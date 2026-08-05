@@ -292,6 +292,7 @@ export function CompareView() {
                 data: chData ? chData.data : null,
                 hasLevels: !!chData,
                 displayMax: chData ? displayScaleFor(planeMax(chData.data), meta.bit_depth) : 0,
+                controlMax: chData ? displayScaleFor(planeMax(chData.data), meta.bit_depth) : 0,
               });
             }
             return { ...prev, [id]: { id, metadata: meta, channels, loadKey: key } };

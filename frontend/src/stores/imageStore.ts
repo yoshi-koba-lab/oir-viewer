@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import type { ImageMetadata, ImageListItem } from '../utils/api';
 import { getLutColor, TRANSMITTED_COLOR } from '../utils/colormap';
-import { displayScaleFor, planeMax } from '../utils/intensity';
+import { displayScaleFor, effectiveScale, planeMax } from '../utils/intensity';
 
 export interface ChannelState {
   visible: boolean;
@@ -25,6 +25,15 @@ export interface ChannelState {
    * while stepping through Z, so the slider's scale stays put.
    */
   displayMax: number;
+  /**
+   * Upper end of the Min/Max track. Deliberately NOT derived from `max` on every
+   * render: doing that rescaled the track mid-drag — pulling Max down past the
+   * data's scale shrank the axis, so the thumb jumped right while the pointer
+   * kept going left and the value landed nowhere near the cursor. The track is
+   * re-fitted when pixels arrive and on Auto, and otherwise only ever widens.
+   * 0 = not fitted yet.
+   */
+  controlMax: number;
 }
 
 export type ProjectionMethod = 'max' | 'min' | 'avg';
@@ -85,6 +94,14 @@ interface ImageStore {
   setProjection: (p: ProjectionState) => void;
   setLoading: (l: boolean) => void;
   setLoadError: (e: string | null) => void;
+}
+
+/** Track that fits both the data and the window, used when Auto re-fits it. */
+function refitControlMax(ch: ChannelState, windowMax: number, bitDepth: number): number {
+  return Math.max(
+    effectiveScale(ch.displayMax, bitDepth),
+    displayScaleFor(windowMax, bitDepth),
+  );
 }
 
 export const useImageStore = create<ImageStore>((set, get) => ({
@@ -190,6 +207,7 @@ export const useImageStore = create<ImageStore>((set, get) => ({
         hasLevels: hasFileRange,
         // 0 = nothing measured yet; the first plane sets the real scale.
         displayMax: 0,
+        controlMax: 0,
       });
     }
     set({ channels });
@@ -214,12 +232,21 @@ export const useImageStore = create<ImageStore>((set, get) => ({
       const displayMax = pMax > 0
         ? Math.max(channels[c].displayMax, displayScaleFor(pMax, bitDepth))
         : channels[c].displayMax;
+      const nextMax = adoptAuto ? autoMax : channels[c].max;
       channels[c] = {
         ...channels[c],
         data,
         autoMin,
         autoMax,
         displayMax,
+        // Fit the track to whichever is larger: where the data is, or where the
+        // window currently sits (a file that recorded a full-range LUT opens at
+        // the top of the range whatever the pixels do).
+        controlMax: Math.max(
+          channels[c].controlMax,
+          displayMax,
+          displayScaleFor(nextMax, bitDepth),
+        ),
         ...(adoptAuto ? { min: autoMin, max: autoMax, hasLevels: true } : {}),
       };
       set({ channels });
@@ -250,30 +277,45 @@ export const useImageStore = create<ImageStore>((set, get) => ({
       // channel out with no feedback — keep them ordered instead.
       const lo = Math.min(min, max);
       const hi = Math.max(min, max);
-      channels[c] = { ...channels[c], min: lo, max: hi, hasLevels: true };
+      const bitDepth = get().metadata?.bit_depth ?? 16;
+      channels[c] = {
+        ...channels[c],
+        min: lo,
+        max: hi,
+        hasLevels: true,
+        // Widen only. A drag must never make the track it is being dragged on
+        // smaller; Auto is what re-fits it downward.
+        controlMax: Math.max(channels[c].controlMax, displayScaleFor(hi, bitDepth)),
+      };
       set({ channels });
     }
   },
 
   autoContrastChannel: (c) => {
     const channels = [...get().channels];
+    const bitDepth = get().metadata?.bit_depth ?? 16;
     if (channels[c]) {
       channels[c] = {
         ...channels[c],
         min: channels[c].autoMin,
         max: channels[c].autoMax,
         hasLevels: true,
+        // Auto is a deliberate press, so it is the one place the track may
+        // narrow — back onto the data, where the resolution is wanted.
+        controlMax: refitControlMax(channels[c], channels[c].autoMax, bitDepth),
       };
       set({ channels });
     }
   },
 
   autoContrastAll: () => {
+    const bitDepth = get().metadata?.bit_depth ?? 16;
     const channels = get().channels.map(ch => ({
       ...ch,
       min: ch.autoMin,
       max: ch.autoMax,
       hasLevels: true,
+      controlMax: refitControlMax(ch, ch.autoMax, bitDepth),
     }));
     set({ channels });
   },

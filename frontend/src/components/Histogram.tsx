@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { useImageStore } from '../stores/imageStore';
-import { controlScale } from '../utils/intensity';
+import { effectiveScale } from '../utils/intensity';
 
 interface Props {
   channelIndex: number;
@@ -13,7 +13,7 @@ export function Histogram({ channelIndex }: Props) {
   // Spanning the declared bit depth instead squeezed the whole distribution
   // into the leftmost few pixels of the plot.
   const bitDepth = useImageStore((s) => s.metadata?.bit_depth ?? 16);
-  const maxIntensity = ch ? controlScale(ch, bitDepth) : 65535;
+  const maxIntensity = effectiveScale(ch?.controlMax, bitDepth);
 
   useEffect(() => {
     const canvas = canvasRef.current;

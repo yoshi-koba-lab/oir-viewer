@@ -5,6 +5,15 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.2.1 — 2026-08-05 — Fixed the Min/Max sliders moving the thumb away from the
+//     cursor. 1.2.0 derived the track's upper end from the current window on every
+//     render, so pulling Max down past the channel's data scale shrank the track
+//     mid-drag and the thumb jumped right while the pointer kept going left —
+//     measured on the user's file as a release at 21% of the track leaving the
+//     handle at 71%, which reads as "changing Min/Max does nothing". The track is
+//     now stored per channel: fitted when pixels arrive, re-fitted only by Auto,
+//     and otherwise only ever widened. A drag can never rescale the track it is
+//     being dragged on.
 //   1.2.0 — 2026-08-05 — The contrast controls now span the channel's own scale
 //     instead of the declared bit depth. A 12-bit file whose channels top out near
 //     600 was given 0..4095 sliders, so 86% of the travel did nothing and the
@@ -69,4 +78,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.2.0';
+export const VERSION = '1.2.1';

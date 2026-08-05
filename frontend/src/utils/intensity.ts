@@ -58,24 +58,3 @@ export function planeMax(data: Uint16Array): number {
 export function effectiveScale(displayMax: number | undefined, bitDepth: number): number {
   return displayMax && displayMax > 0 ? displayMax : fullScaleFor(bitDepth);
 }
-
-/**
- * Upper end of the contrast controls: the data's scale, widened if the current
- * window reaches past it.
- *
- * The window can legitimately sit above the data — a file that recorded a
- * full-range LUT opens at 0..4095 whatever the pixels do — and an axis that
- * could not represent the current value would leave the handle pinned off the
- * end of a track it can never return to. Because both terms are snapped to a
- * full scale, pulling the window down into the data rescales the axis once, at
- * a threshold, rather than sliding under the cursor.
- */
-export function controlScale(
-  ch: { max: number; displayMax?: number },
-  bitDepth: number,
-): number {
-  return Math.max(
-    effectiveScale(ch.displayMax, bitDepth),
-    displayScaleFor(ch.max, bitDepth),
-  );
-}

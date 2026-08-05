@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { useImageStore } from '../stores/imageStore';
 import { LUTS } from '../utils/colormap';
-import { controlScale, fullScaleFor } from '../utils/intensity';
+import { effectiveScale, fullScaleFor } from '../utils/intensity';
 import { Histogram } from './Histogram';
 
 export function ChannelPanel() {
@@ -28,10 +28,11 @@ export function ChannelPanel() {
       </div>
 
       {channels.map((ch, i) => {
-        // The controls span the channel's own scale, not the declared bit depth:
-        // 12-bit data that tops out near 600 gave a 0..4095 slider whose upper
-        // 86% did nothing, which is why the contrast read as broken.
-        const maxIntensity = controlScale(ch, metadata.bit_depth);
+        // The track spans the channel's own scale, not the declared bit depth:
+        // 12-bit data topping out near 600 gave a 0..4095 slider whose upper 86%
+        // did nothing, which is why the contrast read as broken. It is a stored
+        // value, not one derived from `max` here — see ChannelState.controlMax.
+        const maxIntensity = effectiveScale(ch.controlMax, metadata.bit_depth);
         // The slider's track is the channel's own scale, but a typed number is
         // clamped only by what the format can hold. Clamping the box to the
         // track too would silently rewrite a value the user chose deliberately —
