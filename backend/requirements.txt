@@ -1,0 +1,26 @@
+# Pinned to the versions this app is developed and verified against, so a CI
+# build matches the machine it was tested on.
+
+# Web server
+fastapi==0.135.1
+uvicorn==0.42.0
+python-multipart==0.0.22   # required for the /api/upload multipart form
+
+# Arrays / imaging
+numpy==1.26.4
+scipy==1.13.1              # ndimage.zoom, for the 3D volume downsample
+Pillow==10.4.0
+tifffile==2026.3.3         # TIFF + OME-TIFF read/write
+
+# Bio-Formats bridge for .oir/.oib/.oif/.nd2/.lif/.czi.
+# jpype starts the JVM, scyjava wraps it, and cjdk fetches a JRE when one is not
+# already bundled — scripts/stage_runtime.py uses cjdk + Maven once to stage
+# backend/runtime, after which the packaged app never needs either again.
+scyjava==1.12.4
+JPype1==1.6.0
+jgo==2.1.3
+cjdk==0.5.0
+
+# Optional: only used by `python main.py` without --no-webview. The packaged
+# desktop build uses Electron for the window instead.
+# pywebview==5.3.2

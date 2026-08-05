@@ -1,0 +1,27 @@
+# Node / frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.backend-port
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Bundled Java runtime staged by scripts/stage_runtime.py (~155 MB).
+# Regenerate with `python3 scripts/stage_runtime.py`; never commit it.
+backend/runtime/
+
+# Packaging output
+build/
+dist/
+*.spec.bak
+src-tauri/target/
+
+# App data written at runtime
+.oir-viewer/
+
+# macOS
+.DS_Store

@@ -1,0 +1,102 @@
+name: Build desktop app
+
+# Cross-building a Mac app from Windows (or vice versa) is not possible, so each
+# installer is produced on its own runner and collected as an artifact. Pushing a
+# v* tag additionally attaches them to a GitHub Release.
+on:
+  push:
+    tags: ['v*']
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14        # Apple silicon
+            name: mac-arm64
+          - os: macos-13        # Intel
+            name: mac-x64
+          - os: windows-latest
+            name: win-x64
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install pyinstaller
+
+      - name: Build the frontend bundle
+        working-directory: frontend
+        run: |
+          npm ci
+          npx tsc --noEmit -p tsconfig.app.json
+          npm run build
+
+      # Downloads the JRE (cjdk) and the Bio-Formats jars (Maven) once, then
+      # copies them into backend/runtime so the app never needs them at run time.
+      - name: Stage the Java runtime
+        run: python scripts/stage_runtime.py
+
+      - name: Package the backend
+        run: pyinstaller backend/oir-viewer-backend.spec --noconfirm --distpath dist --workpath build
+
+      - name: Smoke-test the packaged backend
+        shell: bash
+        run: |
+          # It must start, serve the UI and answer the API without a system Java.
+          if [ "$RUNNER_OS" = "Windows" ]; then EXE=dist/backend/oir-viewer-backend.exe; else EXE=dist/backend/oir-viewer-backend; fi
+          OIR_BACKEND_PORT=8799 "$EXE" &
+          for i in $(seq 1 90); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8799/api/images || true)
+            [ "$code" = "200" ] && break
+            sleep 2
+          done
+          curl -fsS -o /dev/null http://127.0.0.1:8799/api/images
+          curl -fsS -o /dev/null http://127.0.0.1:8799/
+          echo "packaged backend OK"
+
+      - name: Build the installer
+        working-directory: desktop
+        run: |
+          npm install
+          npx electron-builder --publish never
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oir-viewer-${{ matrix.name }}
+          path: |
+            release/*.dmg
+            release/*.exe
+            release/*.AppImage
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
