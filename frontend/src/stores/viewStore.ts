@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { DEFAULT_SCALEBAR_COLOR } from '../utils/scalebar';
+import { DEFAULT_SCALEBAR_COLOR, type ScalebarPos } from '../utils/scalebar';
 
 export type ROITool = 'none' | 'line' | 'rect' | 'ellipse';
 export type ViewMode = '2d' | 'mip' | '3d' | 'split' | 'compare';
@@ -33,6 +33,12 @@ interface ViewStore {
   showScalebar: boolean;
   /** Bar and label colour, as hex. */
   scalebarColor: string;
+  /**
+   * Where the user dragged the bar, as a fraction of the image; null = the
+   * default bottom-left corner. Shared like the other settings, so the bar keeps
+   * the same spot across views and across the images in a Compare grid.
+   */
+  scalebarPos: ScalebarPos | null;
 
   setZoom: (z: number) => void;
   setPan: (x: number, y: number) => void;
@@ -50,6 +56,7 @@ interface ViewStore {
   setScalebarUm: (um: number | null) => void;
   setShowScalebar: (v: boolean) => void;
   setScalebarColor: (hex: string) => void;
+  setScalebarPos: (p: ScalebarPos | null) => void;
   resetView: () => void;
 }
 
@@ -69,6 +76,7 @@ export const useViewStore = create<ViewStore>((set) => ({
   scalebarUm: null,
   showScalebar: true,
   scalebarColor: DEFAULT_SCALEBAR_COLOR,
+  scalebarPos: null,
 
   setZoom: (z) => set({ zoom: Math.max(0.1, Math.min(50, z)) }),
   setPan: (x, y) => set({ panX: x, panY: y }),
@@ -86,5 +94,6 @@ export const useViewStore = create<ViewStore>((set) => ({
   setScalebarUm: (um) => set({ scalebarUm: um !== null && um > 0 ? um : null }),
   setShowScalebar: (v) => set({ showScalebar: v }),
   setScalebarColor: (hex) => set({ scalebarColor: hex }),
+  setScalebarPos: (p) => set({ scalebarPos: p }),
   resetView: () => set({ zoom: 1, panX: 0, panY: 0 }),
 }));

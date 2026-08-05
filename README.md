@@ -14,16 +14,22 @@ built for looking at multi-channel Z-stacks quickly and exporting figure-ready i
   (merged and/or per channel).
 - **Export** — per-channel and merged TIFF/PNG/JPEG, Z-projection to OME-TIFF,
   ROI line profiles and area measurements.
-- **Scale bar** — pinned to the image's bottom-left corner in every view, so it
-  follows the pan and zoom. Length (or auto), colour and on/off are one shared
-  setting, so a figure set keeps one bar. Labels are set in Arial.
+- **Scale bar** — starts at the image's bottom-left corner in every view and
+  follows the pan and zoom; drag it anywhere, double-click to send it back.
+  Length (or auto), colour and on/off are one shared setting, so a figure set
+  keeps one bar. Labels are set in Arial.
 
 Two behaviours worth knowing about:
 
 - **Contrast opens as acquired.** The display range recorded by the microscope
   (the LUT's shadow/highlight points) is read from the file and rescaled to the
   data's bit depth, so an image looks like it did on the scope rather than
-  auto-stretched. `Auto` / `Auto All` switch to percentile auto-contrast.
+  auto-stretched. `Auto` / `Auto All` switch to percentile auto-contrast. Note
+  that a file whose LUT covers the whole bit depth — what gets recorded when
+  nobody adjusted it — opens flat by definition; `Auto` is the quick fix.
+  The Min/Max sliders and the histogram span each channel's own scale rather
+  than the declared bit depth, so the useful range is not squeezed into a
+  fraction of the track.
 - **Split `.oir` files are detected.** Olympus splits a dataset over ~1 GB into
   `<name>.oir` plus extensionless `<name>_00001`, `_00002`, … Opening only the
   `.oir` still "works" but silently exposes just part of the stack (e.g. Z 13 of

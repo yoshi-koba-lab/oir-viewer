@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { useImageStore } from '../stores/imageStore';
 import { LUTS } from '../utils/colormap';
+import { controlScale, fullScaleFor } from '../utils/intensity';
 import { Histogram } from './Histogram';
 
 export function ChannelPanel() {
@@ -14,8 +15,6 @@ export function ChannelPanel() {
 
   if (!metadata) return null;
 
-  const maxIntensity = (1 << metadata.bit_depth) - 1;
-
   return (
     <div className="bg-[var(--bg-panel)] flex flex-col">
       <div className="p-3 border-b border-[var(--border)] flex items-center justify-between">
@@ -28,7 +27,17 @@ export function ChannelPanel() {
         </button>
       </div>
 
-      {channels.map((ch, i) => (
+      {channels.map((ch, i) => {
+        // The controls span the channel's own scale, not the declared bit depth:
+        // 12-bit data that tops out near 600 gave a 0..4095 slider whose upper
+        // 86% did nothing, which is why the contrast read as broken.
+        const maxIntensity = controlScale(ch, metadata.bit_depth);
+        // The slider's track is the channel's own scale, but a typed number is
+        // clamped only by what the format can hold. Clamping the box to the
+        // track too would silently rewrite a value the user chose deliberately —
+        // e.g. matching a dim channel to a bright one's display range.
+        const typedMax = fullScaleFor(metadata.bit_depth);
+        return (
         <div key={i} className="p-3 border-b border-[var(--border)]">
           <div className="flex items-center gap-2 mb-2">
             {/* Toggle */}
@@ -95,7 +104,7 @@ export function ChannelPanel() {
             <EditableNumber
               value={Math.round(ch.min)}
               min={0}
-              max={maxIntensity}
+              max={typedMax}
               onChange={(v) => setChannelRange(i, v, ch.max)}
             />
           </div>
@@ -114,12 +123,13 @@ export function ChannelPanel() {
             <EditableNumber
               value={Math.round(ch.max)}
               min={0}
-              max={maxIntensity}
+              max={typedMax}
               onChange={(v) => setChannelRange(i, ch.min, v)}
             />
           </div>
         </div>
-      ))}
+        );
+      })}
     </div>
   );
 }

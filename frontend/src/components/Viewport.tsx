@@ -3,15 +3,8 @@ import { useCanvasRenderer } from '../hooks/useCanvasRenderer';
 import { useViewStore } from '../stores/viewStore';
 import { useImageStore } from '../stores/imageStore';
 import { ROIOverlay } from './ROIOverlay';
-import {
-  SCALEBAR_BLOCK_H,
-  SCALEBAR_FONT,
-  formatUm,
-  imageRect,
-  scalebarAnchor,
-  scalebarMetrics,
-  scalebarOutline,
-} from '../utils/scalebar';
+import { scalebarMetrics } from '../utils/scalebar';
+import { ScalebarOverlay } from './ScalebarOverlay';
 
 /** Pixel under the cursor plus each visible channel's raw value there. */
 interface ReadoutInfo {
@@ -26,7 +19,7 @@ export function Viewport() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const { render } = useCanvasRenderer();
-  const { zoom, panX, panY, setZoom, setPan, roiTool, showScalebar } = useViewStore();
+  const { zoom, panX, panY, setZoom, setPan, roiTool, scalebarUm } = useViewStore();
   const metadata = useImageStore((s) => s.metadata);
   // Snapshot, used only to detect "the pixels changed" below. The readout itself
   // always reads the live store. Viewport already re-renders on channel changes
@@ -56,11 +49,14 @@ export function Viewport() {
   }, [render]);
 
   // React 19 binds wheel passively at the root, so preventDefault() from a JSX
-  // onWheel handler is ignored — bind it non-passively on the canvas instead.
+  // onWheel handler is ignored — bind it non-passively here instead. It goes on
+  // the container rather than the canvas so the scale bar, which overlays the
+  // canvas as a sibling, is not a dead zone for zooming.
   // Zoom anchors at the cursor, matching CompareView.
   useEffect(() => {
+    const container = containerRef.current;
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    if (!container || !canvas) return;
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
       const rect = canvas.getBoundingClientRect();
@@ -72,8 +68,8 @@ export function Viewport() {
       setZoom(newZoom);
       setPan(sx - (sx - v.panX) * k, sy - (sy - v.panY) * k);
     };
-    canvas.addEventListener('wheel', onWheel, { passive: false });
-    return () => canvas.removeEventListener('wheel', onWheel);
+    container.addEventListener('wheel', onWheel, { passive: false });
+    return () => container.removeEventListener('wheel', onWheel);
   }, [setZoom, setPan]);
 
   /** Screen -> image pixel, using the same transform as useCanvasRenderer. */
@@ -133,10 +129,17 @@ export function Viewport() {
   const handleMouseMove = useCallback(
     (e: React.MouseEvent) => {
       if (isPanning.current) {
-        const dx = e.clientX - lastMouse.current.x;
-        const dy = e.clientY - lastMouse.current.y;
-        setPan(panX + dx, panY + dy);
-        lastMouse.current = { x: e.clientX, y: e.clientY };
+        // End on "no button held" rather than on mouseleave: the scale bar
+        // overlays the canvas, so crossing it fired mouseleave and aborted a
+        // pan that was still in progress.
+        if (e.buttons === 0) {
+          isPanning.current = false;
+        } else {
+          const dx = e.clientX - lastMouse.current.x;
+          const dy = e.clientY - lastMouse.current.y;
+          setPan(panX + dx, panY + dy);
+          lastMouse.current = { x: e.clientX, y: e.clientY };
+        }
       }
       lastCursor.current = { x: e.clientX, y: e.clientY };
       updateReadout(e.clientX, e.clientY);
@@ -149,7 +152,8 @@ export function Viewport() {
   }, []);
 
   const handleMouseLeave = useCallback(() => {
-    isPanning.current = false;
+    // The pan deliberately survives leaving the canvas (see handleMouseMove);
+    // only the cursor readout is a leave-scoped concern.
     lastCursor.current = null;
     readoutRef.current?.(null);
   }, []);
@@ -179,15 +183,18 @@ export function Viewport() {
           containerRef={containerRef}
         />
       )}
-      {/* Scale bar */}
-      {metadata && metadata.pixel_size_x > 0 && showScalebar && (
-        <ScaleBar
-          zoom={zoom}
-          panX={panX}
-          panY={panY}
-          pixelSize={metadata.pixel_size_x}
-          imgW={metadata.width}
-          imgH={metadata.height}
+      {/* Scale bar. Capped at 70% of the image on screen so an auto length can
+          never span the whole field. */}
+      {metadata && (
+        <ScalebarOverlay
+          metrics={scalebarMetrics(
+            metadata.pixel_size_x,
+            zoom,
+            scalebarUm,
+            120,
+            metadata.width * zoom * 0.7,
+          )}
+          geometry={{ imgW: metadata.width, imgH: metadata.height, zoom, panX, panY }}
         />
       )}
       {/* Coordinate display */}
@@ -221,142 +228,6 @@ function PixelReadout({ apiRef }: { apiRef: React.RefObject<ReadoutSetter | null
           <span>{v.value}</span>
         </div>
       ))}
-    </div>
-  );
-}
-
-function ScaleBar({
-  zoom,
-  panX,
-  panY,
-  pixelSize,
-  imgW,
-  imgH,
-}: {
-  zoom: number;
-  panX: number;
-  panY: number;
-  pixelSize: number;
-  imgW: number;
-  imgH: number;
-}) {
-  // An explicit length from the shared setting wins over the auto-chosen one.
-  const requestedUm = useViewStore((s) => s.scalebarUm);
-  const color = useViewStore((s) => s.scalebarColor);
-  // Cap at 70% of the image on screen so the bar never spans the whole field.
-  const metrics = scalebarMetrics(pixelSize, zoom, requestedUm, 120, imgW * zoom * 0.7);
-  const barPx = metrics?.px ?? 0;
-  const label = metrics ? formatUm(metrics.um) : '';
-  const visible = metrics !== null;
-
-  const posRef = useRef({ x: -1, y: -1 });
-  const [pos, setPos] = useState({ x: -1, y: -1 });
-  const ref = useRef<HTMLDivElement>(null);
-  const dragStart = useRef({ x: 0, y: 0 });
-  const userMoved = useRef(false);
-  const [sizeTick, setSizeTick] = useState(0);
-
-  // Keep the bar fully inside the container so it can never become unreachable.
-  const applyPos = useCallback((p: { x: number; y: number }) => {
-    const el = ref.current;
-    const parent = el?.parentElement;
-    if (!el || !parent) return;
-    const pr = parent.getBoundingClientRect();
-    const margin = 4;
-    const maxX = Math.max(margin, pr.width - el.offsetWidth - margin);
-    const maxY = Math.max(margin, pr.height - el.offsetHeight - margin);
-    const clamped = {
-      x: Math.min(Math.max(margin, p.x), maxX),
-      y: Math.min(Math.max(margin, p.y), maxY),
-    };
-    const prev = posRef.current;
-    posRef.current = clamped;
-    if (prev.x !== clamped.x || prev.y !== clamped.y) setPos(clamped);
-  }, []);
-
-  // Until the user drags it, the bar sits at the image's own bottom-left corner —
-  // it belongs to the image, so it has to follow the pan and zoom rather than sit
-  // in a corner of the panel. Re-deriving the anchor (rather than re-clamping the
-  // old value) keeps it flush as the bar width changes with zoom. Once dragged,
-  // keep the user's spot but clamp it, since a wider bar or a smaller container
-  // can push it out of view.
-  useEffect(() => {
-    const el = ref.current;
-    const parent = el?.parentElement;
-    if (!el || !parent) return;
-    if (userMoved.current && posRef.current.x >= 0) {
-      applyPos(posRef.current);
-    } else {
-      const pr = parent.getBoundingClientRect();
-      const rect = imageRect(pr.width, pr.height, imgW, imgH, zoom, panX, panY);
-      applyPos(
-        scalebarAnchor(rect, pr.width, pr.height, el.offsetWidth || barPx, el.offsetHeight || SCALEBAR_BLOCK_H),
-      );
-    }
-  }, [barPx, sizeTick, applyPos, imgW, imgH, zoom, panX, panY]);
-
-  // Recompute on container resize (window resize, panel collapse/expand) through
-  // the effect above so it sees the current bar width. Keyed on `visible`, not []:
-  // the parent is reached through this component's own ref, so a first render with
-  // no bar would otherwise leave the observer permanently unattached and the bar
-  // stuck at a stale offset once it came back.
-  useEffect(() => {
-    const parent = ref.current?.parentElement;
-    if (!parent) return;
-    const observer = new ResizeObserver(() => setSizeTick((t) => t + 1));
-    observer.observe(parent);
-    return () => observer.disconnect();
-  }, [visible]);
-
-  const onPointerDown = (e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.preventDefault();
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
-    dragStart.current = { x: e.clientX, y: e.clientY };
-  };
-
-  const onPointerMove = (e: React.PointerEvent) => {
-    if (!(e.target as HTMLElement).hasPointerCapture(e.pointerId)) return;
-    const dx = e.clientX - dragStart.current.x;
-    const dy = e.clientY - dragStart.current.y;
-    dragStart.current = { x: e.clientX, y: e.clientY };
-    userMoved.current = true;
-    applyPos({ x: posRef.current.x + dx, y: posRef.current.y + dy });
-  };
-
-  const onPointerUp = (e: React.PointerEvent) => {
-    (e.target as HTMLElement).releasePointerCapture(e.pointerId);
-  };
-
-  if (!metrics) return null;
-
-  // The halo follows the bar's own luminance, so a black bar gets a light one
-  // and stays visible against dark signal.
-  const outline = scalebarOutline(color);
-
-  return (
-    <div
-      ref={ref}
-      className="absolute flex flex-col items-start gap-1 cursor-grab active:cursor-grabbing select-none touch-none"
-      style={{ left: pos.x, top: pos.y }}
-      onPointerDown={onPointerDown}
-      onPointerMove={onPointerMove}
-      onPointerUp={onPointerUp}
-    >
-      <span
-        className="text-xs pointer-events-none"
-        style={{
-          color,
-          fontFamily: SCALEBAR_FONT,
-          textShadow: `0 0 3px ${outline}, 0 1px 2px ${outline}`,
-        }}
-      >
-        {label}
-      </span>
-      <div
-        className="h-[3px] rounded pointer-events-none"
-        style={{ width: `${barPx}px`, backgroundColor: color, boxShadow: `0 0 0 1px ${outline}` }}
-      />
     </div>
   );
 }

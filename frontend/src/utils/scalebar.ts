@@ -83,12 +83,15 @@ export function scalebarMetrics(
 }
 
 /**
- * Halo colour for the bar and its label. A fixed black outline is invisible
- * behind a black bar, which matters now that black is selectable — so the halo
- * follows the bar's luminance instead.
+ * Outline colour for the bar and its label — opposite the bar's own luminance,
+ * so a black bar gets a light edge and stays visible on dark signal.
+ *
+ * Opaque on purpose. A translucent outline reads as a smear rather than an edge,
+ * and it is drawn as a hard stroke (never a blurred glow): a soft halo around a
+ * dark glyph is a bright cloud that eats the thin strokes and looks out of focus.
  */
 export function scalebarOutline(hex: string): string {
-  return luminance(hex) > 0.45 ? 'rgba(0,0,0,0.75)' : 'rgba(255,255,255,0.85)';
+  return luminance(hex) > 0.45 ? '#000000' : '#ffffff';
 }
 
 function luminance(hex: string): number {
@@ -142,6 +145,63 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.min(Math.max(v, lo), hi);
 }
 
+
+/**
+ * Where the user dragged the bar to, as a fraction of the image: (0,1) is the
+ * bottom-left corner. Fractions rather than pixels so the bar stays on the same
+ * part of the sample when the view is panned or zoomed.
+ *
+ * `fx` is the bar's left end, `fy` its baseline.
+ */
+export interface ScalebarPos {
+  fx: number;
+  fy: number;
+}
+
+/**
+ * Screen position of the bar's left end and baseline. Without a user position
+ * it sits `pad` inside the image's bottom-left corner; either way it is kept
+ * inside the viewport, since zoomed in the image's own corner is off-screen and
+ * a bar pinned there would simply be invisible.
+ */
+export function scalebarPlacement(
+  rect: { x: number; y: number; w: number; h: number },
+  pos: ScalebarPos | null,
+  viewW: number,
+  viewH: number,
+  barW: number,
+  blockH: number,
+  pad = 12,
+): { x: number; baseline: number } {
+  const x = pos
+    ? rect.x + pos.fx * rect.w
+    : rect.x + pad;
+  const baseline = pos
+    ? rect.y + pos.fy * rect.h
+    : rect.y + rect.h - pad;
+  return {
+    x: clamp(x, pad, Math.max(pad, viewW - barW - pad)),
+    baseline: clamp(baseline, pad + blockH, Math.max(pad + blockH, viewH - pad)),
+  };
+}
+
+/** Inverse of scalebarPlacement: a screen point back to image fractions. */
+export function scalebarPosFromScreen(
+  rect: { x: number; y: number; w: number; h: number },
+  x: number,
+  baseline: number,
+  blockH: number,
+): ScalebarPos {
+  const w = rect.w > 0 ? rect.w : 1;
+  const h = rect.h > 0 ? rect.h : 1;
+  // Keep the whole block on the image: the label sits above the baseline, so the
+  // baseline cannot go higher than one block from the top.
+  return {
+    fx: clamp((x - rect.x) / w, 0, 1),
+    fy: clamp((baseline - rect.y) / h, Math.min(1, blockH / h), 1),
+  };
+}
+
 /**
  * Draw the bar and its label into a 2D context with its baseline at (x, y),
  * i.e. (x, y) is the bar's left end. `scale` lets an export render it at the
@@ -176,6 +236,11 @@ export function drawScalebarAt(
   ctx.font = `${12 * scale}px ${SCALEBAR_FONT}`;
   ctx.textBaseline = 'bottom';
   ctx.textAlign = 'left';
+  // Stroke then fill, with round joins: a hard outline. A blurred shadow behind
+  // a dark glyph is a bright cloud that eats the thin strokes and reads as
+  // out of focus, which is exactly what a black bar looked like.
+  ctx.lineJoin = 'round';
+  ctx.miterLimit = 2;
   ctx.lineWidth = 3 * scale;
   ctx.strokeStyle = outline;
   ctx.strokeText(label, x, y - 5 * scale);
@@ -184,5 +249,11 @@ export function drawScalebarAt(
   ctx.restore();
 }
 
-/** Height the bar plus its label occupies, used to keep it inside the viewport. */
-export const SCALEBAR_BLOCK_H = 22;
+/**
+ * Height of the bar plus its label, in CSS pixels: 12 (label, leading-none) + 4
+ * (gap) + 3 (bar). The overlay pins this as an explicit height so the rendered
+ * block and this constant cannot drift apart — they are the same number in the
+ * drag maths, in the viewport clamp and in the burned-in export, and a mismatch
+ * showed up as the bar creeping upward a few pixels on every grab.
+ */
+export const SCALEBAR_BLOCK_H = 19;

@@ -5,6 +5,21 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.2.0 — 2026-08-05 — The contrast controls now span the channel's own scale
+//     instead of the declared bit depth. A 12-bit file whose channels top out near
+//     600 was given 0..4095 sliders, so 86% of the travel did nothing and the
+//     histogram was an invisible sliver at the left edge — the contrast read as
+//     broken because, at that resolution, it effectively was. The backend already
+//     inferred a data-derived scale for its own histogram; the client now uses the
+//     same rule for the sliders and the plot, so the handles line up with the data.
+//     A typed number is still bounded only by what the format can hold, and the
+//     axis widens to keep it representable.
+//     The scale bar became a shared DOM overlay used by all four views, so it can
+//     be dragged anywhere (double-click returns it to the bottom-left) and its
+//     position follows the sample rather than the panel. Its outline is a hard
+//     stroke rather than a blurred glow: a soft halo around a dark glyph is a
+//     bright cloud that eats thin strokes, which is why a black bar looked out of
+//     focus. Wheel zoom and in-progress pans now survive the cursor crossing it.
 //   1.1.0 — 2026-08-05 — The scale bar belongs to the image, not to the panel. It now
 //     sits at the image's own bottom-left corner and follows the pan and zoom, instead
 //     of floating in a corner of the viewport where it said nothing about what it was
@@ -54,4 +69,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.1.0';
+export const VERSION = '1.2.0';

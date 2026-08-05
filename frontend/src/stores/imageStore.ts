@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import type { ImageMetadata, ImageListItem } from '../utils/api';
 import { getLutColor, TRANSMITTED_COLOR } from '../utils/colormap';
+import { displayScaleFor, planeMax } from '../utils/intensity';
 
 export interface ChannelState {
   visible: boolean;
@@ -18,6 +19,12 @@ export interface ChannelState {
    * fresh pixels arrived.
    */
   hasLevels: boolean;
+  /**
+   * Upper end of the contrast controls for this channel — the data's own scale,
+   * not the declared bit depth (see utils/intensity). Grows but never shrinks
+   * while stepping through Z, so the slider's scale stays put.
+   */
+  displayMax: number;
 }
 
 export type ProjectionMethod = 'max' | 'min' | 'avg';
@@ -162,8 +169,16 @@ export const useImageStore = create<ImageStore>((set, get) => ({
       // Prefer the display range the microscope recorded, so the image opens
       // looking as it did at acquisition instead of auto-stretched. hasLevels
       // marks it as established so incoming pixels don't overwrite it.
+      //
+      // This is honoured even when the range covers the whole bit depth, which
+      // is what a file records when nobody adjusted the LUT. Falling back to
+      // auto levels there was tried and is worse: auto-stretching every channel
+      // of a 5-channel stack and adding them saturates the merge to white. Flat
+      // is at least what the microscope showed, and the contrast controls are
+      // there to fix it.
       const fileRange = channelRanges[i];
-      const hasFileRange = Array.isArray(fileRange) && fileRange.length === 2 && fileRange[1] > fileRange[0];
+      const hasFileRange =
+        Array.isArray(fileRange) && fileRange.length === 2 && fileRange[1] > fileRange[0];
       channels.push({
         visible: !isTransmitted,  // DIC/brightfield off by default
         color,
@@ -173,6 +188,8 @@ export const useImageStore = create<ImageStore>((set, get) => ({
         autoMax: 65535,
         data: null,
         hasLevels: hasFileRange,
+        // 0 = nothing measured yet; the first plane sets the real scale.
+        displayMax: 0,
       });
     }
     set({ channels });
@@ -185,11 +202,24 @@ export const useImageStore = create<ImageStore>((set, get) => ({
       // so a restored view state or a hand-tuned window survives new pixels
       // arriving for a different Z/T.
       const adoptAuto = !channels[c].hasLevels;
+      // Widen the controls to fit this plane, never narrow them: stepping
+      // through Z would otherwise rescale the slider under the user's hand.
+      //
+      // An all-zero plane is skipped rather than measured. displayScaleFor(0)
+      // means "nothing known, assume the full bit depth", and because the widen
+      // is monotonic, scrubbing across one empty slice would otherwise blow the
+      // axis out to 4095 permanently and undo the whole point of measuring it.
+      const bitDepth = get().metadata?.bit_depth ?? 16;
+      const pMax = planeMax(data);
+      const displayMax = pMax > 0
+        ? Math.max(channels[c].displayMax, displayScaleFor(pMax, bitDepth))
+        : channels[c].displayMax;
       channels[c] = {
         ...channels[c],
         data,
         autoMin,
         autoMax,
+        displayMax,
         ...(adoptAuto ? { min: autoMin, max: autoMax, hasLevels: true } : {}),
       };
       set({ channels });

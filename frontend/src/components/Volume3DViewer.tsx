@@ -7,12 +7,14 @@ import {
   type RenderImagePayload,
 } from '../utils/api';
 import {
-  SCALEBAR_FONT,
+  SCALEBAR_BLOCK_H,
   drawScalebarAt,
   formatUm,
   niceScaleLength,
-  scalebarOutline,
+  scalebarPlacement,
+  type ScalebarPos,
 } from '../utils/scalebar';
+import { ScalebarOverlay } from './ScalebarOverlay';
 import { ScalebarSettings } from './ScalebarSettings';
 
 /** Vertex shader (GLSL3): pass position to fragment for ray-marching. */
@@ -153,16 +155,24 @@ function bytesToBase64(bytes: Uint8Array): string {
 function drawScalebar(
   ctx: CanvasRenderingContext2D,
   bar: { um: number; px: number },
+  canvasW: number,
   canvasH: number,
   color: string,
+  pos: ScalebarPos | null,
   scale = 1,
 ) {
-  const pad = 14 * scale;
-  drawScalebarAt(ctx, pad, canvasH - pad, bar.px * scale, bar.um, color, scale);
+  // Same placement rule as the on-screen overlay, at export resolution, so what
+  // was dragged into place is what gets saved.
+  const rect = { x: 0, y: 0, w: canvasW, h: canvasH };
+  const p = scalebarPlacement(
+    rect, pos, canvasW, canvasH, bar.px * scale, SCALEBAR_BLOCK_H * scale, 14 * scale,
+  );
+  drawScalebarAt(ctx, p.x, p.baseline, bar.px * scale, bar.um, color, scale);
 }
 
 export function Volume3DViewer() {
   const containerRef = useRef<HTMLDivElement>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
@@ -190,6 +200,7 @@ export function Volume3DViewer() {
   const showScalebar = useViewStore((s) => s.showScalebar);
   const scalebarUm = useViewStore((s) => s.scalebarUm);
   const scalebarColor = useViewStore((s) => s.scalebarColor);
+  const scalebarPos = useViewStore((s) => s.scalebarPos);
 
   // Save options
   const [saveFormat, setSaveFormat] = useState<'png' | 'tiff'>('png');
@@ -567,6 +578,12 @@ export function Volume3DViewer() {
 
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
     if (!isDragging.current) return;
+      // End the gesture when the button is no longer held, not on mouseleave:
+      // the scale bar overlays the canvas, so crossing it fires mouseleave and
+      // used to abort a pan that was still in progress. This also covers a
+      // release that happens outside the canvas, which is what mouseleave was
+      // really there for.
+      if (e.buttons === 0) { isDragging.current = false; return; }
     const dx = e.clientX - lastMouse.current.x;
     const dy = e.clientY - lastMouse.current.y;
     lastMouse.current = { x: e.clientX, y: e.clientY };
@@ -611,7 +628,7 @@ export function Volume3DViewer() {
       ctx.fillRect(0, 0, w, h);
       ctx.drawImage(src, 0, 0);
       if (showScalebar && scalebar) {
-        drawScalebar(ctx, scalebar, h, scalebarColor, src.clientWidth > 0 ? w / src.clientWidth : 1);
+        drawScalebar(ctx, scalebar, w, h, scalebarColor, scalebarPos, src.clientWidth > 0 ? w / src.clientWidth : 1);
       }
       const bytes = new Uint8Array(ctx.getImageData(0, 0, w, h).data.buffer);
       return { name, width: w, height: h, data_b64: bytesToBase64(bytes) };
@@ -619,7 +636,7 @@ export function Volume3DViewer() {
       mat.uniforms.uVisible.value = prev;
       renderer.render(scene, cam);
     }
-  }, [showScalebar, scalebar, scalebarColor]);
+  }, [showScalebar, scalebar, scalebarColor, scalebarPos]);
 
   /** Channels the save will use: an explicit pick, else whatever is visible now. */
   const saveChannelIndices = useMemo(() => {
@@ -688,10 +705,15 @@ export function Volume3DViewer() {
   // Wheel zoom is bound natively with { passive: false }: React routes onWheel
   // through a passive root listener, so preventDefault() there is ignored and the
   // scroll leaks to the page instead of zooming the volume.
+  //
+  // Bound on the whole viewer rather than the canvas host, so a wheel over the
+  // scale bar still zooms; the controls panel is excluded because scrolling it
+  // must scroll it, not the volume.
   useEffect(() => {
-    const el = containerRef.current;
+    const el = rootRef.current;
     if (!el) return;
     const onWheel = (e: WheelEvent) => {
+      if ((e.target as HTMLElement | null)?.closest('[data-3d-controls]')) return;
       e.preventDefault();
       const r = orbit.current.radius * (e.deltaY > 0 ? 1.1 : 0.9);
       orbit.current.radius = Math.max(0.5, Math.min(10, r));
@@ -715,7 +737,7 @@ export function Volume3DViewer() {
   }
 
   return (
-    <div className="relative flex-1 overflow-hidden bg-black">
+    <div ref={rootRef} className="relative flex-1 overflow-hidden bg-black">
       {/* 3D Canvas */}
       <div
         ref={containerRef}
@@ -723,7 +745,6 @@ export function Volume3DViewer() {
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
       />
 
       {/* Loading overlay */}
@@ -750,7 +771,7 @@ export function Volume3DViewer() {
       )}
 
       {/* 3D Controls Panel */}
-      <div className="absolute top-12 right-2 bg-black/70 rounded-lg p-3 flex flex-col gap-2 text-xs text-white/80 w-[230px]">
+      <div data-3d-controls className="absolute top-12 right-2 bg-black/70 rounded-lg p-3 flex flex-col gap-2 text-xs text-white/80 w-[230px]">
         <div className="font-bold text-white text-center mb-1">3D Controls</div>
 
         {/* Resolution */}
@@ -1034,40 +1055,22 @@ export function Volume3DViewer() {
         </button>
       </div>
 
-      {/* Scale bar overlay (burned into saved images by captureFrame) */}
-      {showScalebar && scalebar && (
-        <div className="absolute bottom-8 left-3 pointer-events-none select-none">
-          <div
-            className="text-[11px] mb-1"
-            style={{
-              color: scalebarColor,
-              fontFamily: SCALEBAR_FONT,
-              textShadow: `0 0 3px ${scalebarOutline(scalebarColor)}, 0 0 3px ${scalebarOutline(scalebarColor)}`,
-            }}
-          >
-            {formatUm(scalebar.um)}
-          </div>
-          <div
-            className="h-[3px] rounded-sm"
-            style={{
-              width: `${scalebar.px}px`,
-              backgroundColor: scalebarColor,
-              boxShadow: `0 0 0 1.5px ${scalebarOutline(scalebarColor)}`,
-            }}
-          />
-        </div>
-      )}
-
       {/* Info overlay */}
-      <div className="absolute top-2 left-2 text-xs font-mono text-white/60 bg-black/40 px-2 py-1 rounded">
+      <div className="absolute top-2 left-2 text-xs font-mono text-white/60 bg-black/40 px-2 py-1 rounded pointer-events-none">
         {metadata.filename} | 3D Volume | {metadata.width}&times;{metadata.height}&times;{metadata.num_z}
         {metadata.pixel_size_z > 0 && ` | Z step: ${metadata.pixel_size_z.toFixed(2)} um`}
       </div>
 
       {/* Help */}
-      <div className="absolute bottom-2 left-2 text-[10px] text-white/40">
+      <div className="absolute bottom-2 left-2 text-[10px] text-white/40 pointer-events-none">
         Drag: rotate | Scroll: zoom | Double-click: reset
       </div>
+
+      {/* Scale bar (burned into saved images by captureFrame at the same spot).
+          No geometry: the volume render fills the canvas, so the canvas is the
+          image here. Rendered after the readouts so a bar dragged into a corner
+          stays visible and grabbable instead of disappearing under them. */}
+      <ScalebarOverlay metrics={scalebar} pad={14} />
     </div>
   );
 }

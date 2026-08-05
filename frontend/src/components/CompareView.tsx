@@ -2,12 +2,9 @@ import { useRef, useEffect, useCallback, useState } from 'react';
 import { useImageStore, type ChannelState } from '../stores/imageStore';
 import { useViewStore } from '../stores/viewStore';
 import { fetchAllChannelsBin, fetchMetadata, type ImageMetadata } from '../utils/api';
-import {
-  SCALEBAR_BLOCK_H,
-  drawScalebarAt,
-  scalebarAnchor,
-  scalebarMetrics,
-} from '../utils/scalebar';
+import { scalebarMetrics } from '../utils/scalebar';
+import { ScalebarOverlay } from './ScalebarOverlay';
+import { displayScaleFor, planeMax } from '../utils/intensity';
 import { ScalebarSettings } from './ScalebarSettings';
 
 /** Per-image data loaded independently for comparison. */
@@ -294,6 +291,7 @@ export function CompareView() {
                 autoMax: chData?.auto_max ?? 65535,
                 data: chData ? chData.data : null,
                 hasLevels: !!chData,
+                displayMax: chData ? displayScaleFor(planeMax(chData.data), meta.bit_depth) : 0,
               });
             }
             return { ...prev, [id]: { id, metadata: meta, channels, loadKey: key } };
@@ -831,9 +829,7 @@ function ComparePanel({
 }) {
   // Scale bar settings are global, so read them here rather than threading them
   // through every panel.
-  const showScalebar = useViewStore((s) => s.showScalebar);
   const scalebarUm = useViewStore((s) => s.scalebarUm);
-  const scalebarColor = useViewStore((s) => s.scalebarColor);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const compositeRef = useRef<OffscreenCanvas | null>(null);
   const isPanning = useRef(false);
@@ -896,19 +892,7 @@ function ComparePanel({
     const dx = cw / 2 - drawW / 2 + panX;
     const dy = chh / 2 - drawH / 2 + panY;
     ctx.drawImage(offscreen, dx, dy, drawW, drawH);
-
-    // Scale bar, pinned to the image's own bottom-left corner rather than the
-    // panel's, so it stays with the sample when the view is panned.
-    if (showScalebar) {
-      const bar = scalebarMetrics(metadata.pixel_size_x, zoom, scalebarUm, 120, drawW * 0.7);
-      if (bar && bar.px < cw * 0.9) {
-        // The anchor is the bar's baseline, so the block height is measured from
-        // the bar up through its label.
-        const a = scalebarAnchor({ x: dx, y: dy, w: drawW, h: drawH }, cw, chh, bar.px, SCALEBAR_BLOCK_H, 10);
-        drawScalebarAt(ctx, a.x, a.y + SCALEBAR_BLOCK_H, bar.px, bar.um, scalebarColor);
-      }
-    }
-  }, [zoom, panX, panY, metadata, showScalebar, scalebarUm, scalebarColor, drawTick]);
+  }, [zoom, panX, panY, metadata, drawTick]);
 
   // Redraw on container resize.
   useEffect(() => {
@@ -944,10 +928,15 @@ function ComparePanel({
 
   const handleMouseMove = useCallback(
     (e: React.MouseEvent) => {
-      if (isPanning.current) {
-        onPan(panX + e.clientX - lastMouse.current.x, panY + e.clientY - lastMouse.current.y);
-        lastMouse.current = { x: e.clientX, y: e.clientY };
-      }
+      if (!isPanning.current) return;
+      // End the gesture when the button is no longer held, not on mouseleave:
+      // the scale bar overlays the canvas, so crossing it fires mouseleave and
+      // used to abort a pan that was still in progress. This also covers a
+      // release that happens outside the canvas, which is what mouseleave was
+      // really there for.
+      if (e.buttons === 0) { isPanning.current = false; return; }
+      onPan(panX + e.clientX - lastMouse.current.x, panY + e.clientY - lastMouse.current.y);
+      lastMouse.current = { x: e.clientX, y: e.clientY };
     },
     [panX, panY, onPan]
   );
@@ -962,16 +951,20 @@ function ComparePanel({
         selected ? 'ring-2 ring-[var(--accent)] shadow-lg shadow-[var(--accent)]/20' : ''
       }`}
       onClick={onSelect}
+      onWheel={handleWheel}
     >
       <canvas
         ref={canvasRef}
         className="w-full h-full cursor-crosshair"
-        onWheel={handleWheel}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
         onDoubleClick={(e) => { e.stopPropagation(); onResetView(); }}
+      />
+      <ScalebarOverlay
+        metrics={scalebarMetrics(metadata.pixel_size_x, zoom, scalebarUm, 120, metadata.width * zoom * 0.7)}
+        geometry={{ imgW: metadata.width, imgH: metadata.height, zoom, panX, panY }}
+        pad={10}
       />
       {/* Filename label */}
       <div className={`absolute top-1 left-1 text-[10px] font-mono px-1.5 py-0.5 rounded max-w-[90%] truncate ${

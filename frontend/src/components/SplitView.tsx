@@ -1,12 +1,8 @@
 import { useRef, useEffect, useCallback, useMemo, useState } from 'react';
 import { useImageStore, type ChannelState } from '../stores/imageStore';
 import { useViewStore } from '../stores/viewStore';
-import {
-  SCALEBAR_BLOCK_H,
-  drawScalebarAt,
-  scalebarAnchor,
-  scalebarMetrics,
-} from '../utils/scalebar';
+import { scalebarMetrics } from '../utils/scalebar';
+import { ScalebarOverlay } from './ScalebarOverlay';
 
 export function SplitView() {
   const metadata = useImageStore((s) => s.metadata);
@@ -81,6 +77,7 @@ function SplitPanel({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const isPanning = useRef(false);
   const lastMouse = useRef({ x: 0, y: 0 });
+  const scalebarUm = useViewStore((s) => s.scalebarUm);
 
   // Colourise this channel once per data/contrast change — not on every pan/zoom.
   const composite = useMemo(() => {
@@ -109,28 +106,27 @@ function SplitPanel({
 
   const drawTick = useRedrawOnResize(canvasRef);
 
-  // blitToCanvas reads the scale bar settings from the store, so subscribe here
-  // too — otherwise changing the colour or length would not redraw the panel.
-  const scalebarDeps = useScalebarRedrawKey();
-
   useEffect(() => {
     blitToCanvas(canvasRef.current, composite, metadata, zoom, panX, panY);
-  }, [composite, metadata, zoom, panX, panY, drawTick, scalebarDeps]);
+  }, [composite, metadata, zoom, panX, panY, drawTick]);
 
   const { handleWheel, handleMouseDown, handleMouseMove, handleMouseUp } = usePanZoom(
     zoom, panX, panY, onZoom, onPan, isPanning, lastMouse
   );
 
   return (
-    <div className="relative overflow-hidden bg-black rounded">
+    <div className="relative overflow-hidden bg-black rounded" onWheel={handleWheel}>
       <canvas
         ref={canvasRef}
         className="w-full h-full cursor-crosshair"
-        onWheel={handleWheel}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
+      />
+      <ScalebarOverlay
+        metrics={scalebarMetrics(metadata.pixel_size_x, zoom, scalebarUm, 120, metadata.width * zoom * 0.7)}
+        geometry={{ imgW: metadata.width, imgH: metadata.height, zoom, panX, panY }}
+        pad={8}
       />
       <div
         className="absolute top-1 left-2 text-xs font-mono px-1.5 py-0.5 rounded bg-black/50"
@@ -162,6 +158,7 @@ function MergePanel({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const isPanning = useRef(false);
   const lastMouse = useRef({ x: 0, y: 0 });
+  const scalebarUm = useViewStore((s) => s.scalebarUm);
 
   // Additive merge of all visible channels, cached like the single-channel panels.
   const composite = useMemo(() => {
@@ -193,28 +190,27 @@ function MergePanel({
 
   const drawTick = useRedrawOnResize(canvasRef);
 
-  // blitToCanvas reads the scale bar settings from the store, so subscribe here
-  // too — otherwise changing the colour or length would not redraw the panel.
-  const scalebarDeps = useScalebarRedrawKey();
-
   useEffect(() => {
     blitToCanvas(canvasRef.current, composite, metadata, zoom, panX, panY);
-  }, [composite, metadata, zoom, panX, panY, drawTick, scalebarDeps]);
+  }, [composite, metadata, zoom, panX, panY, drawTick]);
 
   const { handleWheel, handleMouseDown, handleMouseMove, handleMouseUp } = usePanZoom(
     zoom, panX, panY, onZoom, onPan, isPanning, lastMouse
   );
 
   return (
-    <div className="relative overflow-hidden bg-black rounded">
+    <div className="relative overflow-hidden bg-black rounded" onWheel={handleWheel}>
       <canvas
         ref={canvasRef}
         className="w-full h-full cursor-crosshair"
-        onWheel={handleWheel}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
+      />
+      <ScalebarOverlay
+        metrics={scalebarMetrics(metadata.pixel_size_x, zoom, scalebarUm, 120, metadata.width * zoom * 0.7)}
+        geometry={{ imgW: metadata.width, imgH: metadata.height, zoom, panX, panY }}
+        pad={8}
       />
       <div className="absolute top-1 left-2 text-xs font-mono px-1.5 py-0.5 rounded bg-black/50 text-white">
         Merge
@@ -238,14 +234,6 @@ function useRedrawOnResize(canvasRef: React.RefObject<HTMLCanvasElement | null>)
     return () => observer.disconnect();
   }, [canvasRef]);
   return tick;
-}
-
-/** One value that changes whenever anything about the scale bar changes. */
-function useScalebarRedrawKey(): string {
-  const show = useViewStore((s) => s.showScalebar);
-  const um = useViewStore((s) => s.scalebarUm);
-  const color = useViewStore((s) => s.scalebarColor);
-  return `${show}|${um}|${color}`;
 }
 
 /** Blit a cached composite onto the visible canvas with the current zoom/pan. */
@@ -281,16 +269,6 @@ function blitToCanvas(
   const dy = chh / 2 - drawH / 2 + panY;
   ctx.drawImage(composite, dx, dy, drawW, drawH);
 
-  // Scale bar at the image's bottom-left, same settings as every other view —
-  // the toggle is global, so a panel that ignored it would look broken.
-  const { showScalebar, scalebarUm, scalebarColor } = useViewStore.getState();
-  if (showScalebar) {
-    const bar = scalebarMetrics(metadata.pixel_size_x, zoom, scalebarUm, 120, drawW * 0.7);
-    if (bar && bar.px < cw * 0.9) {
-      const a = scalebarAnchor({ x: dx, y: dy, w: drawW, h: drawH }, cw, chh, bar.px, SCALEBAR_BLOCK_H, 8);
-      drawScalebarAt(ctx, a.x, a.y + SCALEBAR_BLOCK_H, bar.px, bar.um, scalebarColor);
-    }
-  }
 }
 
 /** Shared pan/zoom handlers. */
@@ -300,8 +278,8 @@ function usePanZoom(
   panY: number,
   onZoom: (z: number) => void,
   onPan: (x: number, y: number) => void,
-  isPanning: React.MutableRefObject<boolean>,
-  lastMouse: React.MutableRefObject<{ x: number; y: number }>,
+  isPanningRef: React.MutableRefObject<boolean>,
+  lastMouseRef: React.MutableRefObject<{ x: number; y: number }>,
 ) {
   const handleWheel = useCallback(
     (e: React.WheelEvent) => {
@@ -312,23 +290,28 @@ function usePanZoom(
   );
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
-    isPanning.current = true;
-    lastMouse.current = { x: e.clientX, y: e.clientY };
-  }, [isPanning, lastMouse]);
+    isPanningRef.current = true;
+    lastMouseRef.current = { x: e.clientX, y: e.clientY };
+  }, [isPanningRef, lastMouseRef]);
 
   const handleMouseMove = useCallback(
     (e: React.MouseEvent) => {
-      if (isPanning.current) {
-        onPan(panX + e.clientX - lastMouse.current.x, panY + e.clientY - lastMouse.current.y);
-        lastMouse.current = { x: e.clientX, y: e.clientY };
-      }
+      if (!isPanningRef.current) return;
+      // End the gesture when the button is no longer held, not on mouseleave:
+      // the scale bar overlays the canvas, so crossing it fires mouseleave and
+      // used to abort a pan that was still in progress. This also covers a
+      // release that happens outside the canvas, which is what mouseleave was
+      // really there for.
+      if (e.buttons === 0) { isPanningRef.current = false; return; }
+      onPan(panX + e.clientX - lastMouseRef.current.x, panY + e.clientY - lastMouseRef.current.y);
+      lastMouseRef.current = { x: e.clientX, y: e.clientY };
     },
-    [panX, panY, onPan, isPanning, lastMouse]
+    [panX, panY, onPan, isPanningRef, lastMouseRef]
   );
 
   const handleMouseUp = useCallback(() => {
-    isPanning.current = false;
-  }, [isPanning]);
+    isPanningRef.current = false;
+  }, [isPanningRef]);
 
   return { handleWheel, handleMouseDown, handleMouseMove, handleMouseUp };
 }
