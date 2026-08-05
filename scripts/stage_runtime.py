@@ -30,22 +30,35 @@ ROOT = Path(__file__).resolve().parent.parent
 RUNTIME = ROOT / "backend" / "runtime"
 
 
-def find_cached_jre() -> Path | None:
-    """The JRE home cjdk downloaded, if any."""
-    roots = [
-        Path.home() / "Library" / "Caches" / "cjdk",           # macOS
-        Path.home() / ".cache" / "cjdk",                        # Linux
-        Path(os.environ.get("LOCALAPPDATA", "")) / "cjdk",      # Windows
-    ]
-    exes = []
-    for r in roots:
-        if r.is_dir():
-            exes += glob.glob(str(r / "**" / "bin" / "java"), recursive=True)
-            exes += glob.glob(str(r / "**" / "bin" / "java.exe"), recursive=True)
-    if not exes:
+# The runtime the app is developed against. A JRE (not a full JDK) is enough:
+# Bio-Formats only needs to run, and it halves the bundle.
+JRE_VENDOR = os.environ.get("OIR_JRE_VENDOR", "zulu-jre")
+JRE_VERSION = os.environ.get("OIR_JRE_VERSION", "11")
+
+
+def fetch_jre() -> Path | None:
+    """Provision the JRE explicitly with cjdk, downloading it if needed.
+
+    Deliberately does NOT go looking for whatever Java happens to be installed:
+    CI runners ship a system JDK, so scyjava starts the JVM from that and cjdk
+    is never invoked — leaving nothing to copy. Asking cjdk directly makes the
+    staged runtime the same on a developer's Mac and on a fresh runner.
+    """
+    try:
+        import cjdk
+    except ImportError:
+        print("ERROR: cjdk is not installed (pip install -r backend/requirements.txt)",
+              file=sys.stderr)
         return None
-    # .../Home/bin/java -> .../Home
-    return Path(sorted(exes)[-1]).parent.parent
+    try:
+        home = Path(cjdk.java_home(vendor=JRE_VENDOR, version=JRE_VERSION))
+    except Exception as e:
+        print(f"ERROR: cjdk could not provide {JRE_VENDOR} {JRE_VERSION}: {e}", file=sys.stderr)
+        return None
+    if not home.is_dir():
+        print(f"ERROR: cjdk returned a missing path: {home}", file=sys.stderr)
+        return None
+    return home
 
 
 def find_cached_jars() -> list[Path]:
@@ -53,18 +66,22 @@ def find_cached_jars() -> list[Path]:
     return sorted(Path(p) for p in glob.glob(str(m2 / "**" / "*.jar"), recursive=True))
 
 
-def warm_caches() -> None:
-    """Run the reader's own Maven/cjdk path once so both caches are populated."""
-    print("warming cjdk + Maven caches via scyjava…")
+def resolve_jars() -> None:
+    """Populate the Maven repository with Bio-Formats and its dependencies.
+
+    Done by starting the JVM the way the reader does, which makes scyjava/jgo
+    resolve the whole dependency tree into ~/.m2 — the set we then copy.
+    """
+    print("resolving Bio-Formats jars via scyjava…", flush=True)
     code = (
         "import scyjava;"
         "scyjava.config.endpoints.append('ome:formats-gpl:8.0.1');"
         "scyjava.start_jvm();"
-        "import scyjava as s; s.jimport('loci.formats.ImageReader');"
-        "print('caches warm')"
+        "scyjava.jimport('loci.formats.ImageReader');"
+        "print('jars resolved')"
     )
     env = {**os.environ}
-    env.pop("OIR_RUNTIME_DIR", None)  # force the download path
+    env.pop("OIR_RUNTIME_DIR", None)  # must not short-circuit to a staged runtime
     subprocess.run([sys.executable, "-c", code], check=True, env=env)
 
 
@@ -78,17 +95,22 @@ def main() -> int:
         print(f"removed {RUNTIME}")
         return 0
 
-    jre = find_cached_jre()
-    jars = find_cached_jars()
-    if not jre or not jars:
-        warm_caches()
-        jre = find_cached_jre()
-        jars = find_cached_jars()
+    jre = fetch_jre()
     if not jre:
-        print("ERROR: no cjdk-cached JRE found", file=sys.stderr)
         return 1
+
+    jars = find_cached_jars()
     if not jars:
-        print("ERROR: no jars found in the Maven repository", file=sys.stderr)
+        resolve_jars()
+        jars = find_cached_jars()
+    if not jars:
+        print("ERROR: no jars found in the Maven repository after resolving",
+              file=sys.stderr)
+        return 1
+    # Sanity-check that we got the reader itself, not just transitive noise.
+    if not any(j.name.startswith("formats-gpl") for j in jars):
+        print(f"ERROR: formats-gpl jar missing from the {len(jars)} jars found",
+              file=sys.stderr)
         return 1
 
     shutil.rmtree(RUNTIME, ignore_errors=True)
