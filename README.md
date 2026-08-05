@@ -36,6 +36,21 @@ bundled; there is no separate setup.
 - macOS: `OIR Viewer-<version>-arm64.dmg` (Apple silicon) or `-x64.dmg` (Intel)
 - Windows: `OIR Viewer Setup <version>.exe`
 
+### First launch
+
+The builds are not code-signed, so each OS warns once about an unidentified
+developer. This is expected; it says nothing about the app itself.
+
+- **macOS** — double-clicking shows *"cannot be opened because it is from an
+  unidentified developer."* Instead **right-click (or Control-click) the app →
+  Open → Open**. Only needed the first time. On recent macOS the button may
+  appear under System Settings → Privacy & Security → *Open Anyway*.
+- **Windows** — SmartScreen shows *"Windows protected your PC."* Click
+  **More info → Run anyway**.
+
+First start also takes a few seconds longer than later ones: the bundled Java
+runtime is initialised on demand.
+
 ## Running from source
 
 ```bash

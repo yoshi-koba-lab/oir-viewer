@@ -18,10 +18,13 @@ jobs:
         include:
           - os: macos-14        # Apple silicon
             name: mac-arm64
+            builder_args: --mac --arm64
           - os: macos-13        # Intel
             name: mac-x64
+            builder_args: --mac --x64
           - os: windows-latest
             name: win-x64
+            builder_args: --win --x64
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -75,7 +78,7 @@ jobs:
         working-directory: desktop
         run: |
           npm install
-          npx electron-builder --publish never
+          npx electron-builder ${{ matrix.builder_args }} --publish never
 
       - uses: actions/upload-artifact@v4
         with:
