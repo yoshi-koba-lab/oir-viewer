@@ -120,4 +120,15 @@ files were open; `uploads/` holds dropped files).
 
 ## License
 
-MIT
+Copyright (c) 2026 yoshi-koba-lab. All Rights Reserved.
+
+本ソフトウェアの再配布・ミラーリング・派生物の公開・第三者ホスティングは、
+著作権者の書面による事前許可なく禁止します。詳細は [LICENSE](LICENSE) を
+ご覧ください。個人での閲覧・ローカル実行・研究目的での利用は自由です。
+
+Redistribution, mirroring, publishing derivative works, and third-party hosting
+are prohibited without the copyright holder's prior written permission; see
+[LICENSE](LICENSE). Viewing, running it locally, and research use are free.
+
+Bundled third-party components (Bio-Formats, the Azul Zulu JRE, Python and npm
+dependencies) remain under their own licenses.

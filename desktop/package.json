@@ -6,7 +6,7 @@
   "main": "main.js",
   "private": true,
   "author": "Y. Kobayashi",
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE",
   "scripts": {
     "start": "electron .",
     "dist": "electron-builder",
