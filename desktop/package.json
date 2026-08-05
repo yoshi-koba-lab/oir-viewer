@@ -35,7 +35,6 @@
       }
     ],
     "mac": {
-      "//": "Arch comes from the CLI (--arm64 / --x64), never from here: the bundled Python backend is built by PyInstaller on the runner and is therefore native-only, so a runner must not emit a DMG for the other architecture.",
       "target": ["dmg"],
       "category": "public.app-category.medical",
       "darkModeSupport": true

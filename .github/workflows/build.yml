@@ -12,6 +12,12 @@ on:
 
 jobs:
   build:
+    # The architecture is set here on the CLI and nowhere else. The bundled Python
+    # backend is built by PyInstaller on the runner, so it is native-only: a runner
+    # must never emit an installer for the other architecture. This cannot be
+    # recorded as a comment in desktop/package.json — electron-builder validates
+    # that file against a strict schema and rejects an unknown "//" key outright,
+    # which failed the build at config validation before doing any work.
     strategy:
       fail-fast: false
       matrix:
@@ -73,6 +79,8 @@ jobs:
           curl -fsS -o /dev/null http://127.0.0.1:8799/api/images
           curl -fsS -o /dev/null http://127.0.0.1:8799/
           echo "packaged backend OK"
+          # Stop it: left running, the runner reports it as an orphan process.
+          kill %1 2>/dev/null || true
 
       - name: Build the installer
         working-directory: desktop
