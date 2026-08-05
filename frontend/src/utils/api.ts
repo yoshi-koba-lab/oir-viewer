@@ -1,5 +1,83 @@
 const BASE = '';
 
+/**
+ * Read a JSON response, turning every failure mode into a message that says what
+ * actually went wrong.
+ *
+ * Calling res.json() directly is a trap: when the backend is not running, the
+ * dev proxy answers with an empty-bodied 500 and the user sees
+ * "Failed to execute 'json' on 'Response': Unexpected end of JSON input" —
+ * which describes the parser, not the problem.
+ */
+/**
+ * Message for a failed response, whatever its body turns out to be.
+ * Also used by the binary endpoints, whose error bodies are JSON but whose
+ * success bodies are not.
+ */
+export async function describeHttpError(res: Response, what: string): Promise<string> {
+  let text = '';
+  try { text = await res.text(); } catch { /* body already consumed or absent */ }
+
+  // FastAPI errors carry {"error": ...} or {"detail": ...}; a dead backend
+  // behind the dev proxy carries nothing at all.
+  let detail = '';
+  if (text) {
+    try {
+      const body = JSON.parse(text);
+      detail = body.error || body.detail || '';
+    } catch {
+      detail = text.slice(0, 200);
+    }
+  }
+  if (!detail) {
+    detail = res.status >= 500
+      ? 'バックエンドに接続できません（サーバーが起動しているか確認してください）'
+      : `HTTP ${res.status}`;
+  }
+  return `${what}: ${detail}`;
+}
+
+async function readJson<T>(res: Response, what: string): Promise<T> {
+  if (!res.ok) throw new Error(await describeHttpError(res, what));
+
+  const text = await res.text();
+
+  if (!text) throw new Error(`${what}: サーバーが空の応答を返しました`);
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    // Most likely index.html: the request fell through to the static handler,
+    // i.e. this build's backend does not have that route.
+    throw new Error(`${what}: サーバーの応答が JSON ではありません（API が古い可能性があります）`);
+  }
+}
+
+/** GET a JSON endpoint with legible failures. */
+async function getJson<T>(path: string, what: string): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}${path}`);
+  } catch (e) {
+    throw new Error(`${what}: サーバーに到達できません（${e instanceof Error ? e.message : e}）`);
+  }
+  return readJson<T>(res, what);
+}
+
+/** POST JSON and read JSON back, with the same error handling. */
+async function postJson<T>(path: string, body: unknown, what: string): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    throw new Error(`${what}: サーバーに到達できません（${e instanceof Error ? e.message : e}）`);
+  }
+  return readJson<T>(res, what);
+}
+
 export interface ImageMetadata {
   id?: string;
   filename: string;
@@ -70,52 +148,48 @@ export interface MeasureData {
 }
 
 export async function listImages(): Promise<ImageListItem[]> {
-  const res = await fetch(`${BASE}/api/images`);
-  return res.json();
+  return getJson<ImageListItem[]>('/api/images', '画像一覧の取得に失敗');
 }
 
 export async function activateImage(id: string): Promise<ImageMetadata> {
-  const res = await fetch(`${BASE}/api/images/${id}/activate`, { method: 'POST' });
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(err.error || 'Failed to activate image');
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}/api/images/${id}/activate`, { method: 'POST' });
+  } catch (e) {
+    throw new Error(`画像の切り替えに失敗: サーバーに到達できません（${e instanceof Error ? e.message : e}）`);
   }
-  return res.json();
+  return readJson<ImageMetadata>(res, '画像の切り替えに失敗');
 }
 
 export async function closeImage(id: string): Promise<{ closed: string; active_id: string | null }> {
-  const res = await fetch(`${BASE}/api/images/${id}`, { method: 'DELETE' });
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(err.error || 'Failed to close image');
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}/api/images/${id}`, { method: 'DELETE' });
+  } catch (e) {
+    throw new Error(`画像を閉じられません: サーバーに到達できません（${e instanceof Error ? e.message : e}）`);
   }
-  return res.json();
+  return readJson(res, '画像を閉じられません');
 }
 
 export async function uploadFile(file: File): Promise<ImageMetadata> {
   const form = new FormData();
   form.append('file', file);
-  const res = await fetch(`${BASE}/api/upload`, { method: 'POST', body: form });
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(err.error || 'Failed to upload file');
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}/api/upload`, { method: 'POST', body: form });
+  } catch (e) {
+    throw new Error(`ファイルの読み込みに失敗: サーバーに到達できません（${e instanceof Error ? e.message : e}）`);
   }
-  return res.json();
+  return readJson<ImageMetadata>(res, 'ファイルの読み込みに失敗');
 }
 
 export async function openFile(path: string): Promise<ImageMetadata> {
-  const res = await fetch(`${BASE}/api/open?path=${encodeURIComponent(path)}`);
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(err.error || 'Failed to open file');
-  }
-  return res.json();
+  return getJson<ImageMetadata>(`/api/open?path=${encodeURIComponent(path)}`, 'ファイルを開けません');
 }
 
 export async function fetchMetadata(id?: string): Promise<ImageMetadata> {
   const q = id ? `?id=${id}` : '';
-  const res = await fetch(`${BASE}/api/metadata${q}`);
-  return res.json();
+  return getJson<ImageMetadata>(`/api/metadata${q}`, 'メタデータの取得に失敗');
 }
 
 export interface FetchChannelsOpts {
@@ -153,8 +227,7 @@ export async function fetchAllChannels(
     const idQ = id ? `&id=${id}` : '';
     url = `${BASE}/api/image/all-channels?z=${zOrOpts}&t=${t}&mip=${mip}${idQ}`;
   }
-  const res = await fetch(url);
-  return res.json();
+  return readJson<AllChannelsResponse>(await fetch(url), 'チャンネルデータの取得に失敗');
 }
 
 /** A channel decoded straight from the binary endpoint (no base64). */
@@ -195,9 +268,7 @@ function buildChannelParams(o: FetchChannelsOpts): URLSearchParams {
 export async function fetchAllChannelsBin(opts: FetchChannelsOpts): Promise<AllChannelsBinResponse> {
   const res = await fetch(`${BASE}/api/image/all-channels-bin?${buildChannelParams(opts)}`);
   if (!res.ok) {
-    let msg = 'Failed to fetch channels';
-    try { msg = (await res.json()).error || msg; } catch { /* binary/no body */ }
-    throw new Error(msg);
+    throw new Error(await describeHttpError(res, 'チャンネルデータの取得に失敗'));
   }
   const buf = await res.arrayBuffer();
   const dv = new DataView(buf);
@@ -224,32 +295,21 @@ export async function fetchAllChannelsBin(opts: FetchChannelsOpts): Promise<AllC
 }
 
 export async function fetchHistogram(c: number, z: number, t: number): Promise<HistogramData> {
-  const res = await fetch(`${BASE}/api/histogram?c=${c}&z=${z}&t=${t}`);
-  return res.json();
+  return getJson<HistogramData>(`/api/histogram?c=${c}&z=${z}&t=${t}`, 'ヒストグラムの取得に失敗');
 }
 
 export async function fetchProfile(body: {
   c: number; z: number; t: number;
   x0: number; y0: number; x1: number; y1: number; width?: number;
 }): Promise<ProfileData> {
-  const res = await fetch(`${BASE}/api/roi/profile`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  return res.json();
+  return postJson<ProfileData>('/api/roi/profile', body, 'プロファイルの取得に失敗');
 }
 
 export async function fetchMeasure(body: {
   c: number; z: number; t: number;
   roi_type: string; params: Record<string, unknown>;
 }): Promise<MeasureData> {
-  const res = await fetch(`${BASE}/api/roi/measure`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  return res.json();
+  return postJson<MeasureData>('/api/roi/measure', body, 'ROI の測定に失敗');
 }
 
 export interface ChooseFolderResponse {
@@ -264,21 +324,11 @@ export interface ChooseFilesResponse {
 
 /** Open the OS file picker (Finder on macOS) and return the chosen image paths. */
 export async function chooseFiles(): Promise<ChooseFilesResponse> {
-  const res = await fetch(`${BASE}/api/choose-files`);
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(err.error || 'Failed to open the file picker');
-  }
-  return res.json();
+  return getJson<ChooseFilesResponse>('/api/choose-files', 'ファイル選択ダイアログを開けません');
 }
 
 export async function chooseFolder(): Promise<ChooseFolderResponse> {
-  const res = await fetch(`${BASE}/api/choose-folder`);
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(err.error || 'Failed to open folder picker');
-  }
-  return res.json();
+  return getJson<ChooseFolderResponse>('/api/choose-folder', 'フォルダ選択ダイアログを開けません');
 }
 
 export interface SaveRequest {
@@ -309,16 +359,7 @@ export interface SaveResponse {
 }
 
 export async function saveImages(req: SaveRequest): Promise<SaveResponse> {
-  const res = await fetch(`${BASE}/api/save`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(req),
-  });
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(err.error || 'Failed to save');
-  }
-  return res.json();
+  return postJson<SaveResponse>('/api/save', req, '保存に失敗');
 }
 
 export interface ProjectionRequest {
@@ -338,16 +379,7 @@ export interface ProjectionResultItem {
 }
 
 export async function applyProjection(req: ProjectionRequest): Promise<{ results: ProjectionResultItem[] }> {
-  const res = await fetch(`${BASE}/api/projection`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(req),
-  });
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(err.error || 'Projection failed');
-  }
-  return res.json();
+  return postJson<{ results: ProjectionResultItem[] }>('/api/projection', req, '投影の作成に失敗');
 }
 
 export function decodeUint16(b64: string, width: number, height: number): Uint16Array {
@@ -376,16 +408,7 @@ export interface SaveRenderRequest {
 }
 
 export async function saveRender(req: SaveRenderRequest): Promise<SaveResponse> {
-  const res = await fetch(`${BASE}/api/save-render`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(req),
-  });
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(err.error || 'Failed to save render');
-  }
-  return res.json();
+  return postJson<SaveResponse>('/api/save-render', req, '画像の保存に失敗');
 }
 
 /* ---- Volume data for 3D rendering ---- */
@@ -409,12 +432,7 @@ export interface VolumeResponse {
 export async function fetchVolume(t: number = 0, id?: string, maxDim: number = 256): Promise<VolumeResponse> {
   const params = new URLSearchParams({ t: String(t), max_dim: String(maxDim) });
   if (id) params.set('id', id);
-  const res = await fetch(`${BASE}/api/volume?${params}`);
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(err.error || 'Failed to fetch volume');
-  }
-  return res.json();
+  return readJson<VolumeResponse>(await fetch(`${BASE}/api/volume?${params}`), 'ボリュームの取得に失敗');
 }
 
 export interface VolumeBinResponse {
@@ -443,9 +461,7 @@ export async function fetchVolumeBin(
   if (id) params.set('id', id);
   const res = await fetch(`${BASE}/api/volume-bin?${params}`);
   if (!res.ok) {
-    let msg = 'Failed to fetch volume';
-    try { msg = (await res.json()).error || msg; } catch { /* binary body */ }
-    throw new Error(msg);
+    throw new Error(await describeHttpError(res, 'ボリュームの取得に失敗'));
   }
   const buf = await res.arrayBuffer();
   const dv = new DataView(buf);

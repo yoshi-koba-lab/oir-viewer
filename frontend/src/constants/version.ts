@@ -5,6 +5,13 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.0.2 — 2026-08-05 — Every API call now reports what actually failed. api.ts called
+//     res.json() on 28 unguarded paths, so any response without a JSON body surfaced as
+//     "Failed to execute 'json' on 'Response': Unexpected end of JSON input" — which describes
+//     the parser, not the problem. With the backend down, Vite's proxy answers with an
+//     empty-bodied 502 and that is exactly what the Open button showed. A shared reader now
+//     distinguishes: an unreachable backend, a FastAPI error/detail body, a non-JSON 200 (the
+//     request fell through to the static handler, i.e. a stale API), and an empty 200.
 //   1.0.1 — 2026-08-05 — Distribution + first-run fixes. Open now shows the OS file picker
 //     (Finder on macOS, tkinter elsewhere, multi-select) instead of only accepting a typed path;
 //     the path box moved behind the small "…" button. The empty-state screen replaced the
@@ -36,4 +43,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.0.1';
+export const VERSION = '1.0.2';
