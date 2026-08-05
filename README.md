@@ -1,124 +1,134 @@
 # OIR Viewer
 
-Viewer for Olympus `.oir` microscopy stacks (and `.oib` / `.oif` / `.tif` / `.nd2` / `.lif` / `.czi`),
-built for looking at multi-channel Z-stacks quickly and exporting figure-ready images.
+オリンパス `.oir` の顕微鏡画像スタック（および `.oib` / `.oif` / `.tif` / `.nd2` /
+`.lif` / `.czi`）を開くビューアです。マルチチャンネルの Z スタックを手早く見て、
+そのまま図に使える画像を書き出すことを目的に作っています。
 
-- **2D** — per-channel LUT and contrast, and a cursor readout showing the pixel
-  coordinate plus every channel's raw intensity at that point.
-- **Z** — vertical slider on the left edge (top = first slice), arrow keys, MIP.
-- **Split** — one panel per channel plus a merge.
-- **Compare** — several files side by side with synced or per-panel pan/zoom, a
-  shared Z/MIP selection clamped per file, and drag-to-reorder.
-- **3D** — ray-marched volume with typed orbit angles, a Z sub-range, XY/YZ/XZ
-  presets, and "save the current view" to PNG/TIFF
-  (merged and/or per channel).
-- **Export** — per-channel and merged TIFF/PNG/JPEG, Z-projection to OME-TIFF,
-  ROI line profiles and area measurements.
-- **Scale bar** — starts at the image's bottom-left corner in every view and
-  follows the pan and zoom; drag it anywhere, double-click to send it back.
-  Length (or auto), colour and on/off are one shared setting, so a figure set
-  keeps one bar. Labels are set in Arial.
+- **2D** — チャンネルごとの LUT とコントラスト。カーソル位置の画素座標と、
+  表示中の全チャンネルの生強度を同時に表示します。
+- **Z** — 左端の縦スライダー（上が最初のスライス）、矢印キー、MIP。
+- **Split** — チャンネルごとに 1 パネル＋マージ。
+- **Compare** — 複数ファイルを並べて表示。パン・ズームは全同期／パネル個別を
+  切り替え可能。Z と MIP の選択は共有され、ファイルごとの深さに合わせて
+  クランプされます。ドラッグで並べ替えできます。
+- **3D** — レイマーチングによるボリューム表示。角度を数値入力でき、表示する
+  Z 範囲を指定でき、XY / YZ / XZ 面のプリセット、そして「表示中の条件で保存」
+  で PNG / TIFF に書き出せます（MERGE とチャンネル別の両方）。
+- **書き出し** — チャンネル別・マージの TIFF / PNG / JPEG、Z 投影の OME-TIFF、
+  ROI のラインプロファイルと面積計測。
+- **スケールバー** — どのビューでも画像の左下から始まり、パンとズームに追従
+  します。ドラッグで好きな位置へ移動、ダブルクリックで左下に戻ります。長さ
+  （または自動）・色・表示の有無は全ビュー共通の設定なので、図を揃えるときに
+  1 本のバーで済みます。ラベルは Arial です。
 
-Two behaviours worth knowing about:
+## 知っておいたほうがいい挙動
 
-- **Contrast opens as acquired.** The display range recorded by the microscope
-  (the LUT's shadow/highlight points) is read from the file and rescaled to the
-  data's bit depth, so an image looks like it did on the scope rather than
-  auto-stretched. `Auto` / `Auto All` switch to percentile auto-contrast. Note
-  that a file whose LUT covers the whole bit depth — what gets recorded when
-  nobody adjusted it — opens flat by definition; `Auto` is the quick fix.
-  The Min/Max sliders and the histogram span each channel's own scale rather
-  than the declared bit depth, so the useful range is not squeezed into a
-  fraction of the track.
-- **Split `.oir` files are detected.** Olympus splits a dataset over ~1 GB into
-  `<name>.oir` plus extensionless `<name>_00001`, `_00002`, … Opening only the
-  `.oir` still "works" but silently exposes just part of the stack (e.g. Z 13 of
-  50). The viewer notices and warns. Use **Open** and pick the file in its
-  original folder so the companions are found — drag & drop cannot carry them.
+**コントラストは撮影時のまま開きます。** 顕微鏡が記録した表示レンジ（LUT の
+shadow / highlight）をファイルから読み、データのビット深度に合わせて変換して
+います。オートストレッチではなく、顕微鏡の画面で見たとおりに開くためです。
+`Auto` / `Auto All` を押すとパーセンタイルによる自動コントラストに切り替わり
+ます。
 
-## Install
+ただし、**LUT がビット深度の全域を占めているファイルは、定義上そのまま眠い
+画像として開きます**。これは誰も LUT を触らずに撮ったときに記録される値です。
+その場合は `Auto` が手っ取り早い解決です。
 
-Download the installer for your platform from
-[Releases](../../releases) — nothing else is required. Python and Java are
-bundled; there is no separate setup.
+Min / Max のスライダーとヒストグラムは、宣言されたビット深度ではなく
+**チャンネルごとの実データの尺度**に合わせて目盛りが決まります。12 bit と記録
+されていても実データが 0〜600 程度なら、スライダーの大半が無効にはなりません。
 
-- macOS: `OIR Viewer-<version>-arm64.dmg` (Apple silicon) or `-x64.dmg` (Intel)
+**分割された `.oir` を検出します。** オリンパスは 1 GB を超えるデータセットを
+`<名前>.oir` と、拡張子のない `<名前>_00001`, `_00002`, … に分割します。`.oir`
+だけを開いても一見動きますが、**スタックの一部しか見えません**（例: 50 枚中
+13 枚）。本ビューアはこれを検出して警告します。**Open** から元の保存場所の
+ファイルを指定してください。付随ファイルが一緒に読み込まれます。ドラッグ＆
+ドロップでは付随ファイルを持ち込めません。
+
+## インストール
+
+[Releases](../../releases) からお使いのプラットフォーム用のインストーラを
+ダウンロードしてください。それ以外に必要なものはありません。Python と Java は
+同梱されているので、別途の準備は不要です。
+
+- macOS: `OIR Viewer-<version>-arm64.dmg`（Apple シリコン）または `-x64.dmg`（Intel）
 - Windows: `OIR Viewer Setup <version>.exe`
 
-### First launch
+### 初回起動時
 
-The builds are not code-signed, so each OS warns once about an unidentified
-developer. This is expected; it says nothing about the app itself.
+コード署名をしていないため、OS が一度だけ「開発元が確認できない」旨の警告を
+出します。想定どおりの動作で、アプリ自体の問題ではありません。
 
-- **macOS** — double-clicking shows *"cannot be opened because it is from an
-  unidentified developer."* Instead **right-click (or Control-click) the app →
-  Open → Open**. Only needed the first time. On recent macOS the button may
-  appear under System Settings → Privacy & Security → *Open Anyway*.
-- **Windows** — SmartScreen shows *"Windows protected your PC."* Click
-  **More info → Run anyway**.
+- **macOS** — ダブルクリックすると「開発元が未確認のため開けません」と出ます。
+  代わりに**アプリを右クリック（または Control + クリック）→ 開く → 開く**を
+  選んでください。必要なのは初回だけです。最近の macOS では、システム設定 →
+  プライバシーとセキュリティ → *このまま開く* にボタンが出ることがあります。
+- **Windows** — SmartScreen が「WindowsによってPCが保護されました」と表示
+  します。**詳細情報 → 実行**を選んでください。
 
-First start also takes a few seconds longer than later ones: the bundled Java
-runtime is initialised on demand.
+初回起動は 2 回目以降より数秒長くかかります。同梱の Java 実行環境をそのとき
+初期化するためです。
 
-## Running from source
+## ソースから動かす
 
 ```bash
-# backend
+# バックエンド
 python3 -m pip install -r backend/requirements.txt
-python3 backend/main.py --no-webview        # prints the port it chose
+python3 backend/main.py --no-webview        # 選ばれたポート番号が表示されます
 
-# frontend (separate terminal)
+# フロントエンド（別ターミナル）
 cd frontend && npm install && npm run dev
 ```
 
-The backend picks a free port (8765 upwards) and writes it to
-`frontend/.backend-port`, which the Vite dev proxy reads — so nothing needs
-editing when 8765 is already taken.
+バックエンドは空いているポート（8765 以降）を選び、`frontend/.backend-port` に
+書き出します。Vite の開発用プロキシがそれを読むので、8765 が既に使われていても
+設定を書き換える必要はありません。
 
-Alternatively build the bundle once and let the backend serve it, which is how
-the packaged app runs — one process, one port, no proxy:
+一度ビルドしてバックエンドに配信させることもできます。配布版と同じ構成で、
+プロセスもポートも 1 つ、プロキシなしです。
 
 ```bash
 cd frontend && npm run build
-python3 backend/main.py --no-webview        # then open the printed URL
+python3 backend/main.py --no-webview        # 表示された URL を開く
 ```
 
-## Building the desktop app
+## デスクトップアプリのビルド
 
-Java is needed to read `.oir` (Bio-Formats), so a JRE and the Bio-Formats jars
-are staged into the build. `stage_runtime.py` gets them by running the normal
-code path once and copying what it resolved:
+`.oir` の読み込みには Java が必要（Bio-Formats）なので、JRE と Bio-Formats の
+jar をビルドに同梱します。`stage_runtime.py` は通常の読み込み経路を一度実行し、
+そこで解決されたものをコピーしてきます。
 
 ```bash
-python3 scripts/stage_runtime.py            # → backend/runtime (~155 MB)
+python3 scripts/stage_runtime.py            # → backend/runtime（約 155 MB）
 (cd frontend && npm ci && npm run build)
 pyinstaller backend/oir-viewer-backend.spec --noconfirm --distpath dist --workpath build
 (cd desktop && npm install && npx electron-builder)
 ```
 
-Installers land in `release/`. `backend/runtime/` is generated and git-ignored.
+インストーラは `release/` に出力されます。`backend/runtime/` は生成物なので
+git 管理外です。
 
-A Mac app cannot be built on Windows or vice versa, so
-[`.github/workflows/build.yml`](.github/workflows/build.yml) builds each on its
-own runner; pushing a `v*` tag attaches the installers to a Release.
+Mac 用アプリを Windows で（またはその逆で）ビルドすることはできないため、
+[`.github/workflows/build.yml`](.github/workflows/build.yml) が各プラット
+フォームをそれぞれのランナーでビルドします。`v*` タグを push すると
+インストーラが Release に添付されます。
 
-## Layout
+## 構成
 
 ```
-backend/     FastAPI: reads images, serves slices as raw binary, writes exports
-             main.py      API + static hosting + port selection
-             reader.py    Bio-Formats/TIFF loading, JVM bootstrap, metadata
-             processor.py contrast, histograms
-             roi.py       line profiles, ROI statistics
-frontend/    React + Vite + Tailwind + zustand; Canvas2D, three.js for 3D
-desktop/     Electron shell: spawns the backend, opens the window
+backend/     FastAPI: 画像を読み、スライスをバイナリで配信し、書き出しを行う
+             main.py      API・静的配信・ポート選択
+             reader.py    Bio-Formats / TIFF の読み込み、JVM 起動、メタデータ
+             processor.py コントラスト、ヒストグラム
+             roi.py       ラインプロファイル、ROI 統計
+frontend/    React + Vite + Tailwind + zustand。Canvas2D、3D は three.js
+desktop/     Electron シェル: バックエンドを起動し、ウィンドウを開く
 scripts/     stage_runtime.py
 ```
 
-Data the app writes lives in `~/.oir-viewer/` (`session.json` remembers which
-files were open; `uploads/` holds dropped files).
+アプリが書き出すデータは `~/.oir-viewer/` に置かれます（`session.json` が開いて
+いたファイルを記憶し、`uploads/` にドロップされたファイルが入ります）。
 
-## License
+## ライセンス
 
 Copyright (c) 2026 yoshi-koba-lab. All Rights Reserved.
 
@@ -130,5 +140,5 @@ Redistribution, mirroring, publishing derivative works, and third-party hosting
 are prohibited without the copyright holder's prior written permission; see
 [LICENSE](LICENSE). Viewing, running it locally, and research use are free.
 
-Bundled third-party components (Bio-Formats, the Azul Zulu JRE, Python and npm
-dependencies) remain under their own licenses.
+同梱している第三者ソフトウェア（Bio-Formats、Azul Zulu JRE、Python および npm
+の各依存パッケージ）は、それぞれのライセンスに従います。
