@@ -5,6 +5,17 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.2.2 — 2026-08-06 — The histogram no longer rescans the raw plane on every
+//     contrast tick. It was keyed on the channel object, which setChannelRange
+//     replaces on each tick, so dragging a dashed marker two pixels reread up to
+//     8.5 M raw values. Counts are now cached per (plane, axis) in a WeakMap, so a
+//     drag rescans nothing while new pixels or a re-fitted axis still rescan once.
+//     Measured: 0 raw scans across 5 contrast changes, and ~24 ms saved per change.
+//     That is far less than the ~178 ms predicted, and the prediction was wrong
+//     rather than the fix: the browser composite costs ~319 ms, not the ~170 ms a
+//     Node benchmark of the same loop reports, because the benchmark excludes the
+//     34 MB createImageData/putImageData round trip. The contrast path is still
+//     ~343 ms and remains a full-resolution CPU composite; that is the real target.
 //   1.2.1 — 2026-08-05 — Fixed the Min/Max sliders moving the thumb away from the
 //     cursor. 1.2.0 derived the track's upper end from the current window on every
 //     render, so pulling Max down past the channel's data scale shrank the track
@@ -78,4 +89,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.2.1';
+export const VERSION = '1.2.2';
