@@ -1,6 +1,12 @@
 import { useRef, useEffect, useCallback, useMemo, useState } from 'react';
 import { useImageStore, type ChannelState } from '../stores/imageStore';
 import { useViewStore } from '../stores/viewStore';
+import {
+  SCALEBAR_BLOCK_H,
+  drawScalebarAt,
+  scalebarAnchor,
+  scalebarMetrics,
+} from '../utils/scalebar';
 
 export function SplitView() {
   const metadata = useImageStore((s) => s.metadata);
@@ -65,7 +71,7 @@ function SplitPanel({
 }: {
   channelIndex: number;
   channelState: ChannelState;
-  metadata: { width: number; height: number; channel_names: string[] };
+  metadata: { width: number; height: number; pixel_size_x: number; channel_names: string[] };
   zoom: number;
   panX: number;
   panY: number;
@@ -103,9 +109,13 @@ function SplitPanel({
 
   const drawTick = useRedrawOnResize(canvasRef);
 
+  // blitToCanvas reads the scale bar settings from the store, so subscribe here
+  // too — otherwise changing the colour or length would not redraw the panel.
+  const scalebarDeps = useScalebarRedrawKey();
+
   useEffect(() => {
     blitToCanvas(canvasRef.current, composite, metadata, zoom, panX, panY);
-  }, [composite, metadata, zoom, panX, panY, drawTick]);
+  }, [composite, metadata, zoom, panX, panY, drawTick, scalebarDeps]);
 
   const { handleWheel, handleMouseDown, handleMouseMove, handleMouseUp } = usePanZoom(
     zoom, panX, panY, onZoom, onPan, isPanning, lastMouse
@@ -142,7 +152,7 @@ function MergePanel({
   onPan,
 }: {
   channels: ChannelState[];
-  metadata: { width: number; height: number };
+  metadata: { width: number; height: number; pixel_size_x: number };
   zoom: number;
   panX: number;
   panY: number;
@@ -183,9 +193,13 @@ function MergePanel({
 
   const drawTick = useRedrawOnResize(canvasRef);
 
+  // blitToCanvas reads the scale bar settings from the store, so subscribe here
+  // too — otherwise changing the colour or length would not redraw the panel.
+  const scalebarDeps = useScalebarRedrawKey();
+
   useEffect(() => {
     blitToCanvas(canvasRef.current, composite, metadata, zoom, panX, panY);
-  }, [composite, metadata, zoom, panX, panY, drawTick]);
+  }, [composite, metadata, zoom, panX, panY, drawTick, scalebarDeps]);
 
   const { handleWheel, handleMouseDown, handleMouseMove, handleMouseUp } = usePanZoom(
     zoom, panX, panY, onZoom, onPan, isPanning, lastMouse
@@ -226,11 +240,19 @@ function useRedrawOnResize(canvasRef: React.RefObject<HTMLCanvasElement | null>)
   return tick;
 }
 
+/** One value that changes whenever anything about the scale bar changes. */
+function useScalebarRedrawKey(): string {
+  const show = useViewStore((s) => s.showScalebar);
+  const um = useViewStore((s) => s.scalebarUm);
+  const color = useViewStore((s) => s.scalebarColor);
+  return `${show}|${um}|${color}`;
+}
+
 /** Blit a cached composite onto the visible canvas with the current zoom/pan. */
 function blitToCanvas(
   canvas: HTMLCanvasElement | null,
   composite: OffscreenCanvas | null,
-  metadata: { width: number; height: number },
+  metadata: { width: number; height: number; pixel_size_x: number },
   zoom: number,
   panX: number,
   panY: number,
@@ -258,6 +280,17 @@ function blitToCanvas(
   const dx = cw / 2 - drawW / 2 + panX;
   const dy = chh / 2 - drawH / 2 + panY;
   ctx.drawImage(composite, dx, dy, drawW, drawH);
+
+  // Scale bar at the image's bottom-left, same settings as every other view —
+  // the toggle is global, so a panel that ignored it would look broken.
+  const { showScalebar, scalebarUm, scalebarColor } = useViewStore.getState();
+  if (showScalebar) {
+    const bar = scalebarMetrics(metadata.pixel_size_x, zoom, scalebarUm, 120, drawW * 0.7);
+    if (bar && bar.px < cw * 0.9) {
+      const a = scalebarAnchor({ x: dx, y: dy, w: drawW, h: drawH }, cw, chh, bar.px, SCALEBAR_BLOCK_H, 8);
+      drawScalebarAt(ctx, a.x, a.y + SCALEBAR_BLOCK_H, bar.px, bar.um, scalebarColor);
+    }
+  }
 }
 
 /** Shared pan/zoom handlers. */

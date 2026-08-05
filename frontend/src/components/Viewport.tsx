@@ -3,6 +3,15 @@ import { useCanvasRenderer } from '../hooks/useCanvasRenderer';
 import { useViewStore } from '../stores/viewStore';
 import { useImageStore } from '../stores/imageStore';
 import { ROIOverlay } from './ROIOverlay';
+import {
+  SCALEBAR_BLOCK_H,
+  SCALEBAR_FONT,
+  formatUm,
+  imageRect,
+  scalebarAnchor,
+  scalebarMetrics,
+  scalebarOutline,
+} from '../utils/scalebar';
 
 /** Pixel under the cursor plus each visible channel's raw value there. */
 interface ReadoutInfo {
@@ -17,7 +26,7 @@ export function Viewport() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const { render } = useCanvasRenderer();
-  const { zoom, panX, panY, setZoom, setPan, roiTool } = useViewStore();
+  const { zoom, panX, panY, setZoom, setPan, roiTool, showScalebar } = useViewStore();
   const metadata = useImageStore((s) => s.metadata);
   // Snapshot, used only to detect "the pixels changed" below. The readout itself
   // always reads the live store. Viewport already re-renders on channel changes
@@ -171,8 +180,15 @@ export function Viewport() {
         />
       )}
       {/* Scale bar */}
-      {metadata && metadata.pixel_size_x > 0 && (
-        <ScaleBar zoom={zoom} pixelSize={metadata.pixel_size_x} />
+      {metadata && metadata.pixel_size_x > 0 && showScalebar && (
+        <ScaleBar
+          zoom={zoom}
+          panX={panX}
+          panY={panY}
+          pixelSize={metadata.pixel_size_x}
+          imgW={metadata.width}
+          imgH={metadata.height}
+        />
       )}
       {/* Coordinate display */}
       <CoordinateDisplay />
@@ -209,19 +225,29 @@ function PixelReadout({ apiRef }: { apiRef: React.RefObject<ReadoutSetter | null
   );
 }
 
-function ScaleBar({ zoom, pixelSize }: { zoom: number; pixelSize: number }) {
-  // Target ~100px bar
-  const targetPx = 120;
-  const umPerPx = pixelSize / zoom;
+function ScaleBar({
+  zoom,
+  panX,
+  panY,
+  pixelSize,
+  imgW,
+  imgH,
+}: {
+  zoom: number;
+  panX: number;
+  panY: number;
+  pixelSize: number;
+  imgW: number;
+  imgH: number;
+}) {
   // An explicit length from the shared setting wins over the auto-chosen one.
   const requestedUm = useViewStore((s) => s.scalebarUm);
-  const targetUm = targetPx * umPerPx;
-  // Round to nice number
-  const niceValues = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
-  const autoUm = niceValues.find((v) => v >= targetUm) ?? targetUm;
-  const niceUm = requestedUm && requestedUm > 0 ? requestedUm : autoUm;
-  const barPx = niceUm / umPerPx;
-  const label = niceUm >= 1 ? `${niceUm} \u00b5m` : `${(niceUm * 1000).toFixed(0)} nm`;
+  const color = useViewStore((s) => s.scalebarColor);
+  // Cap at 70% of the image on screen so the bar never spans the whole field.
+  const metrics = scalebarMetrics(pixelSize, zoom, requestedUm, 120, imgW * zoom * 0.7);
+  const barPx = metrics?.px ?? 0;
+  const label = metrics ? formatUm(metrics.um) : '';
+  const visible = metrics !== null;
 
   const posRef = useRef({ x: -1, y: -1 });
   const [pos, setPos] = useState({ x: -1, y: -1 });
@@ -248,30 +274,39 @@ function ScaleBar({ zoom, pixelSize }: { zoom: number; pixelSize: number }) {
     if (prev.x !== clamped.x || prev.y !== clamped.y) setPos(clamped);
   }, []);
 
-  // Until the user drags it, the bar stays anchored bottom-right — re-deriving the
-  // anchor (rather than re-clamping the old value) keeps it flush to the edge as
-  // the bar width changes with zoom. Once dragged, keep the user's spot but clamp
-  // it, since a wider bar or a smaller container can push it out of view.
+  // Until the user drags it, the bar sits at the image's own bottom-left corner —
+  // it belongs to the image, so it has to follow the pan and zoom rather than sit
+  // in a corner of the panel. Re-deriving the anchor (rather than re-clamping the
+  // old value) keeps it flush as the bar width changes with zoom. Once dragged,
+  // keep the user's spot but clamp it, since a wider bar or a smaller container
+  // can push it out of view.
   useEffect(() => {
-    const parent = ref.current?.parentElement;
-    if (!parent) return;
+    const el = ref.current;
+    const parent = el?.parentElement;
+    if (!el || !parent) return;
     if (userMoved.current && posRef.current.x >= 0) {
       applyPos(posRef.current);
     } else {
       const pr = parent.getBoundingClientRect();
-      applyPos({ x: pr.width - barPx - 24, y: pr.height - 40 });
+      const rect = imageRect(pr.width, pr.height, imgW, imgH, zoom, panX, panY);
+      applyPos(
+        scalebarAnchor(rect, pr.width, pr.height, el.offsetWidth || barPx, el.offsetHeight || SCALEBAR_BLOCK_H),
+      );
     }
-  }, [barPx, sizeTick, applyPos]);
+  }, [barPx, sizeTick, applyPos, imgW, imgH, zoom, panX, panY]);
 
   // Recompute on container resize (window resize, panel collapse/expand) through
-  // the effect above so it sees the current bar width.
+  // the effect above so it sees the current bar width. Keyed on `visible`, not []:
+  // the parent is reached through this component's own ref, so a first render with
+  // no bar would otherwise leave the observer permanently unattached and the bar
+  // stuck at a stale offset once it came back.
   useEffect(() => {
     const parent = ref.current?.parentElement;
     if (!parent) return;
     const observer = new ResizeObserver(() => setSizeTick((t) => t + 1));
     observer.observe(parent);
     return () => observer.disconnect();
-  }, []);
+  }, [visible]);
 
   const onPointerDown = (e: React.PointerEvent) => {
     e.stopPropagation();
@@ -293,25 +328,34 @@ function ScaleBar({ zoom, pixelSize }: { zoom: number; pixelSize: number }) {
     (e.target as HTMLElement).releasePointerCapture(e.pointerId);
   };
 
+  if (!metrics) return null;
+
+  // The halo follows the bar's own luminance, so a black bar gets a light one
+  // and stays visible against dark signal.
+  const outline = scalebarOutline(color);
+
   return (
     <div
       ref={ref}
-      className="absolute flex flex-col items-end gap-1 cursor-grab active:cursor-grabbing select-none touch-none"
+      className="absolute flex flex-col items-start gap-1 cursor-grab active:cursor-grabbing select-none touch-none"
       style={{ left: pos.x, top: pos.y }}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
     >
-      {/* Dark outline keeps both readable over saturated signal, not just black bg */}
       <span
-        className="text-xs text-white font-mono pointer-events-none"
-        style={{ textShadow: '0 0 3px rgba(0,0,0,0.9), 0 1px 2px rgba(0,0,0,0.9)' }}
+        className="text-xs pointer-events-none"
+        style={{
+          color,
+          fontFamily: SCALEBAR_FONT,
+          textShadow: `0 0 3px ${outline}, 0 1px 2px ${outline}`,
+        }}
       >
         {label}
       </span>
       <div
-        className="h-[3px] bg-white rounded pointer-events-none"
-        style={{ width: `${barPx}px`, boxShadow: '0 0 0 1px rgba(0,0,0,0.75)' }}
+        className="h-[3px] rounded pointer-events-none"
+        style={{ width: `${barPx}px`, backgroundColor: color, boxShadow: `0 0 0 1px ${outline}` }}
       />
     </div>
   );

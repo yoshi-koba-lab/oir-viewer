@@ -4,6 +4,7 @@ import { useImageStore } from './stores/imageStore';
 import { useViewStore } from './stores/viewStore';
 import { Viewport } from './components/Viewport';
 import { ChannelPanel } from './components/ChannelPanel';
+import { ScalebarSettings } from './components/ScalebarSettings';
 import { DimensionSliders, ZSliderVertical } from './components/DimensionSliders';
 import { Toolbar } from './components/Toolbar';
 import { FileTabBar } from './components/FileTabBar';
@@ -87,6 +88,7 @@ function App() {
           {/* Right panel */}
           <div className="flex flex-col w-64 shrink-0 overflow-y-auto border-l border-[var(--border)]">
             <ChannelPanel />
+            <ScalebarSettings />
             <IntensityProfile />
             <MeasurementPanel />
             <MetadataPanel />

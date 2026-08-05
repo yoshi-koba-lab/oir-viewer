@@ -5,6 +5,17 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.1.0 — 2026-08-05 — The scale bar belongs to the image, not to the panel. It now
+//     sits at the image's own bottom-left corner and follows the pan and zoom, instead
+//     of floating in a corner of the viewport where it said nothing about what it was
+//     measuring. Its colour is selectable from a palette (or any colour), and the halo
+//     behind it follows the bar's luminance so black stays readable on dark signal.
+//     Labels are set in Arial. The four views had four independent implementations that
+//     disagreed on rounding, target width and label format — the same image could read
+//     "20 um" in 2D and "10 um" in Compare — so they now share one definition, one
+//     length, one colour and one on/off switch, with the controls in every view. Split
+//     had no scale bar at all and now has one. Auto lengths are capped at 70% of the
+//     image so a zoomed-out bar cannot span the whole field.
 //   1.0.2 — 2026-08-05 — Every API call now reports what actually failed. api.ts called
 //     res.json() on 28 unguarded paths, so any response without a JSON body surfaced as
 //     "Failed to execute 'json' on 'Response': Unexpected end of JSON input" — which describes
@@ -43,4 +54,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.0.2';
+export const VERSION = '1.1.0';

@@ -6,6 +6,14 @@ import {
   fetchVolumeBin, chooseFolder, saveRender,
   type RenderImagePayload,
 } from '../utils/api';
+import {
+  SCALEBAR_FONT,
+  drawScalebarAt,
+  formatUm,
+  niceScaleLength,
+  scalebarOutline,
+} from '../utils/scalebar';
+import { ScalebarSettings } from './ScalebarSettings';
 
 /** Vertex shader (GLSL3): pass position to fragment for ray-marching. */
 const vertexShader = `
@@ -137,49 +145,20 @@ function bytesToBase64(bytes: Uint8Array): string {
 }
 
 /** Round to a 1/2/5 × 10ⁿ length so the bar reads as a round number. */
-function niceLength(targetUm: number): number {
-  if (!(targetUm > 0)) return 0;
-  const pow = Math.pow(10, Math.floor(Math.log10(targetUm)));
-  const frac = targetUm / pow;
-  return (frac >= 5 ? 5 : frac >= 2 ? 2 : 1) * pow;
-}
-
-function formatUm(um: number): string {
-  if (um >= 1000) return `${(um / 1000).toFixed(um % 1000 === 0 ? 0 : 1)} mm`;
-  if (um >= 1) return `${um % 1 === 0 ? um : um.toFixed(1)} µm`;
-  return `${(um * 1000).toFixed(0)} nm`;
-}
-
-/** Draw the scale bar into a 2D context, used for both export and preview. */
+/**
+ * Draw the scale bar into a 2D context, used for both export and preview.
+ * The volume fills the canvas, so bottom-left of the canvas *is* bottom-left
+ * of the rendered image here.
+ */
 function drawScalebar(
   ctx: CanvasRenderingContext2D,
   bar: { um: number; px: number },
-  canvasW: number,
   canvasH: number,
+  color: string,
   scale = 1,
 ) {
   const pad = 14 * scale;
-  const x = pad;
-  const y = canvasH - pad;
-  const w = bar.px * scale;
-  ctx.save();
-  ctx.lineCap = 'butt';
-  ctx.strokeStyle = 'rgba(0,0,0,0.75)';
-  ctx.lineWidth = 6 * scale;
-  ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + w, y); ctx.stroke();
-  ctx.strokeStyle = '#ffffff';
-  ctx.lineWidth = 3 * scale;
-  ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + w, y); ctx.stroke();
-  const label = formatUm(bar.um);
-  ctx.font = `${12 * scale}px ui-monospace, monospace`;
-  ctx.textBaseline = 'bottom';
-  ctx.lineWidth = 3 * scale;
-  ctx.strokeStyle = 'rgba(0,0,0,0.75)';
-  ctx.strokeText(label, x, y - 5 * scale);
-  ctx.fillStyle = '#ffffff';
-  ctx.fillText(label, x, y - 5 * scale);
-  ctx.restore();
-  void canvasW;
+  drawScalebarAt(ctx, pad, canvasH - pad, bar.px * scale, bar.um, color, scale);
 }
 
 export function Volume3DViewer() {
@@ -205,11 +184,12 @@ export function Volume3DViewer() {
   // perspective projection into a physical scale bar.
   const volumeInfoRef = useRef({ scaleX: 1, scaleY: 1, scaleZ: 1, maxDimUm: 0 });
 
-  // Scale bar
-  const [showScalebar, setShowScalebar] = useState(true);
+  // Scale bar. Length/visibility/colour are shared with the other views; only
+  // the pixel width is local, since it comes from this camera's distance.
   const [scalebar, setScalebar] = useState<{ um: number; px: number } | null>(null);
+  const showScalebar = useViewStore((s) => s.showScalebar);
   const scalebarUm = useViewStore((s) => s.scalebarUm);
-  const setScalebarUm = useViewStore((s) => s.setScalebarUm);
+  const scalebarColor = useViewStore((s) => s.scalebarColor);
 
   // Save options
   const [saveFormat, setSaveFormat] = useState<'png' | 'tiff'>('png');
@@ -256,7 +236,7 @@ export function Volume3DViewer() {
     const umPerPx = (worldH / h) * maxDimUm;
     // An explicit length wins; otherwise pick a round one near 120 px.
     const requested = useViewStore.getState().scalebarUm;
-    const um = requested && requested > 0 ? requested : niceLength(umPerPx * 120);
+    const um = requested && requested > 0 ? requested : niceScaleLength(umPerPx * 120);
     const px = um / umPerPx;
     setScalebar(um > 0 && px > 2 ? { um, px } : null);
   }, []);
@@ -631,7 +611,7 @@ export function Volume3DViewer() {
       ctx.fillRect(0, 0, w, h);
       ctx.drawImage(src, 0, 0);
       if (showScalebar && scalebar) {
-        drawScalebar(ctx, scalebar, w, h, src.clientWidth > 0 ? w / src.clientWidth : 1);
+        drawScalebar(ctx, scalebar, h, scalebarColor, src.clientWidth > 0 ? w / src.clientWidth : 1);
       }
       const bytes = new Uint8Array(ctx.getImageData(0, 0, w, h).data.buffer);
       return { name, width: w, height: h, data_b64: bytesToBase64(bytes) };
@@ -639,7 +619,7 @@ export function Volume3DViewer() {
       mat.uniforms.uVisible.value = prev;
       renderer.render(scene, cam);
     }
-  }, [showScalebar, scalebar]);
+  }, [showScalebar, scalebar, scalebarColor]);
 
   /** Channels the save will use: an explicit pick, else whatever is visible now. */
   const saveChannelIndices = useMemo(() => {
@@ -931,45 +911,12 @@ export function Volume3DViewer() {
           </div>
         </div>
 
-        {/* Scale bar: on/off plus an explicit length (blank = auto) */}
-        <div className="pt-1 border-t border-white/10 space-y-1">
-          <label className="flex items-center gap-2 cursor-pointer select-none">
-            <input
-              type="checkbox"
-              checked={showScalebar}
-              onChange={(e) => setShowScalebar(e.target.checked)}
-              className="accent-[var(--accent)]"
-            />
-            <span>スケールバー</span>
-            <span className="ml-auto text-white/40 font-mono text-[10px]">
-              {scalebar ? formatUm(scalebar.um) : '—'}
-            </span>
-          </label>
+        {/* Scale bar: on/off, length, colour — the same controls as the 2D view */}
+        <div className="pt-1 border-t border-white/10">
+          <ScalebarSettings compact />
           {showScalebar && (
-            <div className="flex items-center gap-2">
-              <span className="w-16 text-white/60">長さ:</span>
-              <input
-                type="number"
-                min={0}
-                step={10}
-                value={scalebarUm ?? ''}
-                placeholder="自動"
-                onChange={(e) => {
-                  const v = e.target.value.trim();
-                  setScalebarUm(v === '' ? null : Number(v));
-                }}
-                className="w-20 bg-black/60 border border-white/20 rounded px-1 py-0.5 text-xs text-right tabular-nums"
-                title="空欄で自動。数値を入れるとその長さ（µm）で固定します"
-              />
-              <span className="text-white/40">µm</span>
-              {scalebarUm !== null && (
-                <button
-                  onClick={() => setScalebarUm(null)}
-                  className="ml-auto text-[10px] underline text-white/50 hover:text-white/90"
-                >
-                  自動
-                </button>
-              )}
+            <div className="text-right text-white/40 font-mono text-[10px] mt-1">
+              現在: {scalebar ? formatUm(scalebar.um) : '—'}
             </div>
           )}
         </div>
@@ -1091,14 +1038,22 @@ export function Volume3DViewer() {
       {showScalebar && scalebar && (
         <div className="absolute bottom-8 left-3 pointer-events-none select-none">
           <div
-            className="text-[11px] font-mono text-white mb-1"
-            style={{ textShadow: '0 0 3px #000, 0 0 3px #000' }}
+            className="text-[11px] mb-1"
+            style={{
+              color: scalebarColor,
+              fontFamily: SCALEBAR_FONT,
+              textShadow: `0 0 3px ${scalebarOutline(scalebarColor)}, 0 0 3px ${scalebarOutline(scalebarColor)}`,
+            }}
           >
             {formatUm(scalebar.um)}
           </div>
           <div
-            className="h-[3px] bg-white rounded-sm"
-            style={{ width: `${scalebar.px}px`, boxShadow: '0 0 0 1.5px rgba(0,0,0,0.75)' }}
+            className="h-[3px] rounded-sm"
+            style={{
+              width: `${scalebar.px}px`,
+              backgroundColor: scalebarColor,
+              boxShadow: `0 0 0 1.5px ${scalebarOutline(scalebarColor)}`,
+            }}
           />
         </div>
       )}

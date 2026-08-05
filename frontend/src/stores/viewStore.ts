@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { DEFAULT_SCALEBAR_COLOR } from '../utils/scalebar';
 
 export type ROITool = 'none' | 'line' | 'rect' | 'ellipse';
 export type ViewMode = '2d' | 'mip' | '3d' | 'split' | 'compare';
@@ -28,6 +29,10 @@ interface ViewStore {
    * Shared by the 2D, Compare and 3D views so a figure set keeps one bar length.
    */
   scalebarUm: number | null;
+  /** Whether the bar is drawn at all. Shared for the same reason as its length. */
+  showScalebar: boolean;
+  /** Bar and label colour, as hex. */
+  scalebarColor: string;
 
   setZoom: (z: number) => void;
   setPan: (x: number, y: number) => void;
@@ -43,6 +48,8 @@ interface ViewStore {
   setPlayingT: (p: boolean) => void;
   setCompareImageIds: (ids: string[]) => void;
   setScalebarUm: (um: number | null) => void;
+  setShowScalebar: (v: boolean) => void;
+  setScalebarColor: (hex: string) => void;
   resetView: () => void;
 }
 
@@ -60,6 +67,8 @@ export const useViewStore = create<ViewStore>((set) => ({
   playingT: false,
   compareImageIds: [],
   scalebarUm: null,
+  showScalebar: true,
+  scalebarColor: DEFAULT_SCALEBAR_COLOR,
 
   setZoom: (z) => set({ zoom: Math.max(0.1, Math.min(50, z)) }),
   setPan: (x, y) => set({ panX: x, panY: y }),
@@ -75,5 +84,7 @@ export const useViewStore = create<ViewStore>((set) => ({
   setPlayingT: (p) => set({ playingT: p }),
   setCompareImageIds: (ids) => set({ compareImageIds: ids }),
   setScalebarUm: (um) => set({ scalebarUm: um !== null && um > 0 ? um : null }),
+  setShowScalebar: (v) => set({ showScalebar: v }),
+  setScalebarColor: (hex) => set({ scalebarColor: hex }),
   resetView: () => set({ zoom: 1, panX: 0, panY: 0 }),
 }));

@@ -2,6 +2,13 @@ import { useRef, useEffect, useCallback, useState } from 'react';
 import { useImageStore, type ChannelState } from '../stores/imageStore';
 import { useViewStore } from '../stores/viewStore';
 import { fetchAllChannelsBin, fetchMetadata, type ImageMetadata } from '../utils/api';
+import {
+  SCALEBAR_BLOCK_H,
+  drawScalebarAt,
+  scalebarAnchor,
+  scalebarMetrics,
+} from '../utils/scalebar';
+import { ScalebarSettings } from './ScalebarSettings';
 
 /** Per-image data loaded independently for comparison. */
 interface CompareImageData {
@@ -73,10 +80,6 @@ export function CompareView() {
   const [panelViews, setPanelViews] = useState<Record<string, PanelView>>({});
   // View lock: when true, pan/zoom is locked (won't respond to drag/scroll)
   const [viewLocked, setViewLocked] = useState(false);
-  // Scale bar overlay; its length is a shared setting (null = auto).
-  const [showScalebar, setShowScalebar] = useState(true);
-  const scalebarUm = useViewStore((s) => s.scalebarUm);
-  const setScalebarUm = useViewStore((s) => s.setScalebarUm);
 
   // Auto-select images once, on first entry into Compare. Firing on every empty
   // selection would make clearing the list in Edit mode instantly undo itself.
@@ -513,8 +516,6 @@ export function CompareView() {
               onResetView={() => resetPanelView(id)}
               selected={!syncMode && selectedPanelId === id}
               onSelect={() => { if (!syncMode) setSelectedPanelId(id); }}
-              showScalebar={showScalebar}
-              scalebarUm={scalebarUm}
               zLabel={zLabel}
               busy={!!pendingIds[id]}
               error={err?.message}
@@ -552,61 +553,23 @@ export function CompareView() {
             </button>
           </div>
 
-          {/* View Lock + Scale bar toggles */}
-          <div className="flex gap-1.5 mt-2">
-            <button
-              onClick={() => setViewLocked(v => !v)}
-              className={`flex-1 flex items-center justify-center gap-1 text-[10px] py-1.5 rounded border transition ${
-                viewLocked
-                  ? 'bg-amber-600/20 border-amber-500 text-amber-400'
-                  : 'bg-[var(--bg-primary)] border-[var(--border)] text-[var(--text-secondary)] hover:text-white'
-              }`}
-              title="Lock pan & zoom"
-            >
-              <span>{viewLocked ? '🔒' : '🔓'}</span>
-              <span>{viewLocked ? 'Locked' : 'Unlocked'}</span>
-            </button>
-            <button
-              onClick={() => setShowScalebar(v => !v)}
-              className={`flex-1 flex items-center justify-center gap-1 text-[10px] py-1.5 rounded border transition ${
-                showScalebar
-                  ? 'bg-[var(--accent)]/20 border-[var(--accent)] text-[var(--accent)]'
-                  : 'bg-[var(--bg-primary)] border-[var(--border)] text-[var(--text-secondary)] hover:text-white'
-              }`}
-              title="Toggle scale bar"
-            >
-              <span>📏</span>
-              <span>Scale</span>
-            </button>
-          </div>
+          {/* View Lock */}
+          <button
+            onClick={() => setViewLocked(v => !v)}
+            className={`w-full flex items-center justify-center gap-1 text-[10px] py-1.5 mt-2 rounded border transition ${
+              viewLocked
+                ? 'bg-amber-600/20 border-amber-500 text-amber-400'
+                : 'bg-[var(--bg-primary)] border-[var(--border)] text-[var(--text-secondary)] hover:text-white'
+            }`}
+            title="Lock pan & zoom"
+          >
+            <span>{viewLocked ? '🔒' : '🔓'}</span>
+            <span>{viewLocked ? 'Locked' : 'Unlocked'}</span>
+          </button>
 
-          {showScalebar && (
-            <div className="flex items-center gap-1.5 mt-1.5">
-              <span className="text-[10px] text-[var(--text-secondary)]">長さ</span>
-              <input
-                type="number"
-                min={0}
-                step={10}
-                value={scalebarUm ?? ''}
-                placeholder="自動"
-                onChange={(e) => {
-                  const v = e.target.value.trim();
-                  setScalebarUm(v === '' ? null : Number(v));
-                }}
-                className="w-16 bg-[var(--bg-primary)] border border-[var(--border)] rounded px-1 py-0.5 text-[10px] text-right tabular-nums focus:outline-none focus:border-[var(--accent)]"
-                title="空欄で自動。数値を入れるとその長さ（µm）で固定します"
-              />
-              <span className="text-[10px] text-[var(--text-secondary)]">µm</span>
-              {scalebarUm !== null && (
-                <button
-                  onClick={() => setScalebarUm(null)}
-                  className="ml-auto text-[9px] underline text-[var(--text-secondary)] hover:text-white"
-                >
-                  自動
-                </button>
-              )}
-            </div>
-          )}
+          <div className="mt-2">
+            <ScalebarSettings compact />
+          </div>
 
           {!syncMode && (
             <p className="text-[9px] text-[var(--text-secondary)] mt-1.5 leading-tight">
@@ -836,22 +799,6 @@ export function CompareView() {
   );
 }
 
-/** Pick a "nice" scale-bar length (1/2/5 × 10ⁿ) close to a target pixel width. */
-function niceScaleLength(targetUm: number): number {
-  if (!(targetUm > 0)) return 0;
-  const pow = Math.pow(10, Math.floor(Math.log10(targetUm)));
-  const frac = targetUm / pow;
-  const nice = frac >= 5 ? 5 : frac >= 2 ? 2 : 1;
-  return nice * pow;
-}
-
-/** Format a micron length for the scale-bar label. */
-function formatUm(um: number): string {
-  if (um >= 1000) return `${(um / 1000).toFixed(um % 1000 === 0 ? 0 : 1)} mm`;
-  if (um >= 1) return `${um % 1 === 0 ? um : um.toFixed(1)} µm`;
-  return `${(um * 1000).toFixed(0)} nm`;
-}
-
 /** Single image panel in the compare grid. */
 function ComparePanel({
   imageData,
@@ -863,8 +810,6 @@ function ComparePanel({
   onResetView,
   selected,
   onSelect,
-  showScalebar,
-  scalebarUm,
   zLabel,
   busy,
   error,
@@ -879,13 +824,16 @@ function ComparePanel({
   onResetView: () => void;
   selected: boolean;
   onSelect: () => void;
-  showScalebar: boolean;
-  scalebarUm: number | null;
   zLabel: string | null;
   busy: boolean;
   error?: string;
   onRetry: () => void;
 }) {
+  // Scale bar settings are global, so read them here rather than threading them
+  // through every panel.
+  const showScalebar = useViewStore((s) => s.showScalebar);
+  const scalebarUm = useViewStore((s) => s.scalebarUm);
+  const scalebarColor = useViewStore((s) => s.scalebarColor);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const compositeRef = useRef<OffscreenCanvas | null>(null);
   const isPanning = useRef(false);
@@ -949,40 +897,18 @@ function ComparePanel({
     const dy = chh / 2 - drawH / 2 + panY;
     ctx.drawImage(offscreen, dx, dy, drawW, drawH);
 
-    // Scale bar (bottom-left), sized from physical pixel size.
-    if (showScalebar && metadata.pixel_size_x > 0) {
-      const umPerScreenPx = metadata.pixel_size_x / zoom;
-      // An explicit length from the shared setting wins over the auto-chosen one.
-      const barUm = scalebarUm && scalebarUm > 0 ? scalebarUm : niceScaleLength(umPerScreenPx * 80);
-      const barPx = barUm / umPerScreenPx;
-      if (barPx > 8 && barPx < cw * 0.9) {
-        const bx = 10;
-        const by = chh - 14;
-        ctx.save();
-        ctx.strokeStyle = 'rgba(0,0,0,0.7)';
-        ctx.lineWidth = 5;
-        ctx.beginPath();
-        ctx.moveTo(bx, by);
-        ctx.lineTo(bx + barPx, by);
-        ctx.stroke();
-        ctx.strokeStyle = 'white';
-        ctx.lineWidth = 2.5;
-        ctx.beginPath();
-        ctx.moveTo(bx, by);
-        ctx.lineTo(bx + barPx, by);
-        ctx.stroke();
-        ctx.font = '11px ui-monospace, monospace';
-        ctx.textBaseline = 'bottom';
-        const label = formatUm(barUm);
-        ctx.lineWidth = 3;
-        ctx.strokeStyle = 'rgba(0,0,0,0.7)';
-        ctx.strokeText(label, bx, by - 3);
-        ctx.fillStyle = 'white';
-        ctx.fillText(label, bx, by - 3);
-        ctx.restore();
+    // Scale bar, pinned to the image's own bottom-left corner rather than the
+    // panel's, so it stays with the sample when the view is panned.
+    if (showScalebar) {
+      const bar = scalebarMetrics(metadata.pixel_size_x, zoom, scalebarUm, 120, drawW * 0.7);
+      if (bar && bar.px < cw * 0.9) {
+        // The anchor is the bar's baseline, so the block height is measured from
+        // the bar up through its label.
+        const a = scalebarAnchor({ x: dx, y: dy, w: drawW, h: drawH }, cw, chh, bar.px, SCALEBAR_BLOCK_H, 10);
+        drawScalebarAt(ctx, a.x, a.y + SCALEBAR_BLOCK_H, bar.px, bar.um, scalebarColor);
       }
     }
-  }, [zoom, panX, panY, metadata, showScalebar, scalebarUm, drawTick]);
+  }, [zoom, panX, panY, metadata, showScalebar, scalebarUm, scalebarColor, drawTick]);
 
   // Redraw on container resize.
   useEffect(() => {

@@ -1,0 +1,188 @@
+/**
+ * One definition of the scale bar, shared by the 2D, Split, Compare and 3D views.
+ *
+ * These used to be four independent copies that disagreed: different rounding
+ * tables, different target widths (80 px vs 120 px) and different label
+ * formatting, so the same image could show "20 µm" in one view and "10 µm" in
+ * another. A figure set needs one bar, so the length rule, the label, the font
+ * and the colour all live here.
+ */
+
+/** Labels are set in Arial so exported figures match the usual journal body font. */
+export const SCALEBAR_FONT = 'Arial, Helvetica, sans-serif';
+
+/** Bar colour choices. Hex, because these end up in CSS and in canvas alike. */
+export const SCALEBAR_COLORS: { name: string; hex: string }[] = [
+  { name: 'White', hex: '#ffffff' },
+  { name: 'Black', hex: '#000000' },
+  { name: 'Yellow', hex: '#ffff00' },
+  { name: 'Orange', hex: '#ffa500' },
+  { name: 'Red', hex: '#ff0000' },
+  { name: 'Magenta', hex: '#ff00ff' },
+  { name: 'Green', hex: '#00ff00' },
+  { name: 'Cyan', hex: '#00ffff' },
+  { name: 'Blue', hex: '#0064ff' },
+  { name: 'Gray', hex: '#b4b4b4' },
+];
+
+export const DEFAULT_SCALEBAR_COLOR = '#ffffff';
+
+/** Round to 1, 2 or 5 times a power of ten — the lengths people expect on a figure. */
+export function niceScaleLength(targetUm: number): number {
+  if (!(targetUm > 0)) return 0;
+  const pow = Math.pow(10, Math.floor(Math.log10(targetUm)));
+  const frac = targetUm / pow;
+  return (frac >= 5 ? 5 : frac >= 2 ? 2 : 1) * pow;
+}
+
+/** mm above 1000 µm, nm below 1 µm, so the number stays readable at any zoom. */
+export function formatUm(um: number): string {
+  if (!(um > 0)) return '';
+  if (um >= 1000) return `${(um / 1000).toFixed(um % 1000 === 0 ? 0 : 1)} mm`;
+  if (um >= 1) return `${um % 1 === 0 ? um : um.toFixed(1)} µm`;
+  return `${(um * 1000).toFixed(0)} nm`;
+}
+
+/**
+ * Bar length for the current zoom: an explicit request wins, otherwise the
+ * nearest nice length to `targetPx` on screen. Returns null only when there is
+ * no pixel size, so no physical length can be claimed at all.
+ *
+ * `maxPx` caps the auto length — zoomed out, a bar aimed at 120 px can end up
+ * as wide as the whole image, which reads as a border rather than a scale.
+ *
+ * Both limits apply to the *auto* length only. An explicit length is the user's
+ * own number: shrinking it would be a lie, and dropping the bar when it gets
+ * short would make it vanish on zoom-out while the checkbox is still ticked and
+ * the field still shows the value they typed. A stubby bar is honest; nothing
+ * at all is not.
+ */
+export function scalebarMetrics(
+  pixelSizeUm: number,
+  zoom: number,
+  requestedUm: number | null,
+  targetPx = 120,
+  maxPx = Infinity,
+): { um: number; px: number } | null {
+  if (!(pixelSizeUm > 0) || !(zoom > 0)) return null;
+  const umPerScreenPx = pixelSizeUm / zoom;
+  if (requestedUm && requestedUm > 0) {
+    return { um: requestedUm, px: requestedUm / umPerScreenPx };
+  }
+  let um = niceScaleLength(Math.min(targetPx, maxPx) * umPerScreenPx);
+  // niceScaleLength rounds up as often as down, so one step down may still be
+  // needed to get under the cap.
+  while (um > 0 && um / umPerScreenPx > maxPx) {
+    const next = niceScaleLength(um * 0.99);
+    if (!(next > 0) || next >= um) break;
+    um = next;
+  }
+  if (!(um > 0)) return null;
+  const px = um / umPerScreenPx;
+  return px >= 8 ? { um, px } : null;
+}
+
+/**
+ * Halo colour for the bar and its label. A fixed black outline is invisible
+ * behind a black bar, which matters now that black is selectable — so the halo
+ * follows the bar's luminance instead.
+ */
+export function scalebarOutline(hex: string): string {
+  return luminance(hex) > 0.45 ? 'rgba(0,0,0,0.75)' : 'rgba(255,255,255,0.85)';
+}
+
+function luminance(hex: string): number {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+  if (!m) return 1; // unparseable → treat as light, i.e. keep the dark outline
+  const n = parseInt(m[1], 16);
+  const r = (n >> 16) & 255;
+  const g = (n >> 8) & 255;
+  const b = n & 255;
+  return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+}
+
+/**
+ * Where the image itself sits inside a viewport, in CSS pixels. Every view
+ * centres the image and then applies pan, so the bar can be pinned to the
+ * image's own bottom-left corner rather than to the panel's.
+ */
+export function imageRect(
+  viewW: number,
+  viewH: number,
+  imgW: number,
+  imgH: number,
+  zoom: number,
+  panX: number,
+  panY: number,
+): { x: number; y: number; w: number; h: number } {
+  const w = imgW * zoom;
+  const h = imgH * zoom;
+  return { x: viewW / 2 - w / 2 + panX, y: viewH / 2 - h / 2 + panY, w, h };
+}
+
+/**
+ * Bottom-left corner of the image, kept on screen. Zoomed in, the image's real
+ * corner is off-panel; pinning the bar there would hide it, so it slides along
+ * to the visible edge instead of disappearing.
+ */
+export function scalebarAnchor(
+  rect: { x: number; y: number; w: number; h: number },
+  viewW: number,
+  viewH: number,
+  barW: number,
+  barH: number,
+  pad = 12,
+): { x: number; y: number } {
+  const x = clamp(rect.x + pad, pad, Math.max(pad, viewW - barW - pad));
+  const y = clamp(rect.y + rect.h - barH - pad, pad, Math.max(pad, viewH - barH - pad));
+  return { x, y };
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.min(Math.max(v, lo), hi);
+}
+
+/**
+ * Draw the bar and its label into a 2D context with its baseline at (x, y),
+ * i.e. (x, y) is the bar's left end. `scale` lets an export render it at the
+ * export's resolution rather than the preview's.
+ */
+export function drawScalebarAt(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  barPx: number,
+  um: number,
+  color: string,
+  scale = 1,
+): void {
+  const outline = scalebarOutline(color);
+  ctx.save();
+  ctx.lineCap = 'butt';
+  ctx.strokeStyle = outline;
+  ctx.lineWidth = 6 * scale;
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.lineTo(x + barPx, y);
+  ctx.stroke();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 3 * scale;
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.lineTo(x + barPx, y);
+  ctx.stroke();
+
+  const label = formatUm(um);
+  ctx.font = `${12 * scale}px ${SCALEBAR_FONT}`;
+  ctx.textBaseline = 'bottom';
+  ctx.textAlign = 'left';
+  ctx.lineWidth = 3 * scale;
+  ctx.strokeStyle = outline;
+  ctx.strokeText(label, x, y - 5 * scale);
+  ctx.fillStyle = color;
+  ctx.fillText(label, x, y - 5 * scale);
+  ctx.restore();
+}
+
+/** Height the bar plus its label occupies, used to keep it inside the viewport. */
+export const SCALEBAR_BLOCK_H = 22;

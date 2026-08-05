@@ -10,10 +10,13 @@ built for looking at multi-channel Z-stacks quickly and exporting figure-ready i
 - **Compare** — several files side by side with synced or per-panel pan/zoom, a
   shared Z/MIP selection clamped per file, and drag-to-reorder.
 - **3D** — ray-marched volume with typed orbit angles, a Z sub-range, XY/YZ/XZ
-  presets, a physical scale bar, and "save the current view" to PNG/TIFF
+  presets, and "save the current view" to PNG/TIFF
   (merged and/or per channel).
 - **Export** — per-channel and merged TIFF/PNG/JPEG, Z-projection to OME-TIFF,
   ROI line profiles and area measurements.
+- **Scale bar** — pinned to the image's bottom-left corner in every view, so it
+  follows the pan and zoom. Length (or auto), colour and on/off are one shared
+  setting, so a figure set keeps one bar. Labels are set in Arial.
 
 Two behaviours worth knowing about:
 
