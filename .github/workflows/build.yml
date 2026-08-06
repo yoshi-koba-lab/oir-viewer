@@ -31,9 +31,15 @@ jobs:
           - os: macos-14        # Apple silicon
             name: mac-arm64
             builder_args: --mac --arm64
-          # macos-13 was retired; jobs targeting it are never assigned a runner
-          # and sit queued until GitHub expires them, which blocked `release`
-          # (needs: build) so no tag ever produced a Release automatically.
+          # macos-13 was retired on 2025-12-04. Jobs targeting a retired label are
+          # never assigned a runner and sit queued until GitHub expires them,
+          # which blocked `release` (needs: build) so no tag ever produced a
+          # Release automatically — for several versions, unnoticed.
+          #
+          # macos-15-intel is GitHub's documented replacement, and is itself the
+          # last of its kind: x86_64 macOS runners end in August 2027. When this
+          # label goes the same way, an Intel Mac build stops being possible on
+          # GitHub-hosted runners at all, so drop the leg rather than relabel it.
           - os: macos-15-intel  # Intel
             name: mac-x64
             builder_args: --mac --x64
