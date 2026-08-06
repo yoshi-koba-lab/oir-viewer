@@ -5,6 +5,28 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.2.7 — 2026-08-06 — Packaged builds could not open a .oir at all, on any
+//     platform. scyjava's __init__ ends with `__version__ = get_version("scyjava")`,
+//     which reads its own .dist-info at import time; PyInstaller collects modules
+//     but not .dist-info, so `import scyjava` raised PackageNotFoundError in every
+//     packaged build. That is an ImportError subclass, and reader.py caught it and
+//     reported "scyjava is needed. pip install scyjava jpype1" — about a package
+//     sitting right there in the bundle. .tif kept working because TIFF never goes
+//     through Java, which is what made it look like a file-format problem.
+//     Reproduced against the shipped 1.2.2 DMG before fixing: opening a .oir
+//     returned exactly that message; opening a .tif returned a correct
+//     FileNotFoundError. The Mac release was equally broken and nobody noticed,
+//     because running from source sees site-packages metadata.
+//     copy_metadata now ships the metadata for scyjava, jgo and JPype1, and the
+//     import failure reports the real exception type and text — in a frozen build
+//     as a broken bundle rather than as advice to pip install. Guessing at the
+//     cause is what let missing metadata masquerade as a missing dependency for a
+//     whole release.
+//     A --selftest flag walks the actual path (import scyjava, start the bundled
+//     JVM, jimport the four Bio-Formats classes the reader uses) and CI runs it on
+//     every platform before building an installer. The old smoke test only asked
+//     whether the server answered /api/images, which a build that cannot reach
+//     Java passes.
 //   1.2.6 — 2026-08-06 — A failed Open says why. On Windows, picking a file and
 //     pressing Open did nothing at all: no image, no error. The open WAS failing
 //     and the toolbar WAS recording the reason — into `openError`, which is only
@@ -152,4 +174,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.2.6';
+export const VERSION = '1.2.7';

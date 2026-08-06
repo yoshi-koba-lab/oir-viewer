@@ -43,7 +43,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
-from reader import ImageReader, describe_runtime, prewarm_jvm as _prewarm_jvm
+from reader import ImageReader, describe_runtime, prewarm_jvm as _prewarm_jvm, selftest
 from processor import adjust_contrast, auto_contrast, compute_histogram, to_png_bytes
 from roi import line_profile, measure_roi
 
@@ -1423,6 +1423,9 @@ def main():
     pywebview window of its own.
     """
     _log_environment()
+    # A build that cannot reach Bio-Formats must fail the pipeline, not the user.
+    if "--selftest" in sys.argv:
+        raise SystemExit(selftest())
     use_webview = "--no-webview" not in sys.argv and not getattr(sys, "frozen", False)
     if use_webview:
         try:

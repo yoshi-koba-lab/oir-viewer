@@ -65,6 +65,16 @@ jobs:
       - name: Package the backend
         run: pyinstaller backend/oir-viewer-backend.spec --noconfirm --distpath dist --workpath build
 
+      # The smoke test below only proves the server answers. A build with no
+      # working Java at all passes it — and one shipped: PyInstaller collects
+      # modules but not .dist-info, scyjava reads its own metadata at import, and
+      # every .oir failed while .tif kept working. This walks the real path.
+      - name: Self-test Bio-Formats in the packaged backend
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then EXE=dist/backend/oir-viewer-backend.exe; else EXE=dist/backend/oir-viewer-backend; fi
+          "$EXE" --selftest
+
       - name: Smoke-test the packaged backend
         shell: bash
         run: |

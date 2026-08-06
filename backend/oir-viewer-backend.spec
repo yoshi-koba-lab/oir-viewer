@@ -11,6 +11,8 @@
 #   pyinstaller backend/oir-viewer-backend.spec --noconfirm --distpath dist --workpath build
 import os
 
+from PyInstaller.utils.hooks import collect_submodules, copy_metadata
+
 BACKEND = os.path.abspath(os.path.join(SPECPATH))          # noqa: F821 (PyInstaller global)
 ROOT = os.path.dirname(BACKEND)
 
@@ -31,6 +33,18 @@ if os.path.isdir(dist):
 else:
     raise SystemExit("frontend/dist is missing — run `npm run build` in frontend/ first.")
 
+# Package METADATA, not just the modules. scyjava's __init__ ends with
+# `__version__ = get_version("scyjava")`, i.e. it reads its own .dist-info at
+# import time — and PyInstaller collects modules but not .dist-info. So the
+# packaged app raised PackageNotFoundError from `import scyjava`, which is an
+# ImportError subclass, which reader.py caught and reported as "scyjava is not
+# installed. pip install scyjava jpype1" — about a package that was right there.
+# Every .oir failed that way while .tif kept working, because TIFF never goes
+# through Java. Not wrapped in try/except: a build whose requirements are not
+# installed must fail here rather than ship broken again.
+for _pkg in ("scyjava", "jgo", "JPype1"):
+    datas += copy_metadata(_pkg)
+
 # scyjava/jgo and uvicorn resolve pieces dynamically, so name them explicitly.
 hiddenimports = [
     "scyjava", "jpype", "jpype._core", "jgo",
@@ -40,6 +54,7 @@ hiddenimports = [
     # The file picker on Windows/Linux runs through tkinter.
     "tkinter", "tkinter.filedialog",
 ]
+hiddenimports += collect_submodules("scyjava")
 
 a = Analysis(                                              # noqa: F821
     [os.path.join(BACKEND, "main.py")],
@@ -49,7 +64,12 @@ a = Analysis(                                              # noqa: F821
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
-    excludes=["matplotlib", "pytest", "IPython", "notebook"],
+    # Qt is never used in a frozen build — main() only reaches pywebview when
+    # NOT frozen. Excluding it also makes the build reproducible: PyInstaller
+    # aborts outright if the build machine has two Qt bindings installed, which
+    # an Anaconda environment commonly does.
+    excludes=["matplotlib", "pytest", "IPython", "notebook",
+              "PyQt5", "PyQt6", "PySide2", "PySide6"],
     noarchive=False,
 )
 pyz = PYZ(a.pure)                                          # noqa: F821

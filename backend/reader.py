@@ -408,13 +408,29 @@ class ImageReader:
         """Load using scyjava + Bio-Formats Java directly (no bioio needed)."""
         ext = Path(path).suffix.lower()
 
+        # Never translate this failure into advice. It used to say "scyjava is
+        # needed, pip install scyjava jpype1" for ANY ImportError — and scyjava's
+        # __init__ reads its own .dist-info, which PyInstaller does not collect,
+        # so `import scyjava` raised PackageNotFoundError (an ImportError
+        # subclass) in every packaged build. The real fault was missing metadata
+        # for a package that was present, and the guess about a missing install
+        # hid it for a whole release. Report the type and text, and in a frozen
+        # build say what it actually is: a broken bundle, not the user's setup.
         try:
             import scyjava
-        except ImportError:
+        except Exception as e:
+            detail = f"{type(e).__name__}: {e}"
+            if getattr(sys, "frozen", False):
+                raise RuntimeError(
+                    f"{ext} の読み込みに必要な Java 連携（scyjava）を初期化できませんでした。\n"
+                    f"{detail}\n"
+                    "同梱物の不足です。この画面の文言とログを添えて報告してください。"
+                ) from e
             raise RuntimeError(
                 f"{ext} の読み込みには scyjava が必要です。\n"
-                "pip install scyjava jpype1"
-            )
+                f"{detail}\n"
+                "pip install -r backend/requirements.txt"
+            ) from e
 
         _start_jvm(scyjava)
 
@@ -856,3 +872,35 @@ def _read_channel_colors(meta, n_c: int) -> list[list[int]]:
     except Exception:
         return []
     return colors
+
+def selftest() -> int:
+    """Prove this build can actually reach Bio-Formats. Returns an exit code.
+
+    The CI smoke test only checked that the server answered /api/images, which a
+    build with no working Java at all passes — and one shipped. This walks the
+    real path instead: import scyjava (the step that PackageNotFoundError broke),
+    start the bundled JVM, and jimport every class the reader needs. Anything
+    that fails here would have failed on the user's first .oir.
+    """
+    print(f"selftest: {describe_runtime()}", flush=True)
+    try:
+        import scyjava
+    except Exception as e:
+        print(f"selftest FAILED: import scyjava -> {type(e).__name__}: {e}", flush=True)
+        return 1
+    print(f"selftest: scyjava {getattr(scyjava, '__version__', '?')} imported", flush=True)
+    try:
+        _start_jvm(scyjava)
+    except Exception as e:
+        print(f"selftest FAILED: JVM -> {type(e).__name__}: {e}", flush=True)
+        return 2
+    for cls in ("loci.formats.ImageReader", "loci.formats.MetadataTools",
+                "loci.common.services.ServiceFactory", "loci.formats.FormatTools"):
+        try:
+            scyjava.jimport(cls)
+        except Exception as e:
+            print(f"selftest FAILED: jimport {cls} -> {type(e).__name__}: {e}", flush=True)
+            return 3
+        print(f"selftest: {cls} OK", flush=True)
+    print("selftest : OK", flush=True)
+    return 0
