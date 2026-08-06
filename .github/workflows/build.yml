@@ -10,6 +10,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Each push to main supersedes the last. Without this, runs that cannot get a
+# runner pile up and sit queued for hours behind one another.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
 jobs:
   build:
     # The architecture is set here on the CLI and nowhere else. The bundled Python
@@ -25,13 +31,18 @@ jobs:
           - os: macos-14        # Apple silicon
             name: mac-arm64
             builder_args: --mac --arm64
-          - os: macos-13        # Intel
+          # macos-13 was retired; jobs targeting it are never assigned a runner
+          # and sit queued until GitHub expires them, which blocked `release`
+          # (needs: build) so no tag ever produced a Release automatically.
+          - os: macos-15-intel  # Intel
             name: mac-x64
             builder_args: --mac --x64
           - os: windows-latest
             name: win-x64
             builder_args: --win --x64
     runs-on: ${{ matrix.os }}
+    # A leg that wedges should fail and let the others release, not run for hours.
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -108,7 +119,10 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    # `!cancelled()` rather than `success()`: one platform failing to build must
+    # not withhold the installers that did build. The Release then simply carries
+    # fewer files, which is visible, instead of not existing at all.
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     needs: build
     runs-on: ubuntu-latest
     permissions:
