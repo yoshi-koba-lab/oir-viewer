@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import threading
 
 import numpy as np
 from pathlib import Path
@@ -101,6 +102,67 @@ def _libjvm(jre_home: Path) -> Path | None:
     return found[0] if found else None
 
 
+def _prepare_windows_dll_search(jre_home: Path) -> None:
+    """Let Windows resolve jvm.dll's own dependencies.
+
+    JPype loads the JVM with a plain LoadLibraryW on the full path (see
+    native/common/jp_platform.cpp), and that does NOT put the library's own
+    directory on the search path for the DLLs it in turn imports. jvm.dll needs
+    msvcp140.dll, vcruntime140.dll and vcruntime140_1.dll, which Zulu ships in
+    <jre>/bin — so on a machine without the Visual C++ redistributable in
+    System32 the load fails with error 126, "the specified module could not be
+    found", naming jvm.dll rather than the DLL that was actually missing.
+
+    macOS and Linux resolve a dylib/so's dependencies relative to the library
+    itself, which is why this only ever bites the Windows build.
+    """
+    if sys.platform != "win32":
+        return
+    for d in (jre_home / "bin", jre_home / "bin" / "server"):
+        if not d.is_dir():
+            continue
+        try:
+            os.add_dll_directory(str(d))
+        except (AttributeError, OSError):
+            pass
+        # Belt and braces: the JVM also spawns helpers that read PATH.
+        os.environ["PATH"] = f"{d}{os.pathsep}{os.environ.get('PATH', '')}"
+
+
+def prewarm_jvm() -> None:
+    """Start the JVM ahead of the first file, and log the outcome either way.
+
+    Two reasons. A JVM that will not start is otherwise invisible until someone
+    opens a file, and then it surfaces as "this file will not open" — the wrong
+    diagnosis entirely. And the cold start costs several seconds, which the user
+    would otherwise pay while staring at their first image not appearing.
+
+    Never raises: this runs on a background thread at startup, where a failure
+    must not stop the server. The open path starts the JVM itself if this did
+    not manage it, and reports properly from there.
+    """
+    try:
+        import scyjava
+        _start_jvm(scyjava)
+    except Exception as e:
+        print(f"JVM prewarm failed ({type(e).__name__}): {e}", flush=True)
+
+
+def describe_runtime() -> str:
+    """One line naming the Java runtime this process will use, for the log."""
+    runtime = _runtime_dir()
+    if not runtime:
+        return "no bundled runtime found (development fallback: Maven/cjdk)"
+    jre = _jre_home(runtime / "jre")
+    libjvm = _libjvm(jre)
+    jars = list((runtime / "jars").glob("*.jar"))
+    return (f"{runtime} | jvm={libjvm or 'MISSING'} | {len(jars)} jars"
+            f" | formats-gpl={'yes' if any(j.name.startswith('formats-gpl') for j in jars) else 'NO'}")
+
+
+_JVM_LOCK = threading.Lock()
+
+
 def _start_jvm(scyjava) -> None:
     """Start the JVM for Bio-Formats, offline when a bundled runtime is present.
 
@@ -108,7 +170,17 @@ def _start_jvm(scyjava) -> None:
     the bundled JRE and jars are handed straight to JPype. scyjava then sees a
     running JVM and its jimport works unchanged. Without a bundle (development)
     it falls back to scyjava's own Maven-backed startup.
+
+    Serialised: FastAPI runs the sync open endpoint on a thread pool, so two
+    files opened at once both saw a stopped JVM and both called startJVM. The
+    loser got `OSError: JVM is already started` and its file failed for a reason
+    that had nothing to do with the file.
     """
+    with _JVM_LOCK:
+        _start_jvm_locked(scyjava)
+
+
+def _start_jvm_locked(scyjava) -> None:
     if scyjava.jvm_started():
         return
 
@@ -120,10 +192,31 @@ def _start_jvm(scyjava) -> None:
         libjvm = _libjvm(jre)
         if jars and libjvm:
             os.environ.setdefault("JAVA_HOME", str(jre))
-            jpype.startJVM(str(libjvm), classpath=jars, convertStrings=False)
+            _prepare_windows_dll_search(jre)
+            try:
+                jpype.startJVM(str(libjvm), classpath=jars, convertStrings=False)
+            except Exception as e:
+                # Without this the caller reports a bare OSError with a Windows
+                # error number, which says nothing about Java being the problem.
+                raise RuntimeError(
+                    "Java（Bio-Formats）を起動できませんでした。\n"
+                    f"{type(e).__name__}: {e}\n"
+                    f"JVM: {libjvm}"
+                ) from e
             print(f"JVM started from bundled runtime ({len(jars)} jars)", flush=True)
             return
-        print(f"Bundled runtime at {runtime} is incomplete; falling back", flush=True)
+        missing = "jvm library" if not libjvm else "jars"
+        print(f"Bundled runtime at {runtime} is incomplete ({missing} missing)", flush=True)
+        if getattr(sys, "frozen", False):
+            # In a packaged build there is nothing to fall back TO: the Maven
+            # path below needs a network and a JDK the user was promised they
+            # would not need. Say so instead of failing later with a download
+            # error that looks like a connectivity problem.
+            raise RuntimeError(
+                f"同梱の Java ランタイムが不完全です（{missing} が見つかりません）。\n"
+                f"場所: {runtime}\n"
+                "アプリを再インストールしてください。"
+            )
 
     scyjava.config.endpoints.append("ome:formats-gpl:8.0.1")
     scyjava.start_jvm()

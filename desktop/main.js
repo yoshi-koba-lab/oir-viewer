@@ -89,11 +89,16 @@ function startBackend() {
     }, BACKEND_TIMEOUT_MS);
 
     const scan = (chunk) => {
-      const text = chunk.toString();
+      const text = chunk.toString('utf8');
       backendLog += text;
-      process.stdout.write(`[backend] ${text}`);
+      // A packaged Windows app has no console behind process.stdout, and a
+      // write to a closed pipe there throws rather than being dropped.
+      try { process.stdout.write(`[backend] ${text}`); } catch { /* no console */ }
       if (logStream) logStream.write(text);
-      const m = text.match(/listening on http:\/\/127\.0\.0\.1:(\d+)/);
+      // Match the accumulated output, not this chunk: a pipe can split the
+      // startup line, and then the port is never seen and the app waits out
+      // its whole timeout with a backend that is up and serving.
+      const m = backendLog.match(/listening on http:\/\/127\.0\.0\.1:(\d+)/);
       if (m && !settled) {
         settled = true;
         clearTimeout(timer);

@@ -33,6 +33,16 @@ function describeError(e: unknown, what: string): string {
 }
 
 /**
+ * Last path segment, for either separator. Splitting on '/' alone left Windows
+ * paths whole, so a message meant to name one file printed its entire
+ * `C:\Users\...` path and pushed the actual reason off the end.
+ */
+export function basename(p: string): string {
+  const parts = p.split(/[\\/]/);
+  return parts[parts.length - 1] || p;
+}
+
+/**
  * Monotonic token for whole-image switches. Rapid tab clicks used to interleave —
  * one run's metadata could land with another run's pixels — so every entry point
  * that swaps the active image takes a token and abandons its writes if a newer
@@ -180,11 +190,20 @@ export async function closeImageById(id: string) {
   }
 }
 
-/** Open a file by path, add to image list. */
+/**
+ * Open a file by path, add to image list.
+ *
+ * Rethrows so a caller can still react, but records the failure in the store on
+ * the way out. Callers used to own that entirely, and the toolbar's Open button
+ * put its message somewhere that was not on screen — a failed open then looked
+ * exactly like nothing happening at all. The store's toast is always mounted,
+ * so routing through it means no open can fail silently again.
+ */
 export async function openAndReload(path: string) {
   const store = useImageStore.getState();
   store.saveViewState();
   store.setLoading(true);
+  store.setLoadError(null);
   try {
     const m = await openFile(path);
     const id = m.id!;
@@ -198,6 +217,9 @@ export async function openAndReload(path: string) {
 
     await loadChannelData(id);
     await refreshImageList();
+  } catch (e) {
+    store.setLoadError(describeError(e, `${basename(path)} を開けません`));
+    throw e;
   } finally {
     store.setLoading(false);
   }
@@ -208,6 +230,7 @@ export async function uploadAndReload(file: File) {
   const store = useImageStore.getState();
   store.saveViewState();
   store.setLoading(true);
+  store.setLoadError(null);
   try {
     const m = await uploadFile(file);
     const id = m.id!;
@@ -221,6 +244,9 @@ export async function uploadAndReload(file: File) {
 
     await loadChannelData(id);
     await refreshImageList();
+  } catch (e) {
+    store.setLoadError(describeError(e, `${file.name} を読み込めません`));
+    throw e;
   } finally {
     store.setLoading(false);
   }

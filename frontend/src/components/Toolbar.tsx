@@ -1,7 +1,7 @@
 import { useRef, useState } from 'react';
 import { useViewStore, type ROITool, type ViewMode } from '../stores/viewStore';
 import { useImageStore } from '../stores/imageStore';
-import { openAndReload } from '../hooks/useImageLoader';
+import { openAndReload, basename } from '../hooks/useImageLoader';
 import { chooseFiles } from '../utils/api';
 import { SaveDialog } from './SaveDialog';
 import { ProjectionDialog } from './ProjectionDialog';
@@ -31,7 +31,22 @@ export function Toolbar() {
   const [filePath, setFilePath] = useState('');
   const [openError, setOpenError] = useState('');
   const [opening, setOpening] = useState(false);
+  const setLoadError = useImageStore((s) => s.setLoadError);
   const roiToolsUsable = viewMode === '2d';
+
+  /**
+   * Show a failure everywhere it could be looked for.
+   *
+   * `openError` renders inside the path-entry modal only, but the primary Open
+   * button opens the OS picker with that modal closed — so its errors were set
+   * into an element that was not mounted and the user saw the button flick back
+   * to "Open" with no explanation. The store's toast is always on screen; the
+   * modal copy stays for when the path box is the thing being used.
+   */
+  const report = (msg: string) => {
+    setOpenError(msg);
+    setLoadError(msg);
+  };
 
   const handleOpen = async () => {
     const path = filePath.trim();
@@ -43,7 +58,7 @@ export function Toolbar() {
       setShowOpenDialog(false);
       setFilePath('');
     } catch (e: unknown) {
-      setOpenError(e instanceof Error ? e.message : 'Failed to open file');
+      report(e instanceof Error ? e.message : 'Failed to open file');
     } finally {
       setOpening(false);
     }
@@ -55,23 +70,29 @@ export function Toolbar() {
     setOpening(true);
     try {
       const picked = await chooseFiles();
-      if (picked.cancelled || picked.paths.length === 0) return;
+      if (picked.cancelled) return;
+      if (picked.paths.length === 0) {
+        // Not a cancel, but nothing came back either. Silence here is how a
+        // broken picker looks identical to a working one.
+        report('ファイルが選択されませんでした（ファイル選択ダイアログから何も返りませんでした）');
+        return;
+      }
       const failures: string[] = [];
       for (const p of picked.paths) {
         try {
           await openAndReload(p);
         } catch (e) {
-          failures.push(`${p.split('/').pop()}: ${e instanceof Error ? e.message : e}`);
+          failures.push(`${basename(p)}: ${e instanceof Error ? e.message : e}`);
         }
       }
       if (failures.length) {
-        setOpenError(failures.join('\n'));
+        report(failures.join('\n'));
       } else {
         setShowOpenDialog(false);
         setFilePath('');
       }
     } catch (e: unknown) {
-      setOpenError(e instanceof Error ? e.message : 'Failed to open the file picker');
+      report(e instanceof Error ? e.message : 'Failed to open the file picker');
     } finally {
       setOpening(false);
     }

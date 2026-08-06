@@ -7,7 +7,32 @@ import os
 import tempfile
 import threading
 import base64
+import traceback
 import uuid
+
+
+def _force_utf8_stdio() -> None:
+    """Make logging incapable of killing the server.
+
+    stdout and stderr here are pipes the Electron shell reads, so Python picks
+    the OS locale encoding for them: cp1252 on an English Windows, cp932 on a
+    Japanese one. Neither can encode an em dash or a 'µ', both of which appear
+    in this app's own log lines — and print() raises UnicodeEncodeError rather
+    than dropping the character. Raised during startup that kills the process
+    before it ever listens; raised inside a handler it turns an unrelated
+    request into a 400. macOS and Linux never see it because their streams are
+    UTF-8 already, which is exactly why it survived to a Windows install.
+
+    Must run before anything prints, i.e. before the first import that might.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass  # already gone, or not a text stream — nothing to protect
+
+
+_force_utf8_stdio()
 
 import numpy as np
 import uvicorn
@@ -18,7 +43,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
-from reader import ImageReader
+from reader import ImageReader, describe_runtime, prewarm_jvm as _prewarm_jvm
 from processor import adjust_contrast, auto_contrast, compute_histogram, to_png_bytes
 from roi import line_profile, measure_roi
 
@@ -96,6 +121,9 @@ def _restore_session() -> int:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """App lifespan: restore the previous session, or load dummy data for dev."""
+    # Daemon thread: the JVM's cold start is seconds long and must not delay the
+    # port line the shell is waiting on, nor keep the process alive at exit.
+    threading.Thread(target=_prewarm_jvm, name="jvm-prewarm", daemon=True).start()
     restored = _restore_session()
     if restored:
         print(f"Restored {restored} image(s) from previous session")
@@ -103,7 +131,7 @@ async def lifespan(app: FastAPI):
         r = ImageReader()
         r.load_dummy()
         add_image(r)
-        print("No session to restore — loaded dummy data")
+        print("No session to restore - loaded dummy data")
     yield
     # (no shutdown cleanup needed — session is persisted incrementally)
 
@@ -187,16 +215,38 @@ async def close_image(image_id: str):
     return {"closed": image_id, "active_id": active_id}
 
 
+def _describe(e: BaseException) -> str:
+    """A message that always says something.
+
+    Several failures on the way into a file carry no text at all — an empty
+    OSError, a Java exception whose toString() is just its class name. Those
+    reached the UI as an empty red bar, so the exception type is included
+    whenever the message alone would not identify it.
+    """
+    msg = str(e).strip()
+    name = type(e).__name__
+    if not msg:
+        return f"{name}（詳細なし）"
+    if name in ("RuntimeError", "ValueError") or name in msg:
+        return msg
+    return f"{msg}（{name}）"
+
+
 @app.get("/api/open")
 def open_file(path: str = Query(...)):
     """Open an image file by path."""
     try:
+        print(f"Opening {path}", flush=True)
         r = ImageReader()
         r.load_file(path)
         img_id = add_image(r)
         return {**r.metadata.to_dict(), "id": img_id}
     except Exception as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
+        # str(e) alone is what the UI shows, and for a JVM or Bio-Formats
+        # failure that is often a bare class name. The traceback goes to the
+        # log file so the cause is recoverable without reproducing it.
+        traceback.print_exc()
+        return JSONResponse(status_code=400, content={"error": _describe(e)})
 
 
 def _safe_upload_name(raw: str | None) -> str:
@@ -240,7 +290,8 @@ async def upload_file(file: UploadFile = File(...)):
         img_id = add_image(r)
         return {**r.metadata.to_dict(), "id": img_id}
     except Exception as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
+        traceback.print_exc()
+        return JSONResponse(status_code=400, content={"error": _describe(e)})
 
 
 @app.get("/api/metadata")
@@ -1348,6 +1399,22 @@ def start_server():
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
 
 
+def _log_environment() -> None:
+    """Describe this build at the top of the shell's log file.
+
+    The shell records everything the backend prints (see desktop/main.js), so a
+    report can start from the log rather than from a round of questions: which
+    encodings the streams ended up with, and whether a Java runtime was found
+    at all — a jvm library or a formats-gpl jar missing here is the difference
+    between "this file will not open" and "no file will ever open".
+    """
+    print(f"OIR Viewer backend | {sys.platform} | python {sys.version.split()[0]}"
+          f" | frozen={bool(getattr(sys, 'frozen', False))}", flush=True)
+    print(f"stdout encoding: {getattr(sys.stdout, 'encoding', '?')}"
+          f" | filesystem: {sys.getfilesystemencoding()}", flush=True)
+    print(f"java runtime: {describe_runtime()}", flush=True)
+
+
 def main():
     """Launch as desktop app with pywebview, or standalone server.
 
@@ -1355,6 +1422,7 @@ def main():
     and spawns this executable with no arguments, so it must not try to open a
     pywebview window of its own.
     """
+    _log_environment()
     use_webview = "--no-webview" not in sys.argv and not getattr(sys, "frozen", False)
     if use_webview:
         try:

@@ -5,6 +5,36 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.2.6 — 2026-08-06 — A failed Open says why. On Windows, picking a file and
+//     pressing Open did nothing at all: no image, no error. The open WAS failing
+//     and the toolbar WAS recording the reason — into `openError`, which is only
+//     rendered inside the path-entry modal. The primary Open button opens the OS
+//     picker with that modal closed, so the message went into an element that was
+//     not mounted, the button flicked back from "Opening…", and the failure was
+//     indistinguishable from a dead button. Failures now go through the store's
+//     banner, which is always on screen; openAndReload/uploadAndReload record
+//     there themselves, so no caller can swallow one again. The banner no longer
+//     times out (eight seconds is not long enough to read a Java error, let alone
+//     pass it on), wraps multi-line text, and is selectable. Drag-and-drop's own
+//     toast is gone — two red boxes at the same coordinates.
+//     The reason also reaches the log 1.2.5 started writing: /api/open and
+//     /api/upload print a traceback there rather than only a one-line summary,
+//     and the backend opens with the stream encodings and the resolved Java
+//     runtime — which jvm library, how many jars, whether formats-gpl is among
+//     them. The JVM is started on a background thread at launch, so a Java
+//     runtime that cannot start is reported as that instead of surfacing later
+//     as "this file will not open", and the first file no longer pays the
+//     multi-second cold start.
+//     Three Windows-only defects found by reading the shipped 1.2.3 installer:
+//     stdout is a pipe, so Python encoded it as cp1252/cp932 and print() raised
+//     UnicodeEncodeError on the em dash in this app's own startup line — fatal
+//     inside lifespan on a Japanese install; both streams are now forced to UTF-8.
+//     JPype loads jvm.dll with a bare LoadLibraryW, which does not search the
+//     library's own directory for the msvcp140/vcruntime140 DLLs Zulu ships beside
+//     it, so <jre>/bin is added to the DLL search path (macOS and Linux resolve
+//     these relative to the library, which is why only Windows was exposed).
+//     And concurrent opens both saw a stopped JVM and both called startJVM, the
+//     loser failing with "JVM is already started" — now serialised.
 //   1.2.5 — 2026-08-06 — The backend's output is written to a file. It went to the
 //     Electron main process's stdout, and a packaged GUI app on Windows has no
 //     console attached — so every Python traceback went nowhere and a failure left
@@ -122,4 +152,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.2.5';
+export const VERSION = '1.2.6';

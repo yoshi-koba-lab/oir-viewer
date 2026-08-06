@@ -25,7 +25,6 @@ function App() {
   const metadata = useImageStore((s) => s.metadata);
   const viewMode = useViewStore((s) => s.viewMode);
   const [dragOver, setDragOver] = useState(false);
-  const [dropError, setDropError] = useState('');
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -43,18 +42,19 @@ function App() {
     e.preventDefault();
     e.stopPropagation();
     setDragOver(false);
-    setDropError('');
 
     const files = Array.from(e.dataTransfer.files);
     if (files.length === 0) return;
 
+    // uploadAndReload records the reason in the store, which LoadErrorToast
+    // renders and keeps on screen. Catching here only stops the rejection from
+    // going unhandled — a second local toast would just overlap the first.
     try {
       for (const file of files) {
         await uploadAndReload(file);
       }
-    } catch (err: unknown) {
-      setDropError(err instanceof Error ? err.message : 'Failed to open file');
-      setTimeout(() => setDropError(''), 5000);
+    } catch {
+      /* already reported */
     }
   }, []);
 
@@ -115,13 +115,6 @@ function App() {
             <p className="text-lg font-semibold">Drop image file to open</p>
             <p className="text-sm text-[var(--text-secondary)] mt-1">.oir, .oif, .oib, .tif, .nd2, ...</p>
           </div>
-        </div>
-      )}
-
-      {/* Drop error toast */}
-      {dropError && (
-        <div className="absolute top-12 left-1/2 -translate-x-1/2 z-50 bg-red-600 text-white text-xs px-4 py-2 rounded-lg shadow-lg">
-          {dropError}
         </div>
       )}
 
@@ -214,21 +207,23 @@ function FileWarningBanner() {
   );
 }
 
-/** Dismissible toast for image load / tab switch failures. */
+/**
+ * Dismissible banner for image load / tab switch failures.
+ *
+ * It does not time out. These messages name the reason a file would not open,
+ * which is the one thing the user needs to read carefully and often to pass on;
+ * a toast that clears itself after a few seconds left them describing the
+ * failure as "nothing happens". It clears on dismissal, or when the next open
+ * starts.
+ */
 function LoadErrorToast() {
   const loadError = useImageStore((s) => s.loadError);
   const setLoadError = useImageStore((s) => s.setLoadError);
 
-  useEffect(() => {
-    if (!loadError) return;
-    const handle = setTimeout(() => setLoadError(null), 8000);
-    return () => clearTimeout(handle);
-  }, [loadError, setLoadError]);
-
   if (!loadError) return null;
   return (
-    <div className="absolute top-12 left-1/2 -translate-x-1/2 z-50 flex items-start gap-3 max-w-[520px] bg-red-600 text-white text-xs px-4 py-2 rounded-lg shadow-lg">
-      <span className="leading-snug">{loadError}</span>
+    <div className="absolute top-12 left-1/2 -translate-x-1/2 z-50 flex items-start gap-3 max-w-[640px] max-h-[50vh] overflow-y-auto bg-red-600 text-white text-xs px-4 py-2 rounded-lg shadow-lg">
+      <span className="leading-snug whitespace-pre-wrap break-words select-text">{loadError}</span>
       <button
         onClick={() => setLoadError(null)}
         className="shrink-0 opacity-70 hover:opacity-100 transition"
