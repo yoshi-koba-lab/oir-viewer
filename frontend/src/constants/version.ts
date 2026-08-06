@@ -5,6 +5,24 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.2.8 — 2026-08-06 — Reads an Olympus MATL plate acquisition. A Plate button
+//     opens a folder, parses matl.omp2info (plain XML, no Bio-Formats), and shows
+//     the acquisition in the plate's own shape — unacquired wells kept as empty
+//     cells in their real positions, which is also the layout a PDF export will
+//     use. Click wells to choose them, then open them as ordinary image tabs.
+//     Where a well sits is checked twice, against two independent sources: the
+//     label (B02 -> row B, column 2) and the stage coordinates in areaInfo. A
+//     transposed or shifted grid would otherwise produce a correctly rendered
+//     figure with the wrong labels, which nothing downstream could catch. All 8
+//     wells of the real acquisition agree.
+//     The XML names only per-tile files, never the stitched one the microscope
+//     also wrote, so that is derived (<prefix>_B02_G001_0001.oir ->
+//     Stitch_B02_G001.oir) and checked on disk. A well whose stitched file is
+//     missing is marked in red, never left looking unacquired.
+//     Wells open one at a time and awaited: these are ~1 GB volumes and eight
+//     concurrent opens is how the tab ran out of memory. One failure does not
+//     abort the run.
+//     3D-to-PDF batch export is not implemented; the dialog says so.
 //   1.2.7 — 2026-08-06 — Packaged builds could not open a .oir at all, on any
 //     platform. scyjava's __init__ ends with `__version__ = get_version("scyjava")`,
 //     which reads its own .dist-info at import time; PyInstaller collects modules
@@ -174,4 +192,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.2.7';
+export const VERSION = '1.2.8';

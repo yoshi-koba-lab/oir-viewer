@@ -1,0 +1,222 @@
+"""Read an Olympus MATL acquisition into a validated plate manifest.
+
+`matl.omp2info` is plain XML — no Bio-Formats needed. It describes the physical
+plate (`microPlate`) and one `group` per acquired well, each listing the per-tile
+`.oir` files it produced.
+
+What the viewer wants is the *stitched* file per well, which the microscope wrote
+alongside the tiles but which the XML never names. It is derived from a tile name
+(`<prefix>_B02_G001_0001.oir` -> `Stitch_B02_G001.oir`) and then checked on disk.
+
+Two independent sources agree on where a well sits: the label (`B02` -> row B,
+column 2) and the stage coordinates in `areaInfo`. Both are computed and compared,
+because a transposed or shifted grid would produce a correctly-rendered figure
+with the wrong labels — a mistake nothing downstream could catch.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from pathlib import Path
+
+MATL_NAMES = ("matl.omp2info", "matl_forVSIimages.omp2info")
+
+#: Olympus stores stage geometry in nanometres.
+NM_PER_MM = 1_000_000.0
+
+
+def _tag(e: ET.Element) -> str:
+    return e.tag.split("}")[-1]
+
+
+def _leaf_children(e: ET.Element) -> dict[str, str]:
+    """Direct children that carry text rather than structure."""
+    return {_tag(c): (c.text or "").strip() for c in e if len(c) == 0}
+
+
+@dataclass
+class Well:
+    well_id: str
+    row: int          # 0-based, A=0
+    col: int          # 0-based, column 1 = 0
+    enabled: bool
+    tiles: int
+    tile_grid: str    # "3x3"
+    stitch_path: str | None
+    stitch_bytes: int
+    chunk_count: int
+    #: Empty when the label and the stage coordinates agree.
+    position_warning: str = ""
+
+
+@dataclass
+class Plate:
+    name: str
+    rows: int
+    cols: int
+    source: str
+    matl_sha256: str
+    wells: list[Well] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "rows": self.rows,
+            "cols": self.cols,
+            "source": self.source,
+            "matl_sha256": self.matl_sha256,
+            "warnings": self.warnings,
+            "wells": [
+                {
+                    "well_id": w.well_id, "row": w.row, "col": w.col,
+                    "enabled": w.enabled, "tiles": w.tiles, "tile_grid": w.tile_grid,
+                    "stitch_path": w.stitch_path, "stitch_bytes": w.stitch_bytes,
+                    "chunk_count": w.chunk_count, "position_warning": w.position_warning,
+                }
+                for w in self.wells
+            ],
+        }
+
+
+def find_matl(where: str) -> Path | None:
+    """The MATL file for a folder, or the file itself if that is what was given."""
+    p = Path(where)
+    if p.is_file() and p.suffix.lower() == ".omp2info":
+        return p
+    if not p.is_dir():
+        return None
+    # MATL_NAMES is shortest-first on purpose: an acquisition carries both
+    # matl.omp2info and matl_forVSIimages.omp2info, and the plain one is the one
+    # to use. They are not compared — a difference between them is not a problem
+    # the user needs to hear about.
+    for name in MATL_NAMES:
+        if (p / name).is_file():
+            return p / name
+    # Some exports name it differently; take any single omp2info rather than guess.
+    found = sorted(p.glob("*.omp2info"))
+    return found[0] if len(found) == 1 else None
+
+
+def _well_id_to_rc(well_id: str) -> tuple[int, int] | None:
+    m = re.fullmatch(r"([A-Za-z])(\d{1,2})", well_id.strip())
+    if not m:
+        return None
+    return ord(m.group(1).upper()) - ord("A"), int(m.group(2)) - 1
+
+
+def _derive_stitch(tile_name: str) -> str | None:
+    """`<prefix>_B02_G001_0001.oir` -> `Stitch_B02_G001.oir`."""
+    m = re.fullmatch(r".+_(?P<well>[A-Za-z]\d{1,2})_(?P<grp>G\d+)_\d+\.oir", tile_name)
+    return f"Stitch_{m['well']}_{m['grp']}.oir" if m else None
+
+
+def scan(where: str) -> Plate:
+    """Parse a MATL acquisition. Raises ValueError with a reason the UI can show."""
+    matl = find_matl(where)
+    if matl is None:
+        raise ValueError(
+            "matl.omp2info が見つかりません。\n"
+            "MATL 撮影のフォルダ（.oir と matl.omp2info が入っているフォルダ）を選んでください。"
+        )
+    folder = matl.parent
+    raw = matl.read_bytes()
+    try:
+        root = ET.fromstring(raw.decode("ascii", "replace"))
+    except ET.ParseError as e:
+        raise ValueError(f"matl の XML を解析できません: {e}") from e
+
+    mp_list = [c for c in root if _tag(c) == "microPlate"]
+    if not mp_list:
+        raise ValueError("matl に microPlate の記述がありません（MATL 撮影ではない可能性があります）")
+    mp = _leaf_children(mp_list[0])
+    try:
+        rows, cols = int(mp["numOfRows"]), int(mp["numOfColumns"])
+    except (KeyError, ValueError) as e:
+        raise ValueError(f"プレートの行数・列数を読めません: {e}") from e
+
+    warnings: list[str] = []
+
+    groups = [g for g in root if _tag(g) == "group"]
+    if not groups:
+        raise ValueError("matl に取得ウェル（group）がありません")
+
+    # Stage coordinates are the independent check on the labels. Derived from the
+    # extremes so it needs no absolute origin, only a consistent pitch.
+    pitch_x = float(mp.get("columnSpace") or 0) or None
+    pitch_y = float(mp.get("rowSpace") or 0) or None
+    stage: dict[str, tuple[float, float]] = {}
+    for g in groups:
+        d = _leaf_children(g)
+        ai = [c for c in g if _tag(c) == "areaInfo"]
+        if not ai or "wellId" not in d:
+            continue
+        a = _leaf_children(ai[0])
+        try:
+            stage[d["wellId"]] = (float(a["areaLeft"]), float(a["areaTop"]))
+        except (KeyError, ValueError):
+            pass
+
+    wells: list[Well] = []
+    for g in groups:
+        d = _leaf_children(g)
+        wid = d.get("wellId", "").strip()
+        rc = _well_id_to_rc(wid)
+        if rc is None:
+            warnings.append(f"ウェル名を解釈できません: {wid!r}（このウェルは除外します）")
+            continue
+        row, col = rc
+        if not (0 <= row < rows and 0 <= col < cols):
+            warnings.append(f"{wid} はプレート（{rows}行×{cols}列）の外を指しています")
+
+        areas = [a for a in g if _tag(a) == "area"]
+        ai = [c for c in g if _tag(c) == "areaInfo"]
+        a = _leaf_children(ai[0]) if ai else {}
+        grid = f"{a.get('numOfXAreas', '?')}x{a.get('numOfYAreas', '?')}"
+
+        tile_names = [_leaf_children(x).get("image", "") for x in areas]
+        stitch_name = next((s for s in (_derive_stitch(t) for t in tile_names) if s), None)
+        stitch = folder / stitch_name if stitch_name else None
+        exists = bool(stitch and stitch.is_file())
+        chunks = 0
+        if exists and stitch is not None:
+            stem = stitch.name[: -len(".oir")]
+            chunks = len([p for p in folder.glob(f"{stem}_*") if p.suffix == ""])
+
+        # Compare the label against the stage grid.
+        warn = ""
+        if pitch_x and pitch_y and wid in stage and len(stage) >= 2:
+            xs = [v[0] for v in stage.values()]
+            ys = [v[1] for v in stage.values()]
+            ref_col = min(_well_id_to_rc(k)[1] for k in stage if _well_id_to_rc(k))
+            ref_row = min(_well_id_to_rc(k)[0] for k in stage if _well_id_to_rc(k))
+            c_stage = ref_col + round((stage[wid][0] - min(xs)) / pitch_x)
+            r_stage = ref_row + round((stage[wid][1] - min(ys)) / pitch_y)
+            if (r_stage, c_stage) != (row, col):
+                warn = (f"ラベル {wid} は行{row}列{col}ですが、"
+                        f"ステージ座標では行{r_stage}列{c_stage}です")
+
+        wells.append(Well(
+            well_id=wid, row=row, col=col,
+            enabled=(d.get("enable", "true").lower() != "false"),
+            tiles=len(areas), tile_grid=grid,
+            stitch_path=str(stitch) if exists else None,
+            stitch_bytes=(stitch.stat().st_size if exists and stitch else 0),
+            chunk_count=chunks, position_warning=warn,
+        ))
+
+    wells.sort(key=lambda w: (w.row, w.col))
+    missing = [w.well_id for w in wells if w.enabled and not w.stitch_path]
+    if missing:
+        warnings.append(
+            "Stitch 済みファイルが見つからないウェル: " + ", ".join(missing) +
+            "。PDF 出力には Stitch ファイルが必要です。"
+        )
+    return Plate(
+        name=mp.get("name", "?"), rows=rows, cols=cols,
+        source=str(folder), matl_sha256=hashlib.sha256(raw).hexdigest(),
+        wells=wells, warnings=warnings,
+    )

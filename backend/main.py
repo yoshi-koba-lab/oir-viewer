@@ -46,6 +46,7 @@ from pydantic import BaseModel
 from reader import ImageReader, describe_runtime, prewarm_jvm as _prewarm_jvm, selftest
 from processor import adjust_contrast, auto_contrast, compute_histogram, to_png_bytes
 from roi import line_profile, measure_roi
+import plate
 
 # Multi-image state: id -> ImageReader
 images: dict[str, ImageReader] = {}
@@ -880,6 +881,23 @@ def update_check(current: str = Query(...)):
         "url": RELEASES_PAGE,
         "checked": True,
     }
+
+
+@app.get("/api/plate/scan")
+def plate_scan(path: str = Query(...)):
+    """Read a MATL acquisition folder into a plate manifest.
+
+    Read-only: it parses XML and stats files. Nothing is opened through
+    Bio-Formats here, so scanning an eight-well acquisition costs milliseconds
+    and cannot pin a 4 GiB volume.
+    """
+    try:
+        return plate.scan(path).to_dict()
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse(status_code=400, content={"error": _describe(e)})
 
 
 @app.post("/api/projection")

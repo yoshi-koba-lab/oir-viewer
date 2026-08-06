@@ -5,6 +5,7 @@ import { openAndReload, basename } from '../hooks/useImageLoader';
 import { chooseFiles } from '../utils/api';
 import { SaveDialog } from './SaveDialog';
 import { ProjectionDialog } from './ProjectionDialog';
+import { PlateDialog } from './PlateDialog';
 import { VERSION } from '../constants/version';
 
 const roiTools: { id: ROITool; label: string; icon: string }[] = [
@@ -26,6 +27,7 @@ export function Toolbar() {
     useViewStore();
   const metadata = useImageStore((s) => s.metadata);
   const [showOpenDialog, setShowOpenDialog] = useState(false);
+  const [showPlate, setShowPlate] = useState(false);
   const [showSaveDialog, setShowSaveDialog] = useState(false);
   const [showProjection, setShowProjection] = useState(false);
   const [filePath, setFilePath] = useState('');
@@ -145,6 +147,17 @@ export function Toolbar() {
           Projection
         </button>
       )}
+
+      {/* Plate. Always enabled: it reads an acquisition folder, so it does not
+          depend on anything being open — and the workflow starts here. */}
+      <button
+        onClick={() => setShowPlate(true)}
+        className="px-2 py-1 rounded text-xs bg-[var(--border)] text-[var(--text-secondary)] hover:text-white transition"
+        title="MATL 撮影のプレート情報を読み込む"
+      >
+        Plate
+      </button>
+      {showPlate && <PlateDialog onClose={() => setShowPlate(false)} />}
 
       {/* Open file dialog */}
       {showOpenDialog && (

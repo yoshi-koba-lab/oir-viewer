@@ -548,3 +548,36 @@ export async function checkForUpdate(current: string): Promise<UpdateCheck> {
     return { update_available: false, latest: null, url: '', checked: false };
   }
 }
+
+export interface PlateWell {
+  well_id: string;
+  row: number;
+  col: number;
+  enabled: boolean;
+  tiles: number;
+  tile_grid: string;
+  /** null when the microscope's stitched file for this well is not on disk. */
+  stitch_path: string | null;
+  stitch_bytes: number;
+  chunk_count: number;
+  /** Set when the well label and the stage coordinates disagree. */
+  position_warning: string;
+}
+
+export interface PlateScan {
+  name: string;
+  rows: number;
+  cols: number;
+  source: string;
+  matl_sha256: string;
+  warnings: string[];
+  wells: PlateWell[];
+}
+
+/** Read a MATL acquisition folder (or its .omp2info) into a plate manifest. */
+export async function scanPlate(path: string): Promise<PlateScan> {
+  return getJson<PlateScan>(
+    `/api/plate/scan?path=${encodeURIComponent(path)}`,
+    'プレート情報を読めません',
+  );
+}
