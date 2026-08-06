@@ -610,10 +610,29 @@ export interface PlateVolumeRequest {
 }
 
 /** One well's volume as the binary layout plateRender.parseVolume expects. */
+/** The decoded X-Plate-Volume header: what the backend actually produced. */
+export interface PlateVolumeInfo {
+  channels: number[];
+  /** [z, h, w] of the returned volume. */
+  out: [number, number, number];
+  /** The XY cap applied; 0 means the source resolution. */
+  max_xy: number;
+  /** [n_c, n_z, h, w] of the source, before any downscale. */
+  source: [number, number, number, number];
+  bytes: number;
+  /** µm per voxel [x, y, z]; a zero means the file did not record it. */
+  voxel: [number, number, number];
+}
+
+export interface PlateVolume {
+  data: ArrayBuffer;
+  info: PlateVolumeInfo | null;
+}
+
 export async function fetchPlateVolume(
   req: PlateVolumeRequest,
   signal?: AbortSignal,
-): Promise<ArrayBuffer> {
+): Promise<PlateVolume> {
   let res: Response;
   try {
     res = await fetch('/api/plate/volume-bin', {
@@ -634,7 +653,15 @@ export async function fetchPlateVolume(
     );
   }
   if (!res.ok) throw new Error(await describeHttpError(res, 'ウェルの読み込みに失敗'));
-  return res.arrayBuffer();
+  let info: PlateVolumeInfo | null = null;
+  try {
+    const raw = res.headers.get('X-Plate-Volume');
+    if (raw) info = JSON.parse(raw) as PlateVolumeInfo;
+  } catch {
+    // Only carries voxel size and provenance; the volume itself is still usable.
+    info = null;
+  }
+  return { data: await res.arrayBuffer(), info };
 }
 
 export interface PlatePdfResult {

@@ -128,7 +128,11 @@ def scan(where: str) -> Plate:
     folder = matl.parent
     raw = matl.read_bytes()
     try:
-        root = ET.fromstring(raw.decode("ascii", "replace"))
+        # UTF-8, not ASCII. Plate and sample names are routinely Japanese, and
+        # "ascii", "replace" turns every one of those bytes into U+FFFD — so the
+        # name is already destroyed before it reaches the PDF, whatever font is
+        # used to draw it. The BOM Olympus sometimes writes is handled too.
+        root = ET.fromstring(raw.decode("utf-8-sig", "replace"))
     except ET.ParseError as e:
         raise ValueError(f"matl の XML を解析できません: {e}") from e
 
@@ -252,17 +256,37 @@ _WELL_LOCK = threading.Semaphore(1)
 
 
 def _resize_plane(plane: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
-    """Bilinear XY resize of one plane, allocating only plane-sized temporaries.
+    """Anti-aliased XY resize of one plane, allocating only plane-sized temporaries.
 
     The existing volume route resizes a whole (Z,Y,X) channel at once, which for
     this data means a 1.585 GiB float32 copy per channel. Per plane the same work
     peaks at a few megabytes.
+
+    Interpolation alone is not a downscale. `zoom(order=1)` reads the source at
+    the output sample positions, so shrinking 2911 -> 128 consults roughly one
+    pixel in 23 per axis and ignores the rest: a structure two pixels wide has
+    about a 1-in-10 chance of being sampled at all, and otherwise vanishes
+    completely rather than dimming. For thin epithelial signal that is the
+    difference between a figure and a wrong figure, and it gets worse the lower
+    the resolution — i.e. exactly in the Low preview meant for judging what to
+    export at full detail.
+
+    So the plane is low-pass filtered first, with sigma tied to the reduction
+    factor, which is what an anti-aliased resample means. Thin structures survive
+    as dimmer features instead of disappearing, and integrated signal is
+    preserved. No filtering is applied when not shrinking.
     """
-    from scipy.ndimage import zoom as ndzoom
+    from scipy.ndimage import gaussian_filter, zoom as ndzoom
     h, w = plane.shape
     if (h, w) == (out_h, out_w):
         return plane.astype(np.float32, copy=False)
-    return ndzoom(plane.astype(np.float32), (out_h / h, out_w / w), order=1)
+    src = plane.astype(np.float32)
+    fy, fx = h / out_h, w / out_w
+    if fy > 1 or fx > 1:
+        # skimage's convention: sigma = (factor - 1) / 2 per axis, no blur when
+        # that axis is not being reduced.
+        src = gaussian_filter(src, sigma=(max(fy - 1, 0) / 2, max(fx - 1, 0) / 2))
+    return ndzoom(src, (out_h / h, out_w / w), order=1)
 
 
 @dataclass
@@ -298,14 +322,45 @@ def read_low_volume(spec: VolumeSpec) -> tuple[dict, bytes]:
 
     _start_jvm(scyjava)
     ImageReader_j = scyjava.jimport("loci.formats.ImageReader")
+    MetadataTools = scyjava.jimport("loci.formats.MetadataTools")
     reader_j = ImageReader_j()
+    # Physical voxel size, so the export can be shaped like the sample rather
+    # than like a cube. A confocal stack is almost always anisotropic, and the
+    # interactive view already scales by these — without them the PDF is the one
+    # picture of this data that is the wrong shape.
+    ome = MetadataTools.createOMEXMLMetadata()
+    reader_j.setMetadataStore(ome)
     with _WELL_LOCK:
         try:
             reader_j.setId(str(p))
             n_c, n_z = reader_j.getSizeC(), reader_j.getSizeZ()
             h, w = reader_j.getSizeY(), reader_j.getSizeX()
+            # The pixel type comes from the file, as reader.py already does it.
+            # Hardcoding 16-bit here reinterpreted an 8-bit well's bytes in pairs:
+            # half the width, and values that are two unrelated pixels glued
+            # together. It renders as noise rather than failing.
             little = reader_j.isLittleEndian()
-            dtype = np.dtype("<u2" if little else ">u2")
+            FormatTools = scyjava.jimport("loci.formats.FormatTools")
+            pt = reader_j.getPixelType()
+            end = "<" if little else ">"
+            if pt == FormatTools.UINT8:
+                dtype = np.dtype("u1")
+            elif pt == FormatTools.INT8:
+                dtype = np.dtype("i1")
+            elif pt == FormatTools.UINT16:
+                dtype = np.dtype(end + "u2")
+            elif pt == FormatTools.INT16:
+                dtype = np.dtype(end + "i2")
+            elif pt == FormatTools.UINT32:
+                dtype = np.dtype(end + "u4")
+            elif pt == FormatTools.INT32:
+                dtype = np.dtype(end + "i4")
+            elif pt == FormatTools.FLOAT:
+                dtype = np.dtype(end + "f4")
+            elif pt == FormatTools.DOUBLE:
+                dtype = np.dtype(end + "f8")
+            else:
+                raise ValueError(f"未対応の画素型です (pixelType={pt})")
 
             want = [c for c in spec.channels if 0 <= c < n_c][:PLATE_MAX_CH]
             if not want:
@@ -346,9 +401,22 @@ def read_low_volume(spec: VolumeSpec) -> tuple[dict, bytes]:
             # the window that WAS applied rather than anything measured.
             meta = np.array([(int(lo), int(hi)) for lo, hi in spec.levels[:len(want)]],
                             dtype="<i4").tobytes()
+            def _phys(get) -> float:
+                try:
+                    v = get(0)
+                    return float(v.value().doubleValue()) if v is not None else 0.0
+                except Exception:
+                    return 0.0
+
             info = {
                 "channels": want, "out": [out_z, out_h, out_w], "max_xy": cap,
                 "source": [n_c, n_z, h, w], "bytes": len(header) + len(meta) + sum(map(len, planes)),
+                # µm per voxel. 0 means the file did not say, and the renderer
+                # then treats the volume as isotropic — the same fallback the
+                # interactive view uses.
+                "voxel": [_phys(ome.getPixelsPhysicalSizeX),
+                          _phys(ome.getPixelsPhysicalSizeY),
+                          _phys(ome.getPixelsPhysicalSizeZ)],
             }
             return info, header + meta + b"".join(planes)
         finally:

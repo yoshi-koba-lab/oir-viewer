@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { vertexShader, fragmentShader } from './volumeShader';
 import { volumeTooLarge } from './gpuLimits';
+import type { PlateVolumeInfo } from './api';
 
 /**
  * Renders volumes one at a time, off-screen, for plate export.
@@ -27,10 +28,22 @@ export interface VolumePayload {
   width: number;
   /** One R8 plane stack per channel, already windowed by the backend. */
   channels: Uint8Array[];
+  /**
+   * Physical extent of the SOURCE volume in µm, [x, y, z]. Used to shape the
+   * render like the sample. All-equal (the fallback when the file gives no
+   * voxel size) renders it as a cube, which is what an isotropic stack is.
+   */
+  physical?: [number, number, number];
 }
 
-/** Parse the binary layout /api/plate/volume-bin returns. */
-export function parseVolume(buf: ArrayBuffer): VolumePayload {
+/**
+ * Parse the binary layout /api/plate/volume-bin returns.
+ *
+ * `info` is the decoded X-Plate-Volume header. Its `voxel` is µm per voxel of
+ * the SOURCE, so the physical extent uses the source shape, not the downscaled
+ * one — a 23x XY reduction does not make the sample squatter.
+ */
+export function parseVolume(buf: ArrayBuffer, info?: PlateVolumeInfo): VolumePayload {
   const head = new Uint32Array(buf, 0, 8);
   const [nc, nz, h, w] = [head[0], head[1], head[2], head[3]];
   const perCh = nz * h * w;
@@ -40,7 +53,13 @@ export function parseVolume(buf: ArrayBuffer): VolumePayload {
     channels.push(new Uint8Array(buf, off, perCh));
     off += perCh;
   }
-  return { numChannels: nc, numZ: nz, height: h, width: w, channels };
+  let physical: [number, number, number] | undefined;
+  const vx = info?.voxel;
+  const src = info?.source;                       // [n_c, n_z, h, w] of the source
+  if (vx && src && vx[0] > 0 && vx[1] > 0 && vx[2] > 0) {
+    physical = [src[3] * vx[0], src[2] * vx[1], src[1] * vx[2]];
+  }
+  return { numChannels: nc, numZ: nz, height: h, width: w, channels, physical };
 }
 
 export class PlateRenderer {
@@ -133,6 +152,18 @@ export class PlateRenderer {
   ): Promise<RenderedWell> {
     const tooBig = volumeTooLarge(vol.width, vol.height, vol.numZ, vol.numChannels);
     if (tooBig) throw new Error(tooBig);
+
+    // Shape the box like the sample, exactly as Volume3DViewer does. A confocal
+    // stack is normally anisotropic — a 0.2 µm XY, 2 µm Z acquisition is 10:1 —
+    // and rendering it as a cube stretches Z tenfold. Without this the PDF is
+    // the one view of the data with the wrong proportions, which is worse than
+    // no PDF, because it still looks like a result.
+    const [pw, ph, pz] = vol.physical ?? [1, 1, 1];
+    const maxDim = Math.max(pw, ph, pz) || 1;
+    const sx = pw / maxDim, sy = ph / maxDim, sz = pz / maxDim;
+    this.mesh.scale.set(sx, sy, sz);
+    // Keep the box centred on 0.5 so the camera framing does not shift with it.
+    this.mesh.position.set((1 - sx) * 0.5, (1 - sy) * 0.5, (1 - sz) * 0.5);
 
     this.releaseTextures();
     const n = Math.min(vol.numChannels, 4);

@@ -175,7 +175,7 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
           max_xy: maxXy,
         }, abortRef.current.signal);
         setProgress(`${w.well_id} (${i + 1}/${targets.length}) 描画中…`);
-        const vol = parseVolume(buf);
+        const vol = parseVolume(buf.data, buf.info ?? undefined);
         const shot = await renderer.render(
           w.well_id, vol,
           chIdx.map((c) => channels[c].color),

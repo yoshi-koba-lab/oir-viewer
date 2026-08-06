@@ -5,7 +5,34 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
-//   1.3.0 — 2026-08-07 — Plate-to-PDF export, wired end to end. Choosing wells and
+//   1.3.0 — 2026-08-07 — Plate-to-PDF export, wired end to end, then audited before
+//     going to Windows for testing on real data. The audit found 24 real defects in
+//     this feature and every blocker was silent — each one produced a finished PDF
+//     that looked right and was wrong. The interesting ones:
+//     Downscaling was point-sampling. scipy's zoom(order=1) reads the source at the
+//     output sample positions, so 2911 -> 128 consulted about one pixel in 23 and
+//     ignored the rest. Measured on 2 px lines 97 px apart: 26 of 31 lines vanished
+//     completely, and the mean came out 115.9 / 250.0 / 90.3 at the three
+//     resolutions against a true 83.8 — wrong, and erratically so. Planes are now
+//     low-pass filtered by the reduction factor first, which is what an
+//     anti-aliased resample means: 43 columns keep signal instead of 5, and the
+//     mean lands at 86.6. Thin epithelial structure is the subject here, so the
+//     old behaviour was not a quality setting, it was data loss.
+//     matl.omp2info was decoded as ASCII, so a Japanese plate name was already
+//     U+FFFD before anything tried to draw it. And what drew it had no Japanese
+//     glyphs either — Helvetica and Arial render CJK as .notdef boxes rather than
+//     failing. Fonts are now chosen CJK-first and probed by rendering, because a
+//     missing glyph still has a bounding box: the only honest test is to draw the
+//     character and compare it against a codepoint no font defines.
+//     The export rendered every well as a cube. The interactive view scales by
+//     physical voxel size and this did not, so a 0.2/0.2/2.0 µm stack came out with
+//     Z stretched 1.33x — the PDF being the one view of the data with the wrong
+//     proportions, which is worse than no PDF because it still looks like a result.
+//     Both now read the same voxel size from the file.
+//     Pixel type was hardcoded to 16-bit, so an 8-bit well was reinterpreted in
+//     pairs: half the width, values glued from two unrelated pixels, rendering as
+//     noise rather than failing.
+//     Choosing wells and
 //     pressing "PDF を作成" now walks them one at a time — fetch the volume, render
 //     it offscreen, capture the frame, release the textures — and posts the frames
 //     to be composed. Verified on 8 synthetic wells: 9.9 s, every well in its own
