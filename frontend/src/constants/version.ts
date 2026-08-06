@@ -5,6 +5,24 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.2.9 — 2026-08-06 — Plate wells can be read without building the whole volume,
+//     and the JVM's heap is bounded. A well's stitched OIR is now streamed plane by
+//     plane: read one plane, resize it, apply the window the user set, write the
+//     bytes. The existing volume route instead loads (T,C,Z,Y,X) eagerly, resizes a
+//     whole channel at once and calls auto_contrast — 3.96 GiB per well to produce
+//     the 3.1 MiB a Low render needs, and it would auto-stretch, which plate export
+//     must never do.
+//     Streaming alone did NOT fix the memory, and measuring caught it: peak RSS
+//     still tracked the source, +73/+641/+1349 MB for 34/240/586 MB sources. The
+//     JVM sizes its maximum heap from physical RAM and grows into it rather than
+//     collecting, so resident memory followed the file — about 9 GB extrapolated to
+//     a real well. With the heap capped the same reads peak at +90/+479/+407 MB:
+//     bounded, and no longer a function of well size. Bio-Formats only ever needs a
+//     plane or two; the growth was slack.
+//     Also: this route never registers the image in the global map (which is what
+//     pinned a volume per well), closes the Java reader in a finally, admits one
+//     well at a time, and refuses anything but Low — the cap is enforced server
+//     side, not just in the UI.
 //   1.2.8 — 2026-08-06 — Reads an Olympus MATL plate acquisition. A Plate button
 //     opens a folder, parses matl.omp2info (plain XML, no Bio-Formats), and shows
 //     the acquisition in the plate's own shape — unacquired wells kept as empty
@@ -192,4 +210,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.2.8';
+export const VERSION = '1.2.9';

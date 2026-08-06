@@ -160,6 +160,12 @@ def describe_runtime() -> str:
             f" | formats-gpl={'yes' if any(j.name.startswith('formats-gpl') for j in jars) else 'NO'}")
 
 
+#: JVM heap ceiling, MB. Raise it via OIR_JVM_MAX_HEAP if a file ever needs more.
+try:
+    _JVM_MAX_HEAP_MB = max(256, int(os.environ.get("OIR_JVM_MAX_HEAP", "512")))
+except ValueError:
+    _JVM_MAX_HEAP_MB = 512
+
 _JVM_LOCK = threading.Lock()
 
 
@@ -194,7 +200,16 @@ def _start_jvm_locked(scyjava) -> None:
             os.environ.setdefault("JAVA_HOME", str(jre))
             _prepare_windows_dll_search(jre)
             try:
-                jpype.startJVM(str(libjvm), classpath=jars, convertStrings=False)
+                # Bound the heap. Left to itself the JVM sizes its maximum at a
+                # fraction of physical RAM and then grows into it rather than
+                # collecting, so resident memory tracked the size of the file
+                # being read: measured +1349 MB of peak RSS for a 586 MB source,
+                # and roughly linear — which would put a 4 GiB well near 9 GB.
+                # Capped, the same read peaks around 400 MB and stops depending on
+                # the file at all. Bio-Formats itself only ever needs a plane or
+                # two; the growth was slack, not need.
+                jpype.startJVM(str(libjvm), f"-Xmx{_JVM_MAX_HEAP_MB}m",
+                               classpath=jars, convertStrings=False)
             except Exception as e:
                 # Without this the caller reports a bare OSError with a Windows
                 # error number, which says nothing about Java being the problem.

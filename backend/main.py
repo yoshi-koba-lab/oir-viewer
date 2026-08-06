@@ -37,6 +37,7 @@ _force_utf8_stdio()
 import numpy as np
 import uvicorn
 from contextlib import asynccontextmanager
+import json
 import re
 from fastapi import FastAPI, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -893,6 +894,44 @@ def plate_scan(path: str = Query(...)):
     """
     try:
         return plate.scan(path).to_dict()
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse(status_code=400, content={"error": _describe(e)})
+
+
+class PlateVolumeRequest(BaseModel):
+    path: str
+    channels: list[int]
+    #: [[min, max], ...] aligned with `channels`. Required, never inferred: plate
+    #: export must not auto-stretch, so the caller sends the window the user set.
+    levels: list[list[float]]
+    t: int = 0
+
+
+@app.post("/api/plate/volume-bin")
+def plate_volume_bin(req: PlateVolumeRequest):
+    """One well's stitched OIR as a Low uint8 volume, streamed plane by plane.
+
+    Deliberately not /api/volume-bin: that one needs the image registered in the
+    global `images` map (pinning ~4 GiB per well), resizes whole channels at once,
+    and calls auto_contrast — which plate export must never do. This route opens
+    the file directly, closes it in `finally`, and bakes in the caller's window.
+    """
+    try:
+        spec = plate.VolumeSpec(
+            path=req.path,
+            channels=list(req.channels),
+            levels=[(float(a), float(b)) for a, b in req.levels],
+            t=int(req.t),
+        )
+        info, payload = plate.read_low_volume(spec)
+        return Response(
+            content=payload,
+            media_type="application/octet-stream",
+            headers={"X-Plate-Volume": json.dumps(info)},
+        )
     except ValueError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
     except Exception as e:

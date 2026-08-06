@@ -18,9 +18,12 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import numpy as np
 
 MATL_NAMES = ("matl.omp2info", "matl_forVSIimages.omp2info")
 
@@ -220,3 +223,121 @@ def scan(where: str) -> Plate:
         source=str(folder), matl_sha256=hashlib.sha256(raw).hexdigest(),
         wells=wells, warnings=warnings,
     )
+
+
+# --------------------------------------------------------- plate volume reading
+
+#: Plate export is always Low. Enforced here, not only in the UI: a caller
+#: cannot ask this endpoint for a bigger volume.
+PLATE_MAX_XY = 128
+PLATE_MAX_Z = 128
+#: The renderer's shader samples four channels; more would be transferred and
+#: dropped.
+PLATE_MAX_CH = 4
+
+#: One well at a time. Each read holds a Java reader and a plane buffer, and two
+#: concurrent wells would double both for no gain — the JVM and the disk are the
+#: bottleneck, not the request.
+_WELL_LOCK = threading.Semaphore(1)
+
+
+def _resize_plane(plane: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    """Bilinear XY resize of one plane, allocating only plane-sized temporaries.
+
+    The existing volume route resizes a whole (Z,Y,X) channel at once, which for
+    this data means a 1.585 GiB float32 copy per channel. Per plane the same work
+    peaks at a few megabytes.
+    """
+    from scipy.ndimage import zoom as ndzoom
+    h, w = plane.shape
+    if (h, w) == (out_h, out_w):
+        return plane.astype(np.float32, copy=False)
+    return ndzoom(plane.astype(np.float32), (out_h / h, out_w / w), order=1)
+
+
+@dataclass
+class VolumeSpec:
+    """What to read, and the contrast to bake in. Nothing here is inferred."""
+    path: str
+    channels: list[int]
+    #: Per entry in `channels`, the display window to apply. Never computed here:
+    #: plate export must not auto-stretch, so the caller passes what the user set.
+    levels: list[tuple[float, float]]
+    t: int = 0
+
+
+def read_low_volume(spec: VolumeSpec) -> tuple[dict, bytes]:
+    """Read one well's stitched OIR straight into a Low uint8 volume.
+
+    Streams: for each requested channel and output Z, read the source plane,
+    resize it, apply the frozen window, and write the bytes. The full-resolution
+    volume is never materialised — for the real data that is 3.96 GiB avoided per
+    well, to produce about 3.1 MiB.
+
+    Returns (info, payload) where payload matches /api/volume-bin's layout so the
+    existing renderer can consume it unchanged.
+    """
+    import scyjava
+    from reader import _start_jvm
+
+    p = Path(spec.path)
+    if not p.is_file():
+        raise ValueError(f"ファイルが見つかりません: {p}")
+
+    _start_jvm(scyjava)
+    ImageReader_j = scyjava.jimport("loci.formats.ImageReader")
+    reader_j = ImageReader_j()
+    with _WELL_LOCK:
+        try:
+            reader_j.setId(str(p))
+            n_c, n_z = reader_j.getSizeC(), reader_j.getSizeZ()
+            h, w = reader_j.getSizeY(), reader_j.getSizeX()
+            little = reader_j.isLittleEndian()
+            dtype = np.dtype("<u2" if little else ">u2")
+
+            want = [c for c in spec.channels if 0 <= c < n_c][:PLATE_MAX_CH]
+            if not want:
+                raise ValueError("読み込むチャンネルがありません")
+            if len(spec.levels) < len(want):
+                raise ValueError("チャンネル数と Min/Max の数が一致しません")
+
+            scale = PLATE_MAX_XY / max(h, w) if max(h, w) > PLATE_MAX_XY else 1.0
+            out_h, out_w = int(round(h * scale)), int(round(w * scale))
+            out_z = min(n_z, PLATE_MAX_Z)
+
+            planes: list[bytes] = []
+            for i, c in enumerate(want):
+                lo, hi = spec.levels[i]
+                rng = max(float(hi) - float(lo), 1.0)
+                buf = np.empty((out_z, out_h, out_w), dtype=np.uint8)
+                for zi in range(out_z):
+                    # Nearest source plane when Z is decimated; no interpolation
+                    # across Z, which would invent signal between real sections.
+                    src_z = zi if out_z == n_z else min(n_z - 1, round(zi * (n_z - 1) / max(out_z - 1, 1)))
+                    idx = reader_j.getIndex(int(src_z), int(c), int(spec.t))
+                    raw = bytes(reader_j.openBytes(idx))
+                    plane = np.frombuffer(raw, dtype=dtype).reshape(h, w)
+                    small = _resize_plane(plane, out_h, out_w)
+                    np.clip((small - float(lo)) * (255.0 / rng), 0, 255,
+                            out=small)
+                    buf[zi] = small.astype(np.uint8)
+                planes.append(buf.tobytes())
+                del buf
+
+            header = np.array([len(want), out_z, out_h, out_w, n_c, n_z, h, w],
+                              dtype="<u4").tobytes()
+            # The renderer reads these as the window already applied, so report
+            # the window that WAS applied rather than anything measured.
+            meta = np.array([(int(lo), int(hi)) for lo, hi in spec.levels[:len(want)]],
+                            dtype="<i4").tobytes()
+            info = {
+                "channels": want, "out": [out_z, out_h, out_w],
+                "source": [n_c, n_z, h, w], "bytes": len(header) + len(meta) + sum(map(len, planes)),
+            }
+            return info, header + meta + b"".join(planes)
+        finally:
+            # A Java reader left open holds the file and its memory-mapped chunks.
+            try:
+                reader_j.close()
+            except Exception:
+                pass
