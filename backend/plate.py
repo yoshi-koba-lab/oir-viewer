@@ -227,8 +227,17 @@ def scan(where: str) -> Plate:
 
 # --------------------------------------------------------- plate volume reading
 
-#: Plate export is always Low. Enforced here, not only in the UI: a caller
-#: cannot ask this endpoint for a bigger volume.
+#: Volume resolutions offered for plate export, as a max XY dimension.
+#:
+#: 0 means no downscale at all — the source resolution, whatever it is. Low is
+#: the default because it is the quick look; the larger steps exist for a figure
+#: that has to preserve detail, and `max` for one that must not lose any.
+#:
+#: There is no server-side ceiling. The real limit is the renderer's
+#: MAX_3D_TEXTURE_SIZE, which is 2048 on some GPUs and 16384 on others, so it
+#: cannot be decided here — the client checks its own GPU and says so if the
+#: volume will not fit, rather than this route silently shrinking it.
+PLATE_XY_CHOICES = {"low": 128, "medium": 256, "high": 512, "ultra": 1024, "max": 0}
 PLATE_MAX_XY = 128
 PLATE_MAX_Z = 128
 #: The renderer's shader samples four channels; more would be transferred and
@@ -264,6 +273,8 @@ class VolumeSpec:
     #: plate export must not auto-stretch, so the caller passes what the user set.
     levels: list[tuple[float, float]]
     t: int = 0
+    #: Max XY of the returned volume; 0 for the source resolution unchanged.
+    max_xy: int = PLATE_MAX_XY
 
 
 def read_low_volume(spec: VolumeSpec) -> tuple[dict, bytes]:
@@ -301,9 +312,13 @@ def read_low_volume(spec: VolumeSpec) -> tuple[dict, bytes]:
             if len(spec.levels) < len(want):
                 raise ValueError("チャンネル数と Min/Max の数が一致しません")
 
-            scale = PLATE_MAX_XY / max(h, w) if max(h, w) > PLATE_MAX_XY else 1.0
+            # 0 = no downscale. Otherwise a floor only, so a typo cannot ask for
+            # a 4-pixel volume; there is deliberately no upper bound.
+            cap = 0 if int(spec.max_xy) <= 0 else max(32, int(spec.max_xy))
+            scale = cap / max(h, w) if cap and max(h, w) > cap else 1.0
             out_h, out_w = int(round(h * scale)), int(round(w * scale))
-            out_z = min(n_z, PLATE_MAX_Z)
+            # Z follows the same rule: untouched when max_xy asks for the source.
+            out_z = n_z if cap == 0 else min(n_z, PLATE_MAX_Z)
 
             planes: list[bytes] = []
             for i, c in enumerate(want):
@@ -331,7 +346,7 @@ def read_low_volume(spec: VolumeSpec) -> tuple[dict, bytes]:
             meta = np.array([(int(lo), int(hi)) for lo, hi in spec.levels[:len(want)]],
                             dtype="<i4").tobytes()
             info = {
-                "channels": want, "out": [out_z, out_h, out_w],
+                "channels": want, "out": [out_z, out_h, out_w], "max_xy": cap,
                 "source": [n_c, n_z, h, w], "bytes": len(header) + len(meta) + sum(map(len, planes)),
             }
             return info, header + meta + b"".join(planes)
@@ -341,3 +356,115 @@ def read_low_volume(spec: VolumeSpec) -> tuple[dict, bytes]:
                 reader_j.close()
             except Exception:
                 pass
+
+
+# ------------------------------------------------------------- PDF composition
+
+#: Raster size of one well's image in the PDF, in pixels. The cell and the page
+#: are sized from this, so a bigger choice means a bigger page rather than the
+#: same page with an upscaled image — upscaling would add no detail while
+#: quadrupling the file.
+PDF_CELL_CHOICES = {"draft": 300, "normal": 600, "high": 1200, "max": 2000}
+
+#: Page furniture, as a fraction of the cell so every choice stays proportionate.
+_PAD_F, _LABEL_F, _TITLE_F, _MARGIN_F = 0.04, 0.09, 0.16, 0.10
+
+
+@dataclass
+class WellFrame:
+    """One rendered well, ready to place."""
+    well_id: str
+    row: int
+    col: int
+    #: RGB or RGBA pixels, any size; resized into the cell preserving aspect.
+    png: bytes
+
+
+def compose_pdf(
+    out_path: Path,
+    plate_name: str,
+    rows: int,
+    cols: int,
+    frames: list[WellFrame],
+    known_wells: dict[str, bool],
+    cell_px: int,
+    footer: str,
+) -> Path:
+    """Lay rendered wells out in the plate's own grid and write one PDF.
+
+    Every position in the plate appears, whether or not it was acquired: a packed
+    grid of only the acquired wells would be unreadable as a plate, and a reader
+    could not tell B02 from B04. `known_wells` maps well_id -> enabled for the
+    wells the manifest listed, so an unacquired cell and a disabled one can be
+    told apart; a well that was supposed to render and did not never reaches here,
+    because the caller fails the whole export instead.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    pad = max(2, int(cell_px * _PAD_F))
+    label_h = max(10, int(cell_px * _LABEL_F))
+    title_h = max(16, int(cell_px * _TITLE_F))
+    margin = max(8, int(cell_px * _MARGIN_F))
+    gutter = label_h * 2
+
+    page_w = margin * 2 + gutter + cols * (cell_px + pad)
+    page_h = margin * 2 + title_h + label_h + rows * (cell_px + pad)
+    page = Image.new("RGB", (page_w, page_h), "white")
+    draw = ImageDraw.Draw(page)
+
+    def font(px: int):
+        for name in ("Helvetica.ttc", "Arial.ttf", "DejaVuSans.ttf"):
+            try:
+                return ImageFont.truetype(name, px)
+            except OSError:
+                continue
+        return ImageFont.load_default()
+
+    f_title, f_label, f_cell = font(max(12, title_h // 2)), font(max(9, label_h * 2 // 3)), font(max(8, label_h // 2))
+
+    draw.text((margin, margin), f"{plate_name}  —  {rows}x{cols}", fill="black", font=f_title)
+
+    grid_x = margin + gutter
+    grid_y = margin + title_h + label_h
+    for c in range(cols):
+        x = grid_x + c * (cell_px + pad)
+        draw.text((x + cell_px // 2, grid_y - label_h), f"{c + 1:02d}",
+                  fill="black", font=f_label, anchor="mb")
+    for r in range(rows):
+        y = grid_y + r * (cell_px + pad)
+        draw.text((grid_x - pad, y + cell_px // 2), chr(65 + r),
+                  fill="black", font=f_label, anchor="rm")
+
+    placed = {(f.row, f.col): f for f in frames}
+    for r in range(rows):
+        for c in range(cols):
+            x, y = grid_x + c * (cell_px + pad), grid_y + r * (cell_px + pad)
+            box = (x, y, x + cell_px, y + cell_px)
+            wid = f"{chr(65 + r)}{c + 1:02d}"
+            f = placed.get((r, c))
+            if f is not None:
+                page.paste(Image.new("RGB", (cell_px, cell_px), "black"), (x, y))
+                import io
+                im = Image.open(io.BytesIO(f.png)).convert("RGB")
+                im.thumbnail((cell_px, cell_px), Image.LANCZOS)   # never stretched
+                page.paste(im, (x + (cell_px - im.width) // 2, y + (cell_px - im.height) // 2))
+                draw.rectangle(box, outline="black", width=1)
+                draw.text((x + pad, y + pad), f.well_id, fill="white", font=f_cell)
+            else:
+                draw.rectangle(box, outline="#c8c8c8", width=1)
+                state = "Disabled" if known_wells.get(wid) is False else "Not acquired"
+                draw.text((x + cell_px // 2, y + cell_px // 2 - label_h), wid,
+                          fill="#909090", font=f_cell, anchor="mm")
+                draw.text((x + cell_px // 2, y + cell_px // 2 + label_h), state,
+                          fill="#b0b0b0", font=f_cell, anchor="mm")
+
+    draw.text((margin, page_h - margin // 2), footer, fill="#808080", font=f_cell, anchor="ls")
+
+    # Never overwrite an earlier figure.
+    final = out_path
+    n = 1
+    while final.exists():
+        final = out_path.with_name(f"{out_path.stem}_{n:02d}{out_path.suffix}")
+        n += 1
+    page.save(final, "PDF", resolution=300.0)
+    return final

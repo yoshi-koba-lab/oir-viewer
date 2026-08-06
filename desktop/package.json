@@ -1,7 +1,7 @@
 {
   "name": "oir-viewer-desktop",
   "productName": "OIR Viewer",
-  "version": "1.2.9",
+  "version": "1.3.0",
   "description": "Viewer for Olympus .oir and other microscopy image stacks",
   "main": "main.js",
   "private": true,

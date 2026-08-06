@@ -574,6 +574,23 @@ export interface PlateScan {
   wells: PlateWell[];
 }
 
+/** Volume resolutions for plate export. 0 = source resolution, no downscale. */
+export const PLATE_XY_CHOICES: { key: string; label: string; maxXy: number }[] = [
+  { key: 'low', label: 'Low (128)', maxXy: 128 },
+  { key: 'medium', label: 'Medium (256)', maxXy: 256 },
+  { key: 'high', label: 'High (512)', maxXy: 512 },
+  { key: 'ultra', label: 'Ultra (1024)', maxXy: 1024 },
+  { key: 'max', label: 'Max (原寸)', maxXy: 0 },
+];
+
+/** Raster size of one well in the PDF. The page grows with it rather than upscaling. */
+export const PDF_CELL_CHOICES: { key: string; label: string; px: number }[] = [
+  { key: 'draft', label: 'Draft (300px)', px: 300 },
+  { key: 'normal', label: 'Normal (600px)', px: 600 },
+  { key: 'high', label: 'High (1200px)', px: 1200 },
+  { key: 'max', label: 'Max (2000px)', px: 2000 },
+];
+
 /** Read a MATL acquisition folder (or its .omp2info) into a plate manifest. */
 export async function scanPlate(path: string): Promise<PlateScan> {
   return getJson<PlateScan>(

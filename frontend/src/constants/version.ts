@@ -5,6 +5,27 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.3.0 — 2026-08-06 — The pieces of plate-to-PDF export. Output resolution is
+//     chosen, not fixed, because a figure sometimes has to keep the original
+//     detail: the volume fed to the renderer is Low/Medium/High/Ultra/Max (Max =
+//     source resolution, no downscale and no Z decimation) and the raster of each
+//     well in the PDF is 300/600/1200/2000 px. Raising the raster grows the page
+//     rather than upscaling the image, which would add no detail and quadruple the
+//     file. Cells never stretch; they letterbox.
+//     There is no server-side resolution ceiling. The real limit is the GPU's
+//     MAX_3D_TEXTURE_SIZE, which is 2048 on this machine and 16384 on others, so
+//     it can only be asked at render time — and it is, naming the axis that
+//     overflowed. Untested, texImage3D just fails with a bare INVALID_VALUE. On an
+//     M5 Pro the real 2911x2923 data exceeds 2048 in both X and Y, so Ultra (1024)
+//     is the practical maximum there; Max stays selectable and explains itself.
+//     PDF pages are composed with Pillow at 300 dpi in the plate's own grid, every
+//     position present, unacquired and disabled cells distinguished, each cell
+//     carrying its well ID so a mislabelled figure is visible rather than
+//     plausible. Repeat exports never overwrite an earlier one.
+//     The ray-marching shaders moved to utils/volumeShader so the export and the
+//     interactive view cannot drift — a PDF shaded differently from the inspection
+//     it came from would be worse than no PDF. The export renderer owns its own
+//     context and disposes textures between wells.
 //   1.2.9 — 2026-08-06 — Plate wells can be read without building the whole volume,
 //     and the JVM's heap is bounded. A well's stitched OIR is now streamed plane by
 //     plane: read one plane, resize it, apply the window the user set, write the
@@ -212,4 +233,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.2.9';
+export const VERSION = '1.3.0';
