@@ -605,10 +605,29 @@ def get_volume_bin(
         return JSONResponse(status_code=400, content={"error": str(e)})
 
 
+def _no_dialog_here() -> JSONResponse:
+    """Why this process cannot show a file picker, said once.
+
+    Frozen by PyInstaller, `sys.executable` is this app, not a Python
+    interpreter — so the old `subprocess.run([sys.executable, "-c", ...])`
+    started a SECOND backend, blocked for its whole timeout and left the UI on
+    "Opening…". `_tkinter` is not bundled either, so even a correct interpreter
+    would fail. The desktop build asks Electron instead (desktop/preload.js);
+    this endpoint only ever runs when there is no shell to ask.
+    """
+    return JSONResponse(
+        status_code=501,
+        content={"error": "このビルドではファイル選択ダイアログを開けません。"
+                          "「…」ボタンからパスを直接入力してください。"},
+    )
+
+
 @app.get("/api/choose-folder")
 def choose_folder():
-    """Open native macOS folder picker dialog."""
+    """Native folder picker. macOS only; elsewhere the shell owns it."""
     import subprocess
+    if sys.platform != "darwin":
+        return _no_dialog_here()
     try:
         result = subprocess.run(
             ['osascript', '-e', 'POSIX path of (choose folder with prompt "保存先フォルダを選択")'],
@@ -659,8 +678,12 @@ def choose_files():
             paths = [p for p in (line.strip() for line in result.stdout.splitlines()) if p]
             return {"paths": paths, "cancelled": not paths}
 
-        # tkinter runs in this process, and a GUI toolkit must own the main
-        # thread on some platforms — so do it in a child process.
+        # Below here the picker needs a real Python interpreter to run tkinter
+        # in a child process (a GUI toolkit must own the main thread). A frozen
+        # build has none — see _no_dialog_here.
+        if getattr(sys, "frozen", False):
+            return _no_dialog_here()
+
         code = (
             "import json,sys\n"
             "import tkinter as tk\n"

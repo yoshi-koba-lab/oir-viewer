@@ -5,6 +5,21 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.2.3 — 2026-08-06 — The Open button no longer hangs on Windows. The packaged
+//     backend was calling subprocess.run([sys.executable, "-c", tkinter_code]) to
+//     show a picker, but PyInstaller makes sys.executable the app itself — so it
+//     launched a SECOND backend, blocked for its full 300 s timeout, and left the
+//     UI on "Opening…" before reporting the wait as a user cancellation. _tkinter
+//     was not bundled either, so the call could not have worked regardless. Only
+//     macOS escaped it, via a separate osascript path. Verified against the shipped
+//     1.2.2 binary: `oir-viewer-backend -c "print(1)"` prints nothing and starts a
+//     server on the port instead.
+//     The pickers now belong to the desktop shell, which owns a real native dialog
+//     on every platform: a preload script exposes exactly two calls over
+//     contextBridge, and the renderer falls back to the HTTP endpoint only when
+//     there is no shell. That endpoint now answers 501 with an explanation instead
+//     of hanging. The file filter always offers "all files" — Olympus companion
+//     chunks have no extension, so an extension filter hides them.
 //   1.2.2 — 2026-08-06 — The histogram no longer rescans the raw plane on every
 //     contrast tick. It was keyed on the channel object, which setChannelRange
 //     replaces on each tick, so dragging a dashed marker two pixels reread up to
@@ -89,4 +104,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.2.2';
+export const VERSION = '1.2.3';

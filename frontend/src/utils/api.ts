@@ -322,12 +322,34 @@ export interface ChooseFilesResponse {
   cancelled: boolean;
 }
 
-/** Open the OS file picker (Finder on macOS) and return the chosen image paths. */
+/**
+ * The desktop shell's file pickers, when running inside it (see desktop/preload.js).
+ *
+ * The packaged backend cannot open a dialog: PyInstaller makes `sys.executable`
+ * the app itself, so its subprocess call launched a second backend and blocked
+ * for 300 s — the Windows "Opening…" hang. Electron owns a real native dialog on
+ * every platform, so ask it first and only fall back to the HTTP endpoint when
+ * there is no shell (a plain browser in dev, or --no-webview).
+ */
+interface ElectronAPI {
+  chooseFiles(): Promise<ChooseFilesResponse>;
+  chooseFolder(): Promise<ChooseFolderResponse>;
+}
+
+function shell(): ElectronAPI | null {
+  return (window as unknown as { electronAPI?: ElectronAPI }).electronAPI ?? null;
+}
+
+/** Open the OS file picker and return the chosen image paths. */
 export async function chooseFiles(): Promise<ChooseFilesResponse> {
+  const api = shell();
+  if (api) return api.chooseFiles();
   return getJson<ChooseFilesResponse>('/api/choose-files', 'ファイル選択ダイアログを開けません');
 }
 
 export async function chooseFolder(): Promise<ChooseFolderResponse> {
+  const api = shell();
+  if (api) return api.chooseFolder();
   return getJson<ChooseFolderResponse>('/api/choose-folder', 'フォルダ選択ダイアログを開けません');
 }
 

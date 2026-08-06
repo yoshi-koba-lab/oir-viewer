@@ -9,7 +9,7 @@
  * Port discovery is by parsing the backend's startup line rather than guessing,
  * because the port is chosen at runtime (8765 is often taken on this machine).
  */
-const { app, BrowserWindow, shell, dialog, Menu } = require('electron');
+const { app, BrowserWindow, shell, dialog, ipcMain, Menu } = require('electron');
 const { spawn } = require('node:child_process');
 const http = require('node:http');
 const path = require('node:path');
@@ -131,6 +131,57 @@ function waitForServer(port, timeoutMs = 60_000) {
   });
 }
 
+/**
+ * Extensions the viewer can open. No leading dot: that is the shape Electron's
+ * dialog filters take on every platform.
+ *
+ * The last filter matters as much as the first. Olympus splits a dataset over
+ * ~1 GB into `<name>.oir` plus companions literally named `<name>_00001`,
+ * `_00002` — no extension at all. A user who needs to see one of those (to
+ * confirm it is there, or to pick a file in a folder full of them) cannot with
+ * an extension filter applied, so "すべてのファイル" has to be reachable.
+ */
+const IMAGE_EXTENSIONS = ['oir', 'oib', 'oif', 'tif', 'tiff', 'nd2', 'lif', 'czi'];
+
+/**
+ * The picker is the main process's job: the packaged backend has no way to show
+ * one (see preload.js), and Electron's is the real native dialog.
+ *
+ * Passing the window makes it a sheet on macOS and, on Windows, keeps it from
+ * opening behind the app — a modeless dialog there can end up behind its own
+ * parent or on another monitor.
+ */
+function registerDialogHandlers() {
+  ipcMain.handle('dialog:chooseFiles', async () => {
+    const parent = BrowserWindow.getFocusedWindow() || mainWindow;
+    if (!parent || parent.isDestroyed()) return { paths: [], cancelled: true };
+    const r = await dialog.showOpenDialog(parent, {
+      title: '画像ファイルを選択',
+      // openFile and openDirectory together do not work on Windows, so this
+      // stays files-only; the folder picker below is a separate call.
+      properties: ['openFile', 'multiSelections', 'dontAddToRecent'],
+      filters: [
+        { name: '画像ファイル', extensions: IMAGE_EXTENSIONS },
+        { name: 'すべてのファイル', extensions: ['*'] },
+      ],
+    });
+    return { paths: r.canceled ? [] : r.filePaths, cancelled: r.canceled };
+  });
+
+  ipcMain.handle('dialog:chooseFolder', async () => {
+    const parent = BrowserWindow.getFocusedWindow() || mainWindow;
+    if (!parent || parent.isDestroyed()) return { path: null, cancelled: true };
+    const r = await dialog.showOpenDialog(parent, {
+      title: '保存先フォルダを選択',
+      properties: ['openDirectory', 'createDirectory', 'dontAddToRecent'],
+    });
+    return {
+      path: r.canceled || r.filePaths.length === 0 ? null : r.filePaths[0],
+      cancelled: r.canceled,
+    };
+  });
+}
+
 function createWindow(port) {
   mainWindow = new BrowserWindow({
     width: 1500,
@@ -141,9 +192,11 @@ function createWindow(port) {
     title: 'OIR Viewer',
     show: false,
     webPreferences: {
-      // The UI is our own bundle served over loopback; it needs no Node access.
+      // The UI is our own bundle served over loopback; it needs no Node access
+      // beyond the two file pickers preload.js exposes.
       contextIsolation: true,
       nodeIntegration: false,
+      preload: path.join(__dirname, 'preload.js'),
     },
   });
 
@@ -171,6 +224,10 @@ if (!app.requestSingleInstanceLock()) {
   });
 
   app.whenReady().then(async () => {
+    // Registered before the window exists: the renderer can call as soon as it
+    // loads, and an unhandled invoke would reject rather than wait.
+    registerDialogHandlers();
+
     Menu.setApplicationMenu(Menu.buildFromTemplate([
       ...(process.platform === 'darwin' ? [{ role: 'appMenu' }] : []),
       { role: 'editMenu' },
