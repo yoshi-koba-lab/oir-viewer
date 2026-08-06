@@ -12,6 +12,7 @@ import uuid
 import numpy as np
 import uvicorn
 from contextlib import asynccontextmanager
+import re
 from fastapi import FastAPI, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
@@ -757,6 +758,77 @@ def _build_ome_xml(meta, n_channels: int, height: int, width: int, method: str,
         SubElement(pixels, "TiffData", FirstC=str(c), FirstZ="0", FirstT="0", IFD=str(c))
 
     return '<?xml version="1.0" encoding="UTF-8"?>' + tostring(ome, encoding="unicode")
+
+
+# ---------------------------------------------------------------- update check
+
+RELEASES_API = "https://api.github.com/repos/yoshi-koba-lab/oir-viewer/releases/latest"
+RELEASES_PAGE = "https://github.com/yoshi-koba-lab/oir-viewer/releases/latest"
+#: The only outbound request this app ever makes. Cached so that reopening the
+#: window, or several windows, cannot turn into a burst against a 60-per-hour
+#: unauthenticated rate limit.
+_UPDATE_CACHE: dict[str, object] = {"at": 0.0, "payload": None}
+_UPDATE_TTL_S = 6 * 3600
+
+
+def _parse_version(v: str) -> tuple[int, ...]:
+    """`v1.2.10` -> (1, 2, 10). Trailing junk (`-rc1`) is dropped, not guessed at."""
+    core = re.split(r"[-+]", v.strip().lstrip("vV"), 1)[0]
+    parts = []
+    for chunk in core.split("."):
+        m = re.match(r"\d+", chunk)
+        parts.append(int(m.group()) if m else 0)
+    return tuple(parts) or (0,)
+
+
+def _is_newer(latest: str, current: str) -> bool:
+    """Compare numerically. "1.2.10" is newer than "1.2.9"; a string compare says otherwise."""
+    a, b = _parse_version(latest), _parse_version(current)
+    n = max(len(a), len(b))
+    return a + (0,) * (n - len(a)) > b + (0,) * (n - len(b))
+
+
+@app.get("/api/update-check")
+def update_check(current: str = Query(...)):
+    """Whether a newer release exists, per the GitHub Releases API.
+
+    This is the one place the app talks to the internet. It is called only when
+    the UI asks, the answer is cached for six hours, and every failure — offline,
+    proxy, rate limit, GitHub down — returns "no update" rather than an error:
+    a viewer that cannot reach GitHub is still a working viewer, and a lab
+    machine with no route out must not be nagged about it.
+    """
+    import json as _json
+    import time
+    import urllib.request
+
+    now = time.time()
+    cached = _UPDATE_CACHE.get("payload")
+    if cached is not None and now - float(_UPDATE_CACHE["at"]) < _UPDATE_TTL_S:
+        latest = str(cached)
+    else:
+        try:
+            req = urllib.request.Request(
+                RELEASES_API,
+                headers={"Accept": "application/vnd.github+json",
+                         "User-Agent": "oir-viewer"},
+            )
+            with urllib.request.urlopen(req, timeout=6) as r:
+                latest = str(_json.loads(r.read().decode("utf-8")).get("tag_name") or "")
+            _UPDATE_CACHE.update({"at": now, "payload": latest})
+        except Exception:
+            # Deliberately silent: see the docstring.
+            return {"update_available": False, "latest": None, "url": RELEASES_PAGE,
+                    "checked": False}
+
+    if not latest:
+        return {"update_available": False, "latest": None, "url": RELEASES_PAGE, "checked": True}
+    return {
+        "update_available": _is_newer(latest, current),
+        "latest": latest.lstrip("vV"),
+        "url": RELEASES_PAGE,
+        "checked": True,
+    }
 
 
 @app.post("/api/projection")

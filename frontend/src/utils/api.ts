@@ -524,3 +524,27 @@ export function decodeUint8Volume(b64: string, totalVoxels: number): Uint8Array 
   }
   return bytes.slice(0, totalVoxels);
 }
+
+export interface UpdateCheck {
+  update_available: boolean;
+  latest: string | null;
+  url: string;
+  /** False when the check could not reach GitHub at all — offline, proxy, rate limit. */
+  checked: boolean;
+}
+
+/**
+ * Ask whether a newer release exists. Never throws: an update check that
+ * interrupts the user to say it could not run is worse than one that says
+ * nothing, so a failure is reported as "no update".
+ */
+export async function checkForUpdate(current: string): Promise<UpdateCheck> {
+  try {
+    return await getJson<UpdateCheck>(
+      `/api/update-check?current=${encodeURIComponent(current)}`,
+      'アップデート確認',
+    );
+  } catch {
+    return { update_available: false, latest: null, url: '', checked: false };
+  }
+}

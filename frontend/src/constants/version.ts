@@ -5,6 +5,17 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.2.4 — 2026-08-06 — Tells you when a newer release exists. The app asks the
+//     GitHub Releases API once per launch — its only outbound request, sending
+//     nothing but the running version number — and shows one dismissible line if
+//     there is something newer. Dismissing silences that version for good: a
+//     notice that returns every launch teaches people to close it unread.
+//     Every failure path is silent. Offline, behind a proxy, rate-limited or
+//     GitHub down all report "no update" rather than an error, because a viewer
+//     that cannot reach GitHub is still a working viewer. The answer is cached
+//     for six hours so reopening the window cannot burst against the 60/hour
+//     unauthenticated limit. Versions are compared numerically, so 1.2.10 is
+//     correctly newer than 1.2.9.
 //   1.2.3 — 2026-08-06 — The Open button no longer hangs on Windows. The packaged
 //     backend was calling subprocess.run([sys.executable, "-c", tkinter_code]) to
 //     show a picker, but PyInstaller makes sys.executable the app itself — so it
@@ -104,4 +115,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.2.3';
+export const VERSION = '1.2.4';

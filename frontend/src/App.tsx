@@ -5,6 +5,7 @@ import { useViewStore } from './stores/viewStore';
 import { Viewport } from './components/Viewport';
 import { ChannelPanel } from './components/ChannelPanel';
 import { ScalebarSettings } from './components/ScalebarSettings';
+import { UpdateNotice } from './components/UpdateNotice';
 import { DimensionSliders, ZSliderVertical } from './components/DimensionSliders';
 import { Toolbar } from './components/Toolbar';
 import { FileTabBar } from './components/FileTabBar';
@@ -123,6 +124,10 @@ function App() {
           {dropError}
         </div>
       )}
+
+      {/* New release available on GitHub. Silent when current, when offline,
+          and once dismissed for that version. */}
+      <UpdateNotice />
 
       {/* Load/switch error toast — these used to fail silently, leaving the
           previous plane on screen with no hint that anything went wrong. */}
