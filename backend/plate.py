@@ -219,7 +219,8 @@ def scan(where: str) -> Plate:
             "。PDF 出力には Stitch ファイルが必要です。"
         )
     return Plate(
-        name=mp.get("name", "?"), rows=rows, cols=cols,
+        # Not "?": the name reaches a filename, and ? is illegal on Windows.
+        name=(mp.get("name") or "plate"), rows=rows, cols=cols,
         source=str(folder), matl_sha256=hashlib.sha256(raw).hexdigest(),
         wells=wells, warnings=warnings,
     )

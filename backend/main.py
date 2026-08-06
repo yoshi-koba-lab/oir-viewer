@@ -1215,10 +1215,18 @@ def _free_path(filepath: str) -> str:
         idx += 1
 
 
+#: Characters Windows rejects in a filename. macOS accepts * ? " < > | happily,
+#: so a name built from file metadata or a plate's own title passes here and
+#: fails on the user's machine — and for a plate PDF it fails at `save()`, after
+#: every well has already been read and rendered. A trailing dot or space is
+#: equally illegal there and equally silent here.
+_ILLEGAL_NAME_CHARS = set('/\\:*?"<>|') | {chr(c) for c in range(32)}
+
+
 def _safe_name_part(name: str) -> str:
     """Filename-safe fragment (channel names come straight from file metadata)."""
-    cleaned = "".join(ch for ch in name if ch not in '/\\:\0').strip()
-    return cleaned or "Ch"
+    cleaned = "".join(ch for ch in name if ch not in _ILLEGAL_NAME_CHARS)
+    return cleaned.strip().rstrip(". ") or "Ch"
 
 
 def _save_image_file(img_rgb: np.ndarray, fmt: str, filepath: str) -> str:

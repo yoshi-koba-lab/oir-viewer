@@ -6,6 +6,7 @@ import {
 import { openAndReload } from '../hooks/useImageLoader';
 import { useImageStore } from '../stores/imageStore';
 import { PlateRenderer, parseVolume } from '../utils/plateRender';
+import { gpuLimits } from '../utils/gpuLimits';
 
 /**
  * Reads an Olympus MATL acquisition and shows what it contains, in the plate's
@@ -132,8 +133,22 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
       return;
     }
 
+    // Clamp to what this GPU can hold BEFORE asking for it. A 3D texture is
+    // driver-capped — 2048 under ANGLE, which is every Windows build — and the
+    // real data is 2911 wide, so "Max (原寸)" would stream ~1.7 GB per well and
+    // only then be refused at texImage3D, throwing away the whole export after
+    // minutes of work. Clamping only ever scales down: on a GPU that reports
+    // 16384 a 2911 px well still comes back untouched.
+    const { max3D, vendor } = gpuLimits();
+    if (max3D === 0) {
+      setError('この環境では WebGL2 が使えないため、3D の書き出しができません。');
+      return;
+    }
+    const wanted = PLATE_XY_CHOICES.find((c) => c.key === volKey)!.maxXy;
+    const maxXy = wanted === 0 ? max3D : Math.min(wanted, max3D);
+    const clamped = maxXy !== wanted;
+
     setError(''); setResult(''); cancelRef.current = false; setExporting(true);
-    const maxXy = PLATE_XY_CHOICES.find((c) => c.key === volKey)!.maxXy;
     const cellPx = PDF_CELL_CHOICES.find((c) => c.key === cellKey)!.px;
     const frames: { well_id: string; row: number; col: number; png_b64: string }[] = [];
     let renderer: PlateRenderer | null = null;
@@ -189,10 +204,18 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
       const res = await composePlatePdf({
         plate_name: plate.name, rows: plate.rows, cols: plate.cols,
         frames, well_states: states, cell_px: cellPx, output_dir: dir.path,
-        footer: `matl ${plate.matl_sha256.slice(0, 8)} | vol ${volKey}(${maxXy || 'src'}) `
-              + `| cell ${cellPx}px | ch ${chIdx.join(',')} | ${new Date().toISOString()}`,
+        // The resolution actually applied, never the one requested. Recording the
+        // request is how the footer came to state a resolution that was not used.
+        footer: `matl ${plate.matl_sha256.slice(0, 8)} | vol ${volKey}(${maxXy})`
+              + `${clamped ? ` GPU上限${max3D}に制限` : ''}`
+              + ` | cell ${cellPx}px | ch ${chIdx.join(',')} | ${new Date().toISOString()}`,
       });
-      setResult(`${res.wells} ウェルを書き出しました（${Math.round(res.bytes / 1024)} KB）\n${res.path}`);
+      setResult(
+        `${res.wells} ウェルを書き出しました（${Math.round(res.bytes / 1024)} KB）\n${res.path}`
+        + (clamped
+          ? `\n※ 解像度は この GPU の上限 ${max3D} px に制限しました（${vendor}）。`
+          : ''),
+      );
     } catch (e) {
       // A cancel aborts the fetch, which surfaces here as an AbortError. That is
       // the user's own action, not a failure to report as one.
