@@ -160,11 +160,19 @@ def describe_runtime() -> str:
             f" | formats-gpl={'yes' if any(j.name.startswith('formats-gpl') for j in jars) else 'NO'}")
 
 
-#: JVM heap ceiling, MB. Raise it via OIR_JVM_MAX_HEAP if a file ever needs more.
+#: JVM heap ceiling, MB.
+#:
+#: Generous on purpose. Left with no ceiling the JVM sizes its maximum from
+#: physical RAM and grows into it rather than collecting, so resident memory
+#: tracked the size of the file being read — untidy, and alarming to watch. But
+#: the target machine has 192 GB, so this exists only to stop that drift, not to
+#: ration anything: Bio-Formats needs a plane or two, a plane here is 17 MB, and
+#: this must never be the reason a file fails to open. Override with
+#: OIR_JVM_MAX_HEAP if one ever does.
 try:
-    _JVM_MAX_HEAP_MB = max(256, int(os.environ.get("OIR_JVM_MAX_HEAP", "512")))
+    _JVM_MAX_HEAP_MB = max(256, int(os.environ.get("OIR_JVM_MAX_HEAP", "4096")))
 except ValueError:
-    _JVM_MAX_HEAP_MB = 512
+    _JVM_MAX_HEAP_MB = 4096
 
 _JVM_LOCK = threading.Lock()
 
@@ -200,14 +208,8 @@ def _start_jvm_locked(scyjava) -> None:
             os.environ.setdefault("JAVA_HOME", str(jre))
             _prepare_windows_dll_search(jre)
             try:
-                # Bound the heap. Left to itself the JVM sizes its maximum at a
-                # fraction of physical RAM and then grows into it rather than
-                # collecting, so resident memory tracked the size of the file
-                # being read: measured +1349 MB of peak RSS for a 586 MB source,
-                # and roughly linear — which would put a 4 GiB well near 9 GB.
-                # Capped, the same read peaks around 400 MB and stops depending on
-                # the file at all. Bio-Formats itself only ever needs a plane or
-                # two; the growth was slack, not need.
+                # See _JVM_MAX_HEAP_MB: a ceiling to stop the heap drifting up
+                # with file size, set high enough that it is never the limit.
                 jpype.startJVM(str(libjvm), f"-Xmx{_JVM_MAX_HEAP_MB}m",
                                classpath=jars, convertStrings=False)
             except Exception as e:

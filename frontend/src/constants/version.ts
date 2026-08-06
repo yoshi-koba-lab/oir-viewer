@@ -19,6 +19,8 @@
 //     a real well. With the heap capped the same reads peak at +90/+479/+407 MB:
 //     bounded, and no longer a function of well size. Bio-Formats only ever needs a
 //     plane or two; the growth was slack.
+//     The ceiling is 4 GB, not tight: the machine this runs on has 192 GB, so it
+//     exists only to stop the heap drifting up with file size, never to ration.
 //     Also: this route never registers the image in the global map (which is what
 //     pinned a volume per well), closes the Java reader in a finally, admits one
 //     well at a time, and refuses anything but Low — the cap is enforced server
