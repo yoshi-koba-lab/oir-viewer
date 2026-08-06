@@ -598,3 +598,65 @@ export async function scanPlate(path: string): Promise<PlateScan> {
     'プレート情報を読めません',
   );
 }
+
+export interface PlateVolumeRequest {
+  path: string;
+  channels: number[];
+  /** [[min, max], ...] aligned with `channels`. Required: never auto-stretched. */
+  levels: [number, number][];
+  t?: number;
+  /** Max XY; 0 for the source resolution. */
+  max_xy?: number;
+}
+
+/** One well's volume as the binary layout plateRender.parseVolume expects. */
+export async function fetchPlateVolume(
+  req: PlateVolumeRequest,
+  signal?: AbortSignal,
+): Promise<ArrayBuffer> {
+  let res: Response;
+  try {
+    res = await fetch('/api/plate/volume-bin', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req),
+      signal,
+    });
+  } catch (e) {
+    // An abort is the caller's own doing; let it through as itself so the export
+    // can tell "the user stopped this" from "the read failed".
+    if (e instanceof DOMException && e.name === 'AbortError') throw e;
+    // Otherwise this is the backend dying mid-run, which bare fetch reports as
+    // "Failed to fetch" — the one message in this file that says nothing.
+    throw new Error(
+      'ウェルの読み込みに失敗: バックエンドに接続できません。'
+      + 'アプリを再起動してください。',
+    );
+  }
+  if (!res.ok) throw new Error(await describeHttpError(res, 'ウェルの読み込みに失敗'));
+  return res.arrayBuffer();
+}
+
+export interface PlatePdfResult {
+  path: string;
+  wells: number;
+  bytes: number;
+}
+
+export async function composePlatePdf(body: {
+  plate_name: string;
+  rows: number;
+  cols: number;
+  frames: { well_id: string; row: number; col: number; png_b64: string }[];
+  /**
+   * Why each empty cell is empty: 'disabled', 'excluded' (imaged but not
+   * selected) or 'missing' (imaged but no stitched file). A well_id that is
+   * absent was never imaged. Consulted only for cells with no frame.
+   */
+  well_states: Record<string, string>;
+  cell_px: number;
+  output_dir: string;
+  footer: string;
+}): Promise<PlatePdfResult> {
+  return postJson<PlatePdfResult>('/api/plate/pdf', body, 'PDF の作成に失敗');
+}

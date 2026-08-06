@@ -5,7 +5,23 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
-//   1.3.0 — 2026-08-06 — The pieces of plate-to-PDF export. Output resolution is
+//   1.3.0 — 2026-08-07 — Plate-to-PDF export, wired end to end. Choosing wells and
+//     pressing "PDF を作成" now walks them one at a time — fetch the volume, render
+//     it offscreen, capture the frame, release the textures — and posts the frames
+//     to be composed. Verified on 8 synthetic wells: 9.9 s, every well in its own
+//     row and column, and the images distinguishable from one another (the fixtures
+//     grow monotonically from B02 to C05 and the PDF shows that order), so the
+//     labels are checked against the pictures and not just against the parser.
+//     NOT yet verified on real acquisition data — the fixtures are 320x320x24x3 and
+//     a real well is 2911x2923x50x5, two orders of magnitude larger.
+//     CI could not publish a Release. `release` needs `build`, and the Intel-Mac
+//     leg targeted macos-13, which is retired — no runner is ever assigned, so the
+//     job sat queued for hours and the tag produced nothing. Eight runs had piled up
+//     that way, and v1.2.7's installers had to be attached by hand (its Mac DMG
+//     never was). The leg moves to macos-15-intel, `release` runs on `!cancelled()`
+//     so one dead platform cannot withhold the installers that did build, each job
+//     has a timeout, and a concurrency group stops runs stacking up again.
+//     Output resolution is
 //     chosen, not fixed, because a figure sometimes has to keep the original
 //     detail: the volume fed to the renderer is Low/Medium/High/Ultra/Max (Max =
 //     source resolution, no downscale and no Z decimation) and the raster of each

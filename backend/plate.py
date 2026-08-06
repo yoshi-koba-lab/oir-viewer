@@ -369,6 +369,66 @@ PDF_CELL_CHOICES = {"draft": 300, "normal": 600, "high": 1200, "max": 2000}
 #: Page furniture, as a fraction of the cell so every choice stays proportionate.
 _PAD_F, _LABEL_F, _TITLE_F, _MARGIN_F = 0.04, 0.09, 0.16, 0.10
 
+#: What an empty cell says, by the state the caller reports for that well. These
+#: are printed on a figure, so they have to be true: "Not acquired" over a well
+#: the microscope did image would misdescribe the experiment to anyone reading it.
+#: An unknown or absent state falls back to "Not acquired", which is the only
+#: correct reading of a well the manifest never mentioned.
+EMPTY_CELL_LABELS = {
+    "disabled": "Disabled",       # in the manifest, switched off for the run
+    "excluded": "Not selected",   # imaged, but the user did not include it here
+    "missing": "File missing",    # imaged, but its stitched file is not on disk
+}
+
+#: Fonts to try, CJK-capable first. The plate name comes from the acquisition
+#: folder, which is routinely Japanese — and Helvetica and Arial both render
+#: Japanese as .notdef boxes rather than failing, so a title of tofu is what
+#: reaches the figure. Every CJK font here also covers the ASCII furniture, so
+#: when one is found it is used for everything.
+_FONT_CANDIDATES = (
+    "Hiragino Sans GB.ttc", "Arial Unicode.ttf",              # macOS
+    "meiryo.ttc", "YuGothM.ttc", "YuGothR.ttc", "msgothic.ttc",  # Windows
+    "NotoSansCJK-Regular.ttc", "NotoSansJP-Regular.otf",      # Linux
+    "Helvetica.ttc", "Arial.ttf", "DejaVuSans.ttf",           # Latin-only
+)
+
+
+def _covers_japanese(font) -> bool:
+    """Whether a font has real Japanese glyphs, not .notdef boxes.
+
+    A missing glyph still renders — as a box, with its own bounding box — so
+    asking whether the glyph "exists" the obvious ways all answer yes. The only
+    honest test is to draw it and compare against a codepoint no font defines.
+    """
+    from PIL import Image, ImageDraw
+
+    def bits(ch: str) -> bytes:
+        im = Image.new("L", (40, 40), 0)
+        ImageDraw.Draw(im).text((2, 2), ch, fill=255, font=font)
+        return im.tobytes()
+
+    try:
+        return bits("状") != bits("￾")
+    except Exception:
+        return False
+
+
+def resolve_font_name() -> tuple[str | None, bool]:
+    """Pick the font file to draw with. Returns (name or None, covers_japanese)."""
+    from PIL import ImageFont
+
+    latin: str | None = None
+    for name in _FONT_CANDIDATES:
+        try:
+            probe = ImageFont.truetype(name, 24)
+        except OSError:
+            continue
+        if _covers_japanese(probe):
+            return name, True
+        if latin is None:
+            latin = name
+    return latin, False
+
 
 @dataclass
 class WellFrame:
@@ -386,7 +446,7 @@ def compose_pdf(
     rows: int,
     cols: int,
     frames: list[WellFrame],
-    known_wells: dict[str, bool],
+    well_states: dict[str, str],
     cell_px: int,
     footer: str,
 ) -> Path:
@@ -394,10 +454,15 @@ def compose_pdf(
 
     Every position in the plate appears, whether or not it was acquired: a packed
     grid of only the acquired wells would be unreadable as a plate, and a reader
-    could not tell B02 from B04. `known_wells` maps well_id -> enabled for the
-    wells the manifest listed, so an unacquired cell and a disabled one can be
-    told apart; a well that was supposed to render and did not never reaches here,
-    because the caller fails the whole export instead.
+    could not tell B02 from B04.
+
+    `well_states` says why each empty cell is empty, keyed by well_id — a key that
+    is absent means the plate never imaged it. The distinction is the whole point:
+    an earlier version marked every empty cell "Not acquired", so a well that WAS
+    imaged but merely left out of the selection appeared in the figure as one that
+    was never imaged. That is a false statement about an experiment, and nothing
+    downstream could catch it. A well that was supposed to render and failed never
+    reaches here at all — the caller fails the whole export instead.
     """
     from PIL import Image, ImageDraw, ImageFont
 
@@ -412,13 +477,17 @@ def compose_pdf(
     page = Image.new("RGB", (page_w, page_h), "white")
     draw = ImageDraw.Draw(page)
 
+    chosen, _ = resolve_font_name()
+
     def font(px: int):
-        for name in ("Helvetica.ttc", "Arial.ttf", "DejaVuSans.ttf"):
+        if chosen:
             try:
-                return ImageFont.truetype(name, px)
+                return ImageFont.truetype(chosen, px)
             except OSError:
-                continue
-        return ImageFont.load_default()
+                pass
+        # Pillow's own font, so a machine with no usable system font still
+        # produces a labelled figure rather than an exception.
+        return ImageFont.load_default(px)
 
     f_title, f_label, f_cell = font(max(12, title_h // 2)), font(max(9, label_h * 2 // 3)), font(max(8, label_h // 2))
 
@@ -452,7 +521,7 @@ def compose_pdf(
                 draw.text((x + pad, y + pad), f.well_id, fill="white", font=f_cell)
             else:
                 draw.rectangle(box, outline="#c8c8c8", width=1)
-                state = "Disabled" if known_wells.get(wid) is False else "Not acquired"
+                state = EMPTY_CELL_LABELS.get(well_states.get(wid, ""), "Not acquired")
                 draw.text((x + cell_px // 2, y + cell_px // 2 - label_h), wid,
                           fill="#909090", font=f_cell, anchor="mm")
                 draw.text((x + cell_px // 2, y + cell_px // 2 + label_h), state,
@@ -468,3 +537,66 @@ def compose_pdf(
         n += 1
     page.save(final, "PDF", resolution=300.0)
     return final
+
+
+def selftest() -> int:
+    """Prove this build can actually compose a PDF. Returns an exit code.
+
+    Saving a PDF needs more than `import PIL`: Pillow registers its codecs
+    lazily, by importing `PIL.*ImagePlugin` modules by name at first use, and
+    PyInstaller resolves imports statically. A frozen build can therefore import
+    Pillow perfectly and still fail on `save(..., "PDF")` — the same shape of bug
+    as the missing .dist-info that made every packaged build unable to open a
+    .oir for a whole release. Fonts have the same property: `truetype("Arial.ttf")`
+    resolves against the OS font directories, which differ per platform.
+
+    So this walks the real path — encode a PNG, decode it, resolve the fonts,
+    lay out a grid, write the PDF — rather than asserting the imports succeed.
+    """
+    import io
+    import tempfile
+
+    try:
+        from PIL import Image
+    except Exception as e:
+        print(f"selftest FAILED: import PIL -> {type(e).__name__}: {e}", flush=True)
+        return 10
+
+    try:
+        buf = io.BytesIO()
+        Image.new("RGB", (64, 48), (20, 160, 90)).save(buf, "PNG")
+        png = buf.getvalue()
+    except Exception as e:
+        print(f"selftest FAILED: PNG encode -> {type(e).__name__}: {e}", flush=True)
+        return 11
+
+    # Which font this platform resolved, and whether it can draw Japanese. Not
+    # fatal — a Latin-only font still produces a usable figure — but a plate name
+    # from a Japanese folder would come out as boxes, so it must be visible in
+    # the build log rather than discovered on a finished PDF.
+    try:
+        name, ja = resolve_font_name()
+        print(f"selftest: font {name or 'PIL default'}"
+              f" (日本語 {'OK' if ja else 'NG — 日本語のプレート名は豆腐になります'})", flush=True)
+    except Exception as e:
+        print(f"selftest: font probe failed -> {type(e).__name__}: {e}", flush=True)
+
+    # A frame in a cell and an empty cell, so both branches of the layout run.
+    # The plate name is Japanese on purpose: it is the path that broke.
+    frames = [WellFrame(well_id="B02", row=1, col=1, png=png)]
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = compose_pdf(
+                Path(tmp) / "selftest.pdf", "セルフテスト", 2, 2, frames,
+                {"B03": "disabled"}, PDF_CELL_CHOICES["draft"], "selftest",
+            )
+            head, size = out.read_bytes()[:5], out.stat().st_size
+    except Exception as e:
+        print(f"selftest FAILED: compose_pdf -> {type(e).__name__}: {e}", flush=True)
+        return 12
+
+    if head != b"%PDF-":
+        print(f"selftest FAILED: output is not a PDF (starts {head!r})", flush=True)
+        return 13
+    print(f"selftest: plate PDF OK ({size} bytes)", flush=True)
+    return 0

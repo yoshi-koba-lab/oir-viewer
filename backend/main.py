@@ -34,11 +34,14 @@ def _force_utf8_stdio() -> None:
 
 _force_utf8_stdio()
 
+from pathlib import Path
+
 import numpy as np
 import uvicorn
 from contextlib import asynccontextmanager
 import json
 import re
+import time
 from fastapi import FastAPI, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
@@ -908,11 +911,19 @@ class PlateVolumeRequest(BaseModel):
     #: export must not auto-stretch, so the caller sends the window the user set.
     levels: list[list[float]]
     t: int = 0
+    #: Longest XY edge of the returned volume; 0 means the source resolution,
+    #: with no downscale and no Z decimation. Omitted, it stays at Low.
+    #:
+    #: This field was missing while the UI already sent it. Pydantic drops unknown
+    #: fields, so every choice — Medium, High, Ultra, Max — silently rendered at
+    #: Low, and the PDF footer recorded the resolution the user picked rather than
+    #: the one used. The response header now reports the cap that was applied.
+    max_xy: int = plate.PLATE_MAX_XY
 
 
 @app.post("/api/plate/volume-bin")
 def plate_volume_bin(req: PlateVolumeRequest):
-    """One well's stitched OIR as a Low uint8 volume, streamed plane by plane.
+    """One well's stitched OIR as a uint8 volume, streamed plane by plane.
 
     Deliberately not /api/volume-bin: that one needs the image registered in the
     global `images` map (pinning ~4 GiB per well), resizes whole channels at once,
@@ -925,6 +936,7 @@ def plate_volume_bin(req: PlateVolumeRequest):
             channels=list(req.channels),
             levels=[(float(a), float(b)) for a, b in req.levels],
             t=int(req.t),
+            max_xy=int(req.max_xy),
         )
         info, payload = plate.read_low_volume(spec)
         return Response(
@@ -932,6 +944,63 @@ def plate_volume_bin(req: PlateVolumeRequest):
             media_type="application/octet-stream",
             headers={"X-Plate-Volume": json.dumps(info)},
         )
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse(status_code=400, content={"error": _describe(e)})
+
+
+class PlateFrame(BaseModel):
+    well_id: str
+    row: int
+    col: int
+    #: base64 PNG of the rendered well.
+    png_b64: str
+
+
+class PlatePdfRequest(BaseModel):
+    plate_name: str
+    rows: int
+    cols: int
+    frames: list[PlateFrame]
+    #: well_id -> why that cell is empty: "disabled", "excluded" (imaged but not
+    #: selected) or "missing" (imaged but no stitched file). A well_id that is
+    #: absent was never imaged. Only cells with no frame consult this.
+    well_states: dict[str, str] = {}
+    cell_px: int = 600
+    output_dir: str
+    footer: str = ""
+
+
+@app.post("/api/plate/pdf")
+def plate_pdf(req: PlatePdfRequest):
+    """Compose rendered wells into one PDF in plate order.
+
+    All or nothing by construction: the caller sends frames only for wells it
+    rendered successfully, and it is the caller's job to abort rather than send a
+    partial set — a PDF missing a well that WAS acquired would look like a plate
+    where that well was empty.
+    """
+    try:
+        out_dir = Path(req.output_dir).expanduser()
+        if not out_dir.is_dir():
+            return JSONResponse(status_code=400,
+                                content={"error": f"保存先が見つかりません: {out_dir}"})
+        frames = [
+            plate.WellFrame(f.well_id, f.row, f.col, base64.b64decode(f.png_b64))
+            for f in req.frames
+        ]
+        if not frames:
+            return JSONResponse(status_code=400, content={"error": "描画されたウェルがありません"})
+        safe = _safe_name_part(req.plate_name) or "plate"
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        out = plate.compose_pdf(
+            out_dir / f"{safe}_plate3d_{stamp}.pdf",
+            req.plate_name, int(req.rows), int(req.cols),
+            frames, dict(req.well_states), int(req.cell_px), req.footer,
+        )
+        return {"path": str(out), "wells": len(frames), "bytes": out.stat().st_size}
     except ValueError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
     except Exception as e:
@@ -1480,9 +1549,15 @@ def main():
     pywebview window of its own.
     """
     _log_environment()
-    # A build that cannot reach Bio-Formats must fail the pipeline, not the user.
+    # A build that cannot reach Bio-Formats — or cannot write a PDF — must fail
+    # the pipeline, not the user. Both walk their real path rather than checking
+    # that an import succeeded: Pillow loads its codecs lazily and resolves fonts
+    # against the OS, so PDF export can be broken in a frozen build that imports
+    # PIL fine. Reported together, so one run names every problem.
     if "--selftest" in sys.argv:
-        raise SystemExit(selftest())
+        rc = selftest()
+        rc_plate = plate.selftest()
+        raise SystemExit(rc or rc_plate)
     use_webview = "--no-webview" not in sys.argv and not getattr(sys, "frozen", False)
     if use_webview:
         try:

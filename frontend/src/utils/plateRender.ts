@@ -54,13 +54,24 @@ export class PlateRenderer {
   constructor(size: number) {
     const canvas = document.createElement('canvas');
     canvas.width = canvas.height = size;
-    this.renderer = new THREE.WebGLRenderer({
-      canvas,
-      antialias: true,
-      // Needed to read the frame back after render(); without it the buffer may
-      // already have been cleared by the time toBlob runs.
-      preserveDrawingBuffer: true,
-    });
+    try {
+      this.renderer = new THREE.WebGLRenderer({
+        canvas,
+        antialias: true,
+        // Needed to read the frame back after render(); without it the buffer may
+        // already have been cleared by the time toBlob runs.
+        preserveDrawingBuffer: true,
+      });
+    } catch (e) {
+      // three.js throws a bare "Error creating WebGL context", which tells the
+      // user nothing they can act on. Most often this is a machine with no GPU
+      // acceleration available to the app at all.
+      throw new Error(
+        '3D 描画を初期化できませんでした（WebGL2 が使えません）。'
+        + `GPU ドライバか、ハードウェアアクセラレーションの設定を確認してください。[${
+          e instanceof Error ? e.message : String(e)}]`,
+      );
+    }
     this.renderer.setSize(size, size, false);
     this.renderer.setClearColor(0x000000, 1);
 
@@ -162,6 +173,18 @@ export class PlateRenderer {
     (this.material.uniforms.cameraPos.value as THREE.Vector3).copy(camLocal);
 
     this.renderer.render(this.scene, this.camera);
+
+    // A lost context does not throw. It keeps accepting draw calls and keeps
+    // handing back a canvas — a black one. Unchecked, that black frame is
+    // indistinguishable from a well with no signal, and it would be written into
+    // the PDF as data. A driver reset or GPU memory pressure part-way through a
+    // long export is exactly when this happens, so it is checked every well.
+    if (this.renderer.getContext().isContextLost()) {
+      throw new Error(
+        `${wellId}: 描画中に GPU コンテキストが失われました。`
+        + '解像度を下げて再実行してください（このウェル以降は描画されていません）。',
+      );
+    }
 
     const blob = await new Promise<Blob | null>((res) =>
       (this.renderer.domElement as HTMLCanvasElement).toBlob(res, 'image/png'),

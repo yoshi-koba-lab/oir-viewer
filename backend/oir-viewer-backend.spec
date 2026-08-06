@@ -50,7 +50,13 @@ hiddenimports = [
     "scyjava", "jpype", "jpype._core", "jgo",
     "uvicorn.logging", "uvicorn.loops.auto", "uvicorn.protocols.http.auto",
     "uvicorn.protocols.websockets.auto", "uvicorn.lifespan.on",
-    "tifffile", "PIL.Image", "scipy.ndimage",
+    "tifffile", "PIL.Image", "PIL.ImageDraw", "PIL.ImageFont", "scipy.ndimage",
+    # Pillow registers codecs lazily, importing PIL.*ImagePlugin by name at first
+    # use, which a static analysis does not see. Named here so plate PDF export
+    # cannot fail in a frozen build that imports Pillow perfectly well. The
+    # --selftest run in CI writes a real PDF, so this stays honest.
+    "PIL.PdfImagePlugin", "PIL.PngImagePlugin",
+    "PIL.JpegImagePlugin", "PIL.TiffImagePlugin",
     # The file picker on Windows/Linux runs through tkinter.
     "tkinter", "tkinter.filedialog",
 ]
