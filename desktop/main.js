@@ -22,6 +22,37 @@ const BACKEND_TIMEOUT_MS = 120_000;
 let backend = null;
 let mainWindow = null;
 let backendLog = '';
+let logStream = null;
+
+/**
+ * Where the backend's output goes. A packaged GUI app on Windows has no console
+ * attached, so writing to process.stdout put every Python traceback nowhere —
+ * the app could fail and leave no evidence at all. One file per launch, the last
+ * ten kept, reachable from the Help menu.
+ */
+function openLogFile() {
+  try {
+    const dir = path.join(app.getPath('home'), '.oir-viewer', 'logs');
+    fs.mkdirSync(dir, { recursive: true });
+    const files = fs.readdirSync(dir).filter((f) => f.startsWith('backend-')).sort();
+    for (const old of files.slice(0, Math.max(0, files.length - 9))) {
+      try { fs.rmSync(path.join(dir, old)); } catch { /* a locked old log is not worth failing over */ }
+    }
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const file = path.join(dir, `backend-${stamp}.log`);
+    logStream = fs.createWriteStream(file, { flags: 'a' });
+    logStream.write(`OIR Viewer ${app.getVersion()} on ${process.platform} ${process.arch}\n`);
+    logStream.write(`started ${new Date().toISOString()}\n\n`);
+    return file;
+  } catch {
+    // Logging must never be the reason the app fails to start.
+    return null;
+  }
+}
+
+function logDir() {
+  return path.join(app.getPath('home'), '.oir-viewer', 'logs');
+}
 
 /** Where the packaged Python backend lives, or how to run it from source. */
 function backendCommand() {
@@ -36,6 +67,7 @@ function backendCommand() {
 
 function startBackend() {
   return new Promise((resolve, reject) => {
+    openLogFile();
     const { cmd, args, cwd } = backendCommand();
     if (!isDev && !fs.existsSync(cmd)) {
       reject(new Error(`Backend executable not found:\n${cmd}`));
@@ -60,6 +92,7 @@ function startBackend() {
       const text = chunk.toString();
       backendLog += text;
       process.stdout.write(`[backend] ${text}`);
+      if (logStream) logStream.write(text);
       const m = text.match(/listening on http:\/\/127\.0\.0\.1:(\d+)/);
       if (m && !settled) {
         settled = true;
@@ -242,6 +275,18 @@ if (!app.requestSingleInstanceLock()) {
         ],
       },
       { role: 'windowMenu' },
+      {
+        label: 'ヘルプ',
+        submenu: [
+          {
+            label: 'ログフォルダを開く',
+            click: () => {
+              try { fs.mkdirSync(logDir(), { recursive: true }); } catch { /* shell.openPath reports it */ }
+              shell.openPath(logDir());
+            },
+          },
+        ],
+      },
     ]));
 
     try {

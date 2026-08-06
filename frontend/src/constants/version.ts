@@ -5,6 +5,13 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.2.5 — 2026-08-06 — The backend's output is written to a file. It went to the
+//     Electron main process's stdout, and a packaged GUI app on Windows has no
+//     console attached — so every Python traceback went nowhere and a failure left
+//     no evidence at all. One file per launch under ~/.oir-viewer/logs/, the last
+//     ten kept, with the version and platform in the header, plus a Help menu item
+//     that opens the folder. Logging can never be the reason startup fails: every
+//     step of it is best-effort.
 //   1.2.4 — 2026-08-06 — Tells you when a newer release exists. The app asks the
 //     GitHub Releases API once per launch — its only outbound request, sending
 //     nothing but the running version number — and shows one dismissible line if
@@ -115,4 +122,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.2.4';
+export const VERSION = '1.2.5';
