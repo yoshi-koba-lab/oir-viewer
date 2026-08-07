@@ -5,6 +5,29 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.5.3 — 2026-08-08 — Why 3D was darker than 2D: found, measured, fixed. The
+//     texture fed to the 3D view was packed over an auto-contrast window that
+//     clips the top 0.1 percent of values — and a maximum-intensity projection
+//     displays exactly those values. These acquisitions record a full-scale LUT
+//     (0..4095), which is the window 2D opens with, so on the real well the 3D
+//     view rendered its brightest structures at 0.18x (CH1) and 0.16x (CH3) of
+//     their 2D brightness: five to six times darker, silently. The same clip
+//     moving with the downsample is also what made Ultra and Maximum render at
+//     different brightnesses — the user's own diagnosis, "does reducing the
+//     information also change the brightness?", was the right question.
+//     The texture is now packed over the channel's actual data range, so nothing
+//     the MIP wants is clipped and the shader's window maths (1.5.1) reproduces
+//     the 2D display exactly. Verified on the real well at 512 and at full
+//     resolution: brightest-structure agreement 0.994-0.997, the residual being
+//     uint8 quantisation. One guard remains: a lone hot pixel detached from the
+//     distribution (max > 2x the 99.999th percentile) is treated as noise so it
+//     cannot stretch the packing and band everything else.
+//     What remains resolution-dependent is real: shrinking averages sub-pixel
+//     structures toward their surroundings, in 3D and 2D alike. Maximum quality
+//     shows the true brightness, and since 1.5.2 it can no longer kill the app.
+//     Getting here took its own fix: the external drive holding the data dropped
+//     three times during measurement, so the well is copied to local disk first
+//     — loads went from 97 s to 7 s, and the drive stopped being a dependency.
 //   1.5.2 — 2026-08-08 — The interactive 3D path stops being able to kill the app,
 //     and a whole-tree audit. Two hands worked on this one: a spawned session
 //     rebuilt /api/volume-bin to stream plane by plane (the old path expanded
@@ -394,4 +417,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.5.2';
+export const VERSION = '1.5.3';

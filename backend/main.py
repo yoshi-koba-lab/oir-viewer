@@ -900,9 +900,28 @@ def get_volume_bin(
                     counts += np.bincount(stage[zi].reshape(-1),
                                           minlength=_U16_LEVELS)
 
-            # Same window as before, from a histogram of the same values rather
-            # than from the values themselves — see auto_contrast_from_counts.
-            low, high = auto_contrast_from_counts(counts)
+            # Packed over the channel's own data range, NOT an auto-contrast
+            # percentile. The 99.9th-percentile window this used to take clips
+            # everything above it to a flat 1.0 — and a MIP displays exactly
+            # those voxels. These files record a full-scale LUT (0..4095), so 2D
+            # opens with that window while 3D showed its brightest structures at
+            # the clip level: measured on the real well, 3D rendered CH1 at 0.18x
+            # and CH3 at 0.16x of their 2D brightness. It also made brightness a
+            # function of the quality setting, because the percentile moves with
+            # the downsample. Packing the true range clips nothing, so the
+            # shader's window maths reproduces 2D exactly at any resolution.
+            #
+            # One guard: a lone hot pixel far above the distribution would
+            # stretch the packing and quantise the real signal into a few uint8
+            # steps. If the max is detached from the 99.999th percentile by more
+            # than 2x, it is treated as noise and the percentile wins — that one
+            # pixel saturates instead of everything else banding.
+            nz = np.nonzero(counts)[0]
+            dmin = int(nz[0]) if nz.size else 0
+            dmax = int(nz[-1]) if nz.size else 1
+            _, p_hi = auto_contrast_from_counts(counts, 0.001)
+            high = dmax if dmax <= 2 * max(p_hi, 1.0) else int(p_hi)
+            low = dmin
             rng = max(float(high - low), 1.0)
             base = head_bytes + c * ch_bytes
             mv[32 + 8 * c:40 + 8 * c] = np.array([int(low), int(high)],
