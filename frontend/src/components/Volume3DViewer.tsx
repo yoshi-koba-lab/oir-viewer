@@ -101,6 +101,14 @@ export function Volume3DViewer() {
   // maxDimUm is how many µm one world unit spans, which is what turns the
   // perspective projection into a physical scale bar.
   const volumeInfoRef = useRef({ scaleX: 1, scaleY: 1, scaleZ: 1, maxDimUm: 0 });
+  /**
+   * Per channel, the raw [low, high] the backend normalised the uint8 volume
+   * over. The user's Min/Max is in raw units and the texture is in 0..1, so this
+   * is what converts between them. Empty until a volume has loaded.
+   */
+  const bakedLevelsRef = useRef<[number, number][]>([]);
+  /** Bumped when a volume finishes loading, to re-push the contrast uniforms. */
+  const [volumeEpoch, setVolumeEpoch] = useState(0);
 
   // Scale bar. Length/visibility/colour are shared with the other views; only
   // the pixel width is local, since it comes from this camera's distance.
@@ -344,6 +352,14 @@ export function Volume3DViewer() {
 
         // Create 3D textures for each channel (up to 4) — uint8 data
         const numCh = Math.min(volChannels.length, MAX_TEX_CHANNELS);
+        // The window the backend already applied when it packed the volume into
+        // uint8. Kept because the shader has to express the user's Min/Max in
+        // texture units, not raw ones: without it the contrast controls did
+        // nothing at all in this view.
+        bakedLevelsRef.current = volChannels
+          .slice(0, MAX_TEX_CHANNELS)
+          .map((c) => [c.autoMin, c.autoMax] as [number, number]);
+        setVolumeEpoch((n) => n + 1);
         for (let c = 0; c < numCh; c++) {
           const u8 = volChannels[c].data;
 
@@ -446,8 +462,20 @@ export function Volume3DViewer() {
       if (i < channels.length) {
         const ch = channels[i];
         colors.push(new THREE.Vector3(ch.color[0] / 255, ch.color[1] / 255, ch.color[2] / 255));
-        mins.push(0);
-        maxs.push(1);
+        // Map the user's window into the texture's own scale. The volume was
+        // packed as (raw - low) / (high - low), so the same transform applied to
+        // ch.min/ch.max is what the shader needs. These used to be hardcoded to
+        // 0 and 1, which made the shader a pass-through and the Min/Max controls
+        // inert in this view — the sliders moved and nothing happened.
+        const baked = bakedLevelsRef.current[i];
+        if (baked) {
+          const span = Math.max(baked[1] - baked[0], 1);
+          mins.push((ch.min - baked[0]) / span);
+          maxs.push((ch.max - baked[0]) / span);
+        } else {
+          mins.push(0);
+          maxs.push(1);
+        }
         visible.push(ch.visible);
       } else {
         colors.push(new THREE.Vector3(1, 1, 1));
@@ -461,7 +489,10 @@ export function Volume3DViewer() {
     mat.uniforms.uMins.value = mins;
     mat.uniforms.uMaxs.value = maxs;
     mat.uniforms.uVisible.value = visible;
-  }, [channels]);
+    // volumeEpoch: a freshly loaded volume brings new baked levels, and the
+    // uniforms have to be recomputed against them even if `channels` did not
+    // change.
+  }, [channels, volumeEpoch]);
 
   // Push the visible Z slab to the shader. Plane n covers [n-1, n]/volZ in
   // normalised texture Z, so the selected 1-based inclusive range maps to

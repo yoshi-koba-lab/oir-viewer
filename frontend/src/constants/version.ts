@@ -5,6 +5,25 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.5.1 — 2026-08-07 — Min/Max had no effect at all in the 3D view. The shader has
+//     uMins/uMaxs and applies them correctly; what it was handed was 0 and 1 for
+//     every channel, hardcoded, so it was a pass-through. Moving the sliders did
+//     nothing, in the app and in the browser alike.
+//     What 3D therefore showed was not the user's window but the auto-contrast
+//     the backend applies when it packs the volume into uint8 — which is computed
+//     over the whole stack, while 2D windows the current plane from raw uint16.
+//     Those disagree, so "3D looks darker than 2D" was the same defect seen from
+//     the other side rather than a separate one.
+//     /api/volume-bin already reports the [low, high] it normalised each channel
+//     over, and the client already parsed it, so the fix needs no refetch: the
+//     user's window is mapped into the texture's own scale and the shader does
+//     the rest on the GPU, so dragging a slider is immediate.
+//     Verified on real acquisition data (2910x2924x50, 5 channels): Max 199 -> 40
+//     turns a dim mottled volume fully bright, and Min 0 -> 120 leaves only the
+//     brightest voxels. Both directions, so it is the window and not a gamma.
+//     One limitation this does not remove: the volume is uint8, clipped to that
+//     auto range, so widening the window past it cannot recover what was clipped.
+//     Narrowing — the common case — is exact.
 //   1.5.0 — 2026-08-07 — Saving names the file, and never replaces one silently.
 //     Every export used to name its own files and, on a collision, quietly slide
 //     to `_01`, `_02`. Nothing was ever destroyed — the report of "it overwrites
@@ -345,4 +364,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.5.0';
+export const VERSION = '1.5.1';
