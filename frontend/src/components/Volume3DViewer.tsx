@@ -386,9 +386,26 @@ export function Volume3DViewer() {
         mat.uniforms.uVolumeScale.value.set(scaleX, scaleY, scaleZ);
         updateCamera(); // model-space camera depends on the mesh matrix
 
-        // A new volume resets the visible slab to the whole stack.
         setVolZ(num_z);
-        setZRange({ start: 1, end: num_z });
+        // A slab this image was already set up with wins over the default; only
+        // an image being seen for the first time gets the whole stack. Without
+        // this, coming back to a well to check it silently widened its Z range
+        // and the export no longer matched what had been decided.
+        {
+          const store = useImageStore.getState();
+          const saved = store.activeImageId
+            ? store.imageViewStates[store.activeImageId]?.volume3D
+            : undefined;
+          const range = saved
+            ? {
+                start: Math.max(1, Math.min(num_z, saved.zStart)),
+                end: Math.max(1, Math.min(num_z, saved.zEnd)),
+              }
+            : { start: 1, end: num_z };
+          if (range.end < range.start) range.end = range.start;
+          setZRange(range);
+          store.setVolume3D({ zStart: range.start, zEnd: range.end, zTotal: num_z });
+        }
 
         // Info string
         const mb = ((numCh * num_z * height * width) / 1048576).toFixed(1);
@@ -460,7 +477,9 @@ export function Volume3DViewer() {
     if (Number.isNaN(v)) return;
     setZRange((r) => {
       const start = Math.max(1, Math.min(volZ, Math.round(v)));
-      return { start, end: Math.max(start, r.end) };
+      const next = { start, end: Math.max(start, r.end) };
+      useImageStore.getState().setVolume3D({ zStart: next.start, zEnd: next.end, zTotal: volZ });
+      return next;
     });
   }, [volZ]);
 
@@ -468,7 +487,9 @@ export function Volume3DViewer() {
     if (Number.isNaN(v)) return;
     setZRange((r) => {
       const end = Math.max(1, Math.min(volZ, Math.round(v)));
-      return { start: Math.min(end, r.start), end };
+      const next = { start: Math.min(end, r.start), end };
+      useImageStore.getState().setVolume3D({ zStart: next.start, zEnd: next.end, zTotal: volZ });
+      return next;
     });
   }, [volZ]);
 
@@ -479,6 +500,11 @@ export function Volume3DViewer() {
     orbit.current.az = a;
     orbit.current.el = e;
     setAngles({ az: Math.round(a * 10) / 10, el: Math.round(e * 10) / 10 });
+    // Recorded per image, so the angle survives switching wells and the plate
+    // export renders the view that was actually set up. Written on every change
+    // rather than on gesture end: a zustand set is cheap next to the re-render
+    // this already does, and there is no "gesture end" for a typed angle.
+    useImageStore.getState().setVolume3D({ az: a, el: e, radius: orbit.current.radius });
     updateCamera();
   }, [updateCamera]);
 
@@ -623,6 +649,7 @@ export function Volume3DViewer() {
       e.preventDefault();
       const r = orbit.current.radius * (e.deltaY > 0 ? 1.1 : 0.9);
       orbit.current.radius = Math.max(0.5, Math.min(10, r));
+      useImageStore.getState().setVolume3D({ radius: orbit.current.radius });
       updateCamera();
     };
     el.addEventListener('wheel', onWheel, { passive: false });
@@ -631,8 +658,29 @@ export function Volume3DViewer() {
 
   const resetCamera = useCallback(() => {
     orbit.current.radius = 2.5;
-    applyAngles(DEFAULT_AZ, DEFAULT_EL);
+    applyAngles(DEFAULT_AZ, DEFAULT_EL);   // also records the reset radius
   }, [applyAngles]);
+
+  /**
+   * Adopt this image's stored angle when the active image changes.
+   *
+   * An image with no stored state keeps whatever angle is set rather than
+   * snapping back: a plate figure wants every well seen from the same
+   * direction, so carrying the angle to the next well is the useful default.
+   * The Z slab is per-volume and is handled where the volume loads.
+   */
+  useEffect(() => {
+    if (!activeImageId) return;
+    const v = useImageStore.getState().volume3D;
+    orbit.current.az = v.az;
+    orbit.current.el = v.el;
+    orbit.current.radius = v.radius;
+    setAngles({ az: Math.round(v.az * 10) / 10, el: Math.round(v.el * 10) / 10 });
+    updateCamera();
+    // updateCamera is intentionally not a dependency: including it re-runs this
+    // on every camera change and fights the drag.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeImageId]);
 
   if (!metadata || metadata.num_z <= 1) {
     return (
@@ -760,7 +808,10 @@ export function Volume3DViewer() {
               />
             </div>
             <button
-              onClick={() => setZRange({ start: 1, end: volZ })}
+              onClick={() => {
+                setZRange({ start: 1, end: volZ });
+                useImageStore.getState().setVolume3D({ zStart: 1, zEnd: volZ, zTotal: volZ });
+              }}
               className="w-full px-1 py-0.5 rounded bg-white/10 hover:bg-white/20 text-[10px] transition"
             >
               全範囲

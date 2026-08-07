@@ -117,6 +117,33 @@ def _derive_stitch(tile_name: str) -> str | None:
     return f"Stitch_{m['well']}_{m['grp']}.oir" if m else None
 
 
+def _well_subject(path: Path) -> str:
+    """How to name this file in a message: `Stitch_B02_G001.oir` -> `ウェル B02`.
+
+    The read path is handed a path, not a well, so the label is recovered from
+    the name `_derive_stitch` built. A path that is not a stitched well — the
+    route accepts any .oir — is named by its filename instead of being called a
+    well it is not.
+    """
+    m = re.fullmatch(r"Stitch_(?P<well>[A-Za-z]\d{1,2})_G\d+", path.stem)
+    return f"ウェル {m['well']}" if m else path.name
+
+
+def _chunk_stem(path: Path) -> str:
+    """The prefix a split .oir's continuation files carry: `<name>.oir` -> `<name>`."""
+    return path.name[: -len(".oir")] if path.name.lower().endswith(".oir") else path.stem
+
+
+def count_chunks(path: Path) -> int:
+    """Continuation chunks (`<name>_00001`, no extension) sitting next to a .oir.
+
+    Same count `scan` reports as `chunk_count`, kept in one place so the number
+    quoted in an error is the number the plate list showed.
+    """
+    stem = _chunk_stem(path)
+    return len([p for p in path.parent.glob(f"{stem}_*") if p.suffix == ""])
+
+
 def scan(where: str) -> Plate:
     """Parse a MATL acquisition. Raises ValueError with a reason the UI can show."""
     matl = find_matl(where)
@@ -188,10 +215,7 @@ def scan(where: str) -> Plate:
         stitch_name = next((s for s in (_derive_stitch(t) for t in tile_names) if s), None)
         stitch = folder / stitch_name if stitch_name else None
         exists = bool(stitch and stitch.is_file())
-        chunks = 0
-        if exists and stitch is not None:
-            stem = stitch.name[: -len(".oir")]
-            chunks = len([p for p in folder.glob(f"{stem}_*") if p.suffix == ""])
+        chunks = count_chunks(stitch) if exists and stitch is not None else 0
 
         # Compare the label against the stage grid.
         warn = ""
@@ -289,6 +313,47 @@ def _resize_plane(plane: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
     return ndzoom(src, (out_h / h, out_w / w), order=1)
 
 
+def require_complete_split(reader_j, path: Path, actual_z: int) -> None:
+    """Refuse a well whose split .oir is missing the chunks holding most of its Z.
+
+    Olympus splits a dataset over ~1 GB across `<name>.oir` plus extensionless
+    `<name>_00001`, `_00002`, … siblings. Copy only the .oir and it still opens,
+    still reports the full XY size, and exposes just the planes in the part that
+    came with it — Z 13 of 50, in the case this was found on. reader.py catches
+    that on an ordinary Open (`_detect_incomplete_oir`) and says so; nothing
+    checked it here, so such a well was rendered from a truncated Z range and
+    placed in the PDF looking like a finished result. A figure that is wrong
+    without looking wrong is the worst thing this export can produce, so this
+    fails rather than warns — the same all-or-nothing rule the export already
+    follows, where one unreadable well means no PDF instead of a gap.
+
+    The measure is reader.py's, shared as `reader.declared_z_length`: the vendor
+    metadata keeps the acquired Z even in the truncated copy, so a declared Z
+    longer than the reader can expose means the pixels are elsewhere.
+
+    Deliberately stricter than reader.py in one respect: reader.py stops at
+    "`_00001` exists" and stays quiet, which passes a partly-copied well — some
+    chunks present, Z still short — and that is the likeliest way this arrives,
+    a copy interrupted partway. Here any shortfall fails, and the message quotes
+    the chunk count so a genuinely truncated acquisition is distinguishable from
+    a bad copy by the person reading it.
+    """
+    from reader import declared_z_length
+
+    declared = declared_z_length(reader_j)
+    if declared <= actual_z:
+        return
+    chunks = count_chunks(path)
+    raise ValueError(
+        f"{_well_subject(path)} は分割保存された .oir の一部しか読めません"
+        f"（Zスライス {actual_z}/{declared}、続きのファイル {chunks} 個）。\n"
+        f"同じフォルダに {_chunk_stem(path)}_00001, _00002, … を揃えてから、"
+        "もう一度書き出してください。\n"
+        "一部が欠けたまま PDF にすると、そのウェルだけ浅い Z 範囲で描画され、"
+        "完成した結果と見分けがつきません。PDF は作成していません。"
+    )
+
+
 @dataclass
 class VolumeSpec:
     """What to read, and the contrast to bake in. Nothing here is inferred."""
@@ -335,6 +400,10 @@ def read_low_volume(spec: VolumeSpec) -> tuple[dict, bytes]:
             reader_j.setId(str(p))
             n_c, n_z = reader_j.getSizeC(), reader_j.getSizeZ()
             h, w = reader_j.getSizeY(), reader_j.getSizeX()
+            # Before a single plane is read: a well missing its continuation
+            # chunks reads perfectly and renders a short stack, so the only way
+            # to keep it out of the PDF is to refuse it here.
+            require_complete_split(reader_j, p, int(n_z))
             # The pixel type comes from the file, as reader.py already does it.
             # Hardcoding 16-bit here reinterpreted an 8-bit well's bytes in pairs:
             # half the width, and values that are two unrelated pixels glued
@@ -455,48 +524,83 @@ EMPTY_CELL_LABELS = {
 #: reaches the figure. Every CJK font here also covers the ASCII furniture, so
 #: when one is found it is used for everything.
 _FONT_CANDIDATES = (
-    "Hiragino Sans GB.ttc", "Arial Unicode.ttf",              # macOS
+    "Arial Unicode.ttf", "Hiragino Sans GB.ttc",              # macOS
     "meiryo.ttc", "YuGothM.ttc", "YuGothR.ttc", "msgothic.ttc",  # Windows
     "NotoSansCJK-Regular.ttc", "NotoSansJP-Regular.otf",      # Linux
     "Helvetica.ttc", "Arial.ttf", "DejaVuSans.ttf",           # Latin-only
 )
 
+#: Characters this figure actually prints. Probing one kanji is not enough:
+#: Hiragino Sans GB has every Japanese glyph and no U+00B5, so a caption reading
+#: "10 µM" came out with a box in it while the font reported itself as fine.
+#: Microscopy text is mostly µm, °, and Greek, so those are what get checked.
+_PROBE_JA = "状ア"
+_PROBE_SYM = "µμ°βα±×–℃Å"
 
-def _covers_japanese(font) -> bool:
-    """Whether a font has real Japanese glyphs, not .notdef boxes.
 
-    A missing glyph still renders — as a box, with its own bounding box — so
-    asking whether the glyph "exists" the obvious ways all answer yes. The only
-    honest test is to draw it and compare against a codepoint no font defines.
+def _glyph_gaps(font, text: str) -> str:
+    """Which characters this font would draw as .notdef boxes.
+
+    A missing glyph still renders, with its own bounding box, so every cheap way
+    of asking "does this font have this character" answers yes. Drawing it and
+    comparing against a codepoint no font defines is the only honest test.
     """
     from PIL import Image, ImageDraw
 
     def bits(ch: str) -> bytes:
-        im = Image.new("L", (40, 40), 0)
+        im = Image.new("L", (48, 48), 0)
         ImageDraw.Draw(im).text((2, 2), ch, fill=255, font=font)
         return im.tobytes()
 
     try:
-        return bits("状") != bits("￾")
+        undef = bits("￾")
+        return "".join(ch for ch in text if bits(ch) == undef)
     except Exception:
-        return False
+        return text
 
 
-def resolve_font_name() -> tuple[str | None, bool]:
-    """Pick the font file to draw with. Returns (name or None, covers_japanese)."""
+#: Characters replaced before drawing, where an identical-looking one is far
+#: more widely present. U+00B5 MICRO SIGN is absent from several fonts that do
+#: have U+03BC GREEK SMALL LETTER MU, and no reader can tell the two apart —
+#: substituting is strictly better than printing a box.
+_GLYPH_SUBS = str.maketrans({"µ": "μ", "Å": "Å"})
+
+
+def normalize_text(s: str) -> str:
+    """Swap characters that are commonly missing for identical-looking ones."""
+    return (s or "").translate(_GLYPH_SUBS)
+
+
+def resolve_font_name() -> tuple[str | None, str]:
+    """Pick the font to draw with. Returns (name or None, characters it lacks).
+
+    Scored rather than first-match: several installed fonts cover Japanese, and
+    they differ in which symbols they carry. Japanese coverage is the entry
+    requirement — a figure with boxed-out plate names is worse than one missing
+    a degree sign — and among fonts that pass, the one with the fewest gaps in
+    the symbol set wins.
+    """
     from PIL import ImageFont
 
+    best: tuple[str, str] | None = None
     latin: str | None = None
     for name in _FONT_CANDIDATES:
         try:
             probe = ImageFont.truetype(name, 24)
         except OSError:
             continue
-        if _covers_japanese(probe):
-            return name, True
-        if latin is None:
-            latin = name
-    return latin, False
+        if _glyph_gaps(probe, _PROBE_JA):
+            if latin is None:
+                latin = name
+            continue
+        gaps = _glyph_gaps(probe, normalize_text(_PROBE_SYM))
+        if best is None or len(gaps) < len(best[1]):
+            best = (name, gaps)
+        if not gaps:
+            break
+    if best:
+        return best
+    return latin, "日本語"
 
 
 @dataclass
@@ -507,6 +611,97 @@ class WellFrame:
     col: int
     #: RGB or RGBA pixels, any size; resized into the cell preserving aspect.
     png: bytes
+    #: Lines printed over the top-left of this well's image — the columns the
+    #: user marked for the figure. Empty draws nothing at all rather than a
+    #: blank strip.
+    caption: list[str] = field(default_factory=list)
+
+
+def _render_table_page(
+    headers: list[str],
+    rows: list[list[str]],
+    title: str,
+    page_w: int,
+    font_of,
+    cell_px: int,
+):
+    """The table as its own page, sized to fit the figure page's width.
+
+    Matching the figure's width matters: a PDF whose two pages are different
+    sizes opens at different zooms and prints awkwardly, and this is meant to be
+    read alongside the plate rather than as a separate document.
+
+    Column widths are proportional to the longest cell in each column, so a
+    free-text notes column gets the room and `Well` does not. Text that still
+    does not fit is clipped with an ellipsis rather than overrunning its
+    neighbour, because a table where columns bleed into each other is worse than
+    one that visibly truncates.
+    """
+    from PIL import Image, ImageDraw
+
+    if not headers or not rows:
+        return None
+    # Normalised before measuring, not just before drawing: a substituted glyph
+    # can be a different width, and a column sized to the original would clip.
+    headers = [normalize_text(h) for h in headers]
+    rows = [[normalize_text(c) for c in r] for r in rows]
+
+    pad = max(6, cell_px // 60)
+    fs = max(11, cell_px // 34)
+    f = font_of(fs)
+    f_head = font_of(fs)
+    line_h = int(fs * 1.9)
+    title_h = int(fs * 3.0)
+    margin = max(8, int(cell_px * _MARGIN_F))
+
+    probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+
+    def width_of(s: str) -> int:
+        return int(probe.textlength(s, font=f))
+
+    natural = [
+        max(width_of(h), *(width_of(r[i]) for r in rows)) + pad * 3
+        for i, h in enumerate(headers)
+    ]
+    avail = page_w - margin * 2
+    total = sum(natural)
+    # Only ever shrink: a narrow table centred in a wide page reads better than
+    # one stretched into columns of whitespace.
+    widths = ([int(w * avail / total) for w in natural] if total > avail else natural)
+
+    page_h = margin * 2 + title_h + line_h * (len(rows) + 1)
+    page = Image.new("RGB", (page_w, page_h), "white")
+    d = ImageDraw.Draw(page)
+    d.text((margin, margin), normalize_text(title), fill="black", font=font_of(int(fs * 1.6)))
+
+    def clip(s: str, w: int) -> str:
+        if width_of(s) <= w - pad * 2:
+            return s
+        while s and width_of(s + "…") > w - pad * 2:
+            s = s[:-1]
+        return s + "…"
+
+    y = margin + title_h
+    x = margin
+    for i, h in enumerate(headers):
+        d.text((x + pad, y + line_h // 2), clip(h, widths[i]), fill="black",
+               font=f_head, anchor="lm")
+        x += widths[i]
+    d.line([(margin, y + line_h), (margin + sum(widths), y + line_h)], fill="#404040", width=2)
+
+    for n, row in enumerate(rows):
+        y += line_h
+        if n % 2 == 1:
+            d.rectangle([(margin, y), (margin + sum(widths), y + line_h)], fill="#f4f4f4")
+        x = margin
+        for i, cell in enumerate(row):
+            d.text((x + pad, y + line_h // 2), clip(cell, widths[i]), fill="#202020",
+                   font=f, anchor="lm")
+            x += widths[i]
+        d.line([(margin, y + line_h), (margin + sum(widths), y + line_h)],
+               fill="#d0d0d0", width=1)
+
+    return page
 
 
 def compose_pdf(
@@ -518,6 +713,8 @@ def compose_pdf(
     well_states: dict[str, str],
     cell_px: int,
     footer: str,
+    table_headers: list[str] | None = None,
+    table_rows: list[list[str]] | None = None,
 ) -> Path:
     """Lay rendered wells out in the plate's own grid and write one PDF.
 
@@ -560,7 +757,8 @@ def compose_pdf(
 
     f_title, f_label, f_cell = font(max(12, title_h // 2)), font(max(9, label_h * 2 // 3)), font(max(8, label_h // 2))
 
-    draw.text((margin, margin), f"{plate_name}  —  {rows}x{cols}", fill="black", font=f_title)
+    draw.text((margin, margin), normalize_text(f"{plate_name}  —  {rows}x{cols}"),
+              fill="black", font=f_title)
 
     grid_x = margin + gutter
     grid_y = margin + title_h + label_h
@@ -587,7 +785,16 @@ def compose_pdf(
                 im.thumbnail((cell_px, cell_px), Image.LANCZOS)   # never stretched
                 page.paste(im, (x + (cell_px - im.width) // 2, y + (cell_px - im.height) // 2))
                 draw.rectangle(box, outline="black", width=1)
-                draw.text((x + pad, y + pad), f.well_id, fill="white", font=f_cell)
+                # Over the image, not beside it, so a cell stays one square and
+                # the plate keeps its shape. Stroked rather than shadowed: a
+                # blurred glow around light text on bright signal is a smear,
+                # which is what made the scale bar unreadable on dark colours.
+                lines = f.caption or [f.well_id]
+                ty = y + pad
+                for line in lines:
+                    draw.text((x + pad, ty), normalize_text(line), fill="white", font=f_cell,
+                              stroke_width=max(1, cell_px // 300), stroke_fill="black")
+                    ty += int(label_h * 0.85)
             else:
                 draw.rectangle(box, outline="#c8c8c8", width=1)
                 state = EMPTY_CELL_LABELS.get(well_states.get(wid, ""), "Not acquired")
@@ -596,7 +803,8 @@ def compose_pdf(
                 draw.text((x + cell_px // 2, y + cell_px // 2 + label_h), state,
                           fill="#b0b0b0", font=f_cell, anchor="mm")
 
-    draw.text((margin, page_h - margin // 2), footer, fill="#808080", font=f_cell, anchor="ls")
+    draw.text((margin, page_h - margin // 2), normalize_text(footer),
+              fill="#808080", font=f_cell, anchor="ls")
 
     # Never overwrite an earlier figure.
     final = out_path
@@ -604,7 +812,16 @@ def compose_pdf(
     while final.exists():
         final = out_path.with_name(f"{out_path.stem}_{n:02d}{out_path.suffix}")
         n += 1
-    page.save(final, "PDF", resolution=300.0)
+    extra = []
+    if table_headers and table_rows:
+        # Same file, not a sidecar: the figure and the conditions it was taken
+        # under get separated the moment they are two downloads.
+        tbl = _render_table_page(
+            table_headers, table_rows, f"{plate_name} — 条件表", page_w, font, cell_px,
+        )
+        if tbl is not None:
+            extra.append(tbl)
+    page.save(final, "PDF", resolution=300.0, save_all=bool(extra), append_images=extra)
     return final
 
 
@@ -621,6 +838,9 @@ def selftest() -> int:
 
     So this walks the real path — encode a PNG, decode it, resolve the fonts,
     lay out a grid, write the PDF — rather than asserting the imports succeed.
+
+    It then checks the split-chunk guard, which needs no Bio-Formats and no real
+    acquisition to exercise, and whose failure mode is a PDF that looks right.
     """
     import io
     import tempfile
@@ -644,9 +864,9 @@ def selftest() -> int:
     # from a Japanese folder would come out as boxes, so it must be visible in
     # the build log rather than discovered on a finished PDF.
     try:
-        name, ja = resolve_font_name()
+        name, gaps = resolve_font_name()
         print(f"selftest: font {name or 'PIL default'}"
-              f" (日本語 {'OK' if ja else 'NG — 日本語のプレート名は豆腐になります'})", flush=True)
+              f" ({'全て描画できます' if not gaps else f'描画できない文字: {gaps}'})", flush=True)
     except Exception as e:
         print(f"selftest: font probe failed -> {type(e).__name__}: {e}", flush=True)
 
@@ -668,4 +888,105 @@ def selftest() -> int:
         print(f"selftest FAILED: output is not a PDF (starts {head!r})", flush=True)
         return 13
     print(f"selftest: plate PDF OK ({size} bytes)", flush=True)
+
+    rc = _selftest_split_guard()
+    if rc:
+        return rc
+    return 0
+
+
+class _FakeReader:
+    """A Bio-Formats reader as `reader.declared_z_length` sees one.
+
+    That function only asks for the series metadata table and calls `.get` on it,
+    so a dict stands in exactly — which is what lets the split-chunk rule be
+    tested with no JVM, no Bio-Formats and no 4 GiB of real acquisition.
+    """
+
+    def __init__(self, table: dict | None):
+        self._table = table
+
+    def getSeriesMetadata(self):
+        return self._table
+
+
+def _z_axis(declared: int, *, at: int = 3) -> dict:
+    """A metadata table declaring a ZSTACK of `declared`, plus unrelated axes.
+
+    The decoys matter: the real table numbers its axes arbitrarily and mixes in
+    XY and LAMBDA entries, so a rule that just read `#1` would pass this test and
+    fail on the file it was written for.
+    """
+    return {
+        "axis axis #1": "XY", "axis maxSize #1": "2911",
+        "axis axis #2": "LAMBDA", "axis maxSize #2": "3",
+        f"axis axis #{at}": "ZSTACK", f"axis maxSize #{at}": str(declared),
+    }
+
+
+def _selftest_split_guard() -> int:
+    """Prove an incomplete split .oir stops the export instead of entering the PDF.
+
+    The failure this guards against is silent by construction — the well reads
+    without error and only its Z range is wrong — so the check is worth having
+    proven on every build rather than the day it next happens.
+    """
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            partial = d / "Stitch_B02_G001.oir"
+            partial.write_bytes(b"")
+            # Two continuation chunks present, and one decoy that has a suffix and
+            # so is not one — the same distinction `scan` draws.
+            (d / "Stitch_B02_G001_00001").write_bytes(b"")
+            (d / "Stitch_B02_G001_00002").write_bytes(b"")
+            (d / "Stitch_B02_G001_notes.txt").write_bytes(b"")
+            lone = d / "Stitch_C03_G001.oir"
+            lone.write_bytes(b"")
+
+            if count_chunks(partial) != 2:
+                print(f"selftest FAILED: chunk count {count_chunks(partial)} != 2", flush=True)
+                return 14
+            if count_chunks(lone) != 0:
+                print("selftest FAILED: counted chunks for a file that has none", flush=True)
+                return 14
+
+            # Complete: the reader exposes everything the metadata declares.
+            require_complete_split(_FakeReader(_z_axis(50)), lone, 50)
+            # A file whose metadata names no Z axis is not evidence of a problem.
+            require_complete_split(_FakeReader({}), lone, 13)
+            require_complete_split(_FakeReader(None), lone, 13)
+
+            # Truncated, nothing else copied: the case reader.py already reports.
+            try:
+                require_complete_split(_FakeReader(_z_axis(50)), lone, 13)
+            except ValueError as e:
+                msg = str(e)
+            else:
+                print("selftest FAILED: a truncated well was accepted", flush=True)
+                return 14
+            if "C03" not in msg or "13/50" not in msg:
+                print(f"selftest FAILED: message names neither well nor Z: {msg!r}", flush=True)
+                return 14
+
+            # Partly copied: chunks on disk, Z still short. reader.py stops at
+            # "_00001 exists" and stays quiet here; the export must not.
+            try:
+                require_complete_split(_FakeReader(_z_axis(50, at=7)), partial, 13)
+            except ValueError as e:
+                msg = str(e)
+            else:
+                print("selftest FAILED: a partly-copied well was accepted", flush=True)
+                return 14
+            # "2" alone would pass on "B02" or "_00002"; the count must be stated.
+            if "B02" not in msg or "続きのファイル 2 個" not in msg:
+                print(f"selftest FAILED: message omits well or chunk count: {msg!r}", flush=True)
+                return 14
+    except Exception as e:
+        print(f"selftest FAILED: split guard -> {type(e).__name__}: {e}", flush=True)
+        return 14
+
+    print("selftest: split-chunk guard OK (truncated wells fail the export)", flush=True)
     return 0

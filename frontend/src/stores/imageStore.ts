@@ -45,6 +45,35 @@ export interface ProjectionState {
   zTo: number;   // 0-based
 }
 
+/**
+ * How the 3D volume is being looked at.
+ *
+ * Lives here rather than inside Volume3DViewer because it has to survive
+ * switching images. Setting up eight wells one at a time is the plate workflow,
+ * and an angle that resets the moment you look at the next well makes that
+ * impossible — you can never go back and check one. It is also what the plate
+ * export reads, so the figure shows the view that was actually set up.
+ */
+export interface Volume3DState {
+  az: number;
+  el: number;
+  radius: number;
+  /** 1-based inclusive slice range, matching the control in the 3D panel. */
+  zStart: number;
+  zEnd: number;
+  /**
+   * Slices the range is relative to. The interactive volume may be decimated in
+   * Z, and the export re-reads at its own resolution, so a slab recorded as
+   * "10..30" means nothing without the total it was chosen against — the export
+   * converts through this rather than assuming the two volumes match.
+   */
+  zTotal: number;
+}
+
+export const DEFAULT_VOLUME_3D: Volume3DState = {
+  az: 0, el: 20, radius: 2.5, zStart: 1, zEnd: 1, zTotal: 1,
+};
+
 /** Per-image view state saved when switching images. */
 export interface ImageViewState {
   channels: ChannelState[];
@@ -52,6 +81,7 @@ export interface ImageViewState {
   currentT: number;
   showMIP: boolean;
   projection: ProjectionState;
+  volume3D: Volume3DState;
 }
 
 interface ImageStore {
@@ -67,6 +97,7 @@ interface ImageStore {
   currentT: number;
   showMIP: boolean;
   projection: ProjectionState;
+  volume3D: Volume3DState;
   loading: boolean;
   /** Last load/switch failure, surfaced to the user instead of failing silently. */
   loadError: string | null;
@@ -92,6 +123,7 @@ interface ImageStore {
   setCurrentT: (t: number) => void;
   setShowMIP: (mip: boolean) => void;
   setProjection: (p: ProjectionState) => void;
+  setVolume3D: (v: Partial<Volume3DState>) => void;
   setLoading: (l: boolean) => void;
   setLoadError: (e: string | null) => void;
 }
@@ -115,6 +147,7 @@ export const useImageStore = create<ImageStore>((set, get) => ({
   currentT: 0,
   showMIP: false,
   projection: { active: false, method: 'max', zFrom: 0, zTo: 0 },
+  volume3D: { ...DEFAULT_VOLUME_3D },
   loading: false,
   loadError: null,
 
@@ -123,10 +156,11 @@ export const useImageStore = create<ImageStore>((set, get) => ({
   setActiveImageId: (id) => set({ activeImageId: id }),
 
   saveViewState: () => {
-    const { activeImageId, channels, currentZ, currentT, showMIP, projection } = get();
+    const { activeImageId, channels, currentZ, currentT, showMIP, projection, volume3D } = get();
     if (!activeImageId) return;
     const states = { ...get().imageViewStates };
     states[activeImageId] = {
+      volume3D: { ...volume3D },
       // Drop `data`: keeping every tab's decoded slice here pinned hundreds of MB
       // outside the slice cache's budget. Pixels come back from the cache or the
       // server on restore; `hasLevels` preserves the contrast across that round trip.
@@ -153,6 +187,9 @@ export const useImageStore = create<ImageStore>((set, get) => ({
         currentT: Math.max(0, Math.min(saved.currentT, maxT)),
         showMIP: saved.showMIP,
         projection: saved.projection ? { ...saved.projection } : { active: false, method: 'max', zFrom: 0, zTo: 0 },
+        // Older persisted states predate this field; fall back rather than
+        // restoring `undefined` over a valid view.
+        volume3D: saved.volume3D ? { ...saved.volume3D } : { ...DEFAULT_VOLUME_3D },
       });
     }
   },
@@ -331,6 +368,11 @@ export const useImageStore = create<ImageStore>((set, get) => ({
   })),
   setShowMIP: (mip) => set({ showMIP: mip }),
   setProjection: (p) => set({ projection: p }),
+
+  // Merged rather than replaced: the orbit and the Z range are written by two
+  // different controls, and a full replace makes whichever fired last clobber
+  // the other.
+  setVolume3D: (v) => set({ volume3D: { ...get().volume3D, ...v } }),
   setLoading: (l) => set({ loading: l }),
   setLoadError: (e) => set({ loadError: e }),
 }));

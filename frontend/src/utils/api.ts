@@ -674,7 +674,11 @@ export async function composePlatePdf(body: {
   plate_name: string;
   rows: number;
   cols: number;
-  frames: { well_id: string; row: number; col: number; png_b64: string }[];
+  frames: {
+    well_id: string; row: number; col: number; png_b64: string;
+    /** Lines printed over the top-left of this well's image. */
+    caption?: string[];
+  }[];
   /**
    * Why each empty cell is empty: 'disabled', 'excluded' (imaged but not
    * selected) or 'missing' (imaged but no stitched file). A well_id that is
@@ -684,6 +688,9 @@ export async function composePlatePdf(body: {
   cell_px: number;
   output_dir: string;
   footer: string;
+  /** Conditions table, written as a second page of the same PDF. */
+  table_headers?: string[];
+  table_rows?: string[][];
 }): Promise<PlatePdfResult> {
   return postJson<PlatePdfResult>('/api/plate/pdf', body, 'PDF の作成に失敗');
 }

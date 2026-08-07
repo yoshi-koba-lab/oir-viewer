@@ -1,12 +1,15 @@
-import { useState, useRef } from 'react';
+import { useEffect, useMemo, useState, useRef } from 'react';
 import {
   chooseFolder, scanPlate, fetchPlateVolume, composePlatePdf,
-  PLATE_XY_CHOICES, PDF_CELL_CHOICES, type PlateScan,
+  PLATE_XY_CHOICES, PDF_CELL_CHOICES,
 } from '../utils/api';
 import { openAndReload } from '../hooks/useImageLoader';
 import { useImageStore } from '../stores/imageStore';
+import { usePlateStore } from '../stores/plateStore';
 import { PlateRenderer, parseVolume } from '../utils/plateRender';
+import { collectOpenWells, snapshotOf } from '../utils/plateWells';
 import { gpuLimits } from '../utils/gpuLimits';
+import { PlateTable } from './PlateTable';
 
 /**
  * Reads an Olympus MATL acquisition and shows what it contains, in the plate's
@@ -23,7 +26,12 @@ import { gpuLimits } from '../utils/gpuLimits';
 export function PlateDialog({ onClose }: { onClose: () => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const [plate, setPlate] = useState<PlateScan | null>(null);
+  // The scan lives in the store, not here: the workflow is open the wells, close
+  // this, tune each one in the viewer, then come back — and re-picking the
+  // folder every time would make that unusable.
+  const plate = usePlateStore((s) => s.scan);
+  const setScan = usePlateStore((s) => s.setScan);
+  const seed = usePlateStore((s) => s.seed);
   /** Which wells the next action applies to. Selected = has a stitched file. */
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState('');
@@ -41,9 +49,10 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
   const abortRef = useRef<AbortController | null>(null);
   /** True from the moment an export starts until it has finished or failed. */
   const [exporting, setExporting] = useState(false);
-  //  The contrast to bake in comes from the channels the user has on screen.
-  //  Plate export never computes its own: that is the whole point of the setting.
-  const channels = useImageStore((s) => s.channels);
+  // Each well's own contrast and angle are what get baked in, so the table and
+  // the export both have to re-read when the tabs or the active tab change.
+  const imageList = useImageStore((s) => s.imageList);
+  const activeImageId = useImageStore((s) => s.activeImageId);
 
   const pick = async () => {
     setError('');
@@ -52,17 +61,36 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
       const picked = await chooseFolder();
       if (picked.cancelled || !picked.path) return;
       const p = await scanPlate(picked.path);
-      setPlate(p);
+      setScan(p, picked.path);
       // Everything that can be loaded, pre-selected: that is what the user came
       // for, and unticking is easier than ticking eight boxes.
       setSelected(new Set(p.wells.filter((w) => w.enabled && w.stitch_path).map((w) => w.well_id)));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
-      setPlate(null);
+      setScan(null, '');
     } finally {
       setBusy(false);
     }
   };
+
+  /**
+   * The open wells, and their auto columns kept in step with the viewer.
+   *
+   * Recomputed on every render of the dialog rather than cached: the whole point
+   * is that the table shows what each well is set to *now*, and the user has
+   * just spent time changing exactly that. Reading settings is cheap — no pixels
+   * are touched.
+   */
+  const openWells = useMemo(
+    () => { useImageStore.getState().saveViewState(); return collectOpenWells(plate); },
+    // imageList/activeImageId changing is what makes this stale.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [plate, imageList, activeImageId],
+  );
+
+  useEffect(() => {
+    if (openWells.length) seed(openWells.map((w) => snapshotOf(w, plate)));
+  }, [openWells, plate, seed]);
 
   const toggle = (id: string) => {
     setSelected((prev) => {
@@ -111,25 +139,34 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
    * imaged — so the first failure aborts and nothing is written.
    */
   const exportPdf = async () => {
-    if (!plate) return;
-    const targets = plate.wells.filter((w) => selected.has(w.well_id) && w.stitch_path);
-    if (targets.length === 0) return;
+    const scan = plate;
+    if (!scan) return;
+    // Flush the tab being looked at. Its settings live in the live store fields
+    // until a switch writes them out, and that tab is the one most likely to
+    // have just been adjusted — exporting it from a stale snapshot would drop
+    // exactly the change the user came here to capture.
+    useImageStore.getState().saveViewState();
+    const wells = collectOpenWells(scan);
 
-    // The contrast, colours and channel choice are taken from the image on
-    // screen, so there has to be one. Without this the run fails later with
-    // "no visible channels", which reads as a problem with the plate.
-    if (channels.length === 0) {
+    if (wells.length === 0) {
       setError(
-        'コントラストの基準にする画像がありません。\n'
-        + 'まず代表的なウェルを 1 つ開き、チャンネルの表示・色・Min/Max を決めてから'
-        + '書き出してください。その設定が全ウェルに焼き込まれます。',
+        '開いているウェルがありません。\n'
+        + 'ウェルを選んで「選択したウェルを開く」で読み込み、3D ビューで各ウェルを'
+        + '調整してから書き出してください。',
       );
       return;
     }
-    const visible = channels.map((c) => c.visible);
-    const chIdx = channels.map((_, i) => i).filter((i) => visible[i]).slice(0, 4);
-    if (chIdx.length === 0) {
-      setError('表示中のチャンネルがありません。チャンネルを 1 つ以上表示してください。');
+    const noPath = wells.filter((w) => !w.path);
+    if (noPath.length) {
+      setError(`このプレートに属さないウェルが開いています: ${noPath.map((w) => w.wellId).join(', ')}`);
+      return;
+    }
+    const noCh = wells.filter((w) => w.channelIdx.length === 0);
+    if (noCh.length) {
+      setError(
+        `表示中のチャンネルがないウェルがあります: ${noCh.map((w) => w.wellId).join(', ')}\n`
+        + '各ウェルでチャンネルを 1 つ以上表示してください。',
+      );
       return;
     }
 
@@ -150,8 +187,13 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
 
     setError(''); setResult(''); cancelRef.current = false; setExporting(true);
     const cellPx = PDF_CELL_CHOICES.find((c) => c.key === cellKey)!.px;
-    const frames: { well_id: string; row: number; col: number; png_b64: string }[] = [];
+    const frames: {
+      well_id: string; row: number; col: number; png_b64: string; caption: string[];
+    }[] = [];
     let renderer: PlateRenderer | null = null;
+
+    const { columns, cells } = usePlateStore.getState();
+    const figureCols = columns.filter((c) => c.onFigure);
 
     try {
       const dir = await chooseFolder();
@@ -164,29 +206,35 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
       // rather than throwing an unhandled rejection into the console.
       renderer = new PlateRenderer(cellPx);
 
-      for (const [i, w] of targets.entries()) {
+      for (const [i, w] of wells.entries()) {
         if (cancelRef.current) { setResult('中止しました。PDF は作成していません。'); return; }
-        setProgress(`${w.well_id} (${i + 1}/${targets.length}) 読み込み中…`);
+        setProgress(`${w.wellId} (${i + 1}/${wells.length}) 読み込み中…`);
         abortRef.current = new AbortController();
+        // Each well carries its own contrast and channel choice — that is the
+        // point of tuning them one at a time — so the window baked in here is
+        // this well's, not a global one.
         const buf = await fetchPlateVolume({
-          path: w.stitch_path!,
-          channels: chIdx,
-          levels: chIdx.map((c) => [channels[c].min, channels[c].max] as [number, number]),
+          path: w.path!,
+          channels: w.channelIdx,
+          levels: w.levels,
           max_xy: maxXy,
         }, abortRef.current.signal);
-        setProgress(`${w.well_id} (${i + 1}/${targets.length}) 描画中…`);
+        setProgress(`${w.wellId} (${i + 1}/${wells.length}) 描画中…`);
         const vol = parseVolume(buf.data, buf.info ?? undefined);
         const shot = await renderer.render(
-          w.well_id, vol,
-          chIdx.map((c) => channels[c].color),
-          chIdx.map(() => true),
-          25, 20, 2.5, [0, 1],
+          w.wellId, vol, w.colors, w.channelIdx.map(() => true),
+          w.view.az, w.view.el, w.view.radius, w.zFrac,
         );
         let bin = '';
         for (let k = 0; k < shot.png.length; k += 0x8000) {
           bin += String.fromCharCode(...shot.png.subarray(k, k + 0x8000));
         }
-        frames.push({ well_id: w.well_id, row: w.row, col: w.col, png_b64: btoa(bin) });
+        frames.push({
+          well_id: w.wellId, row: w.row, col: w.col, png_b64: btoa(bin),
+          caption: figureCols
+            .map((c) => (cells[w.wellId]?.[c.key] ?? '').trim())
+            .filter(Boolean),
+        });
       }
 
       setProgress('PDF を作成中…');
@@ -194,21 +242,23 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
       // a false statement over a well the microscope did image — a reader of the
       // figure has no way to tell that apart from a genuinely empty position.
       const states: Record<string, string> = {};
-      const rendered = new Set(targets.map((w) => w.well_id));
-      for (const w of plate.wells) {
+      const rendered = new Set(wells.map((w) => w.wellId));
+      for (const w of scan.wells) {
         if (rendered.has(w.well_id)) continue;      // has a frame; state unused
         states[w.well_id] = !w.enabled ? 'disabled'
           : !w.stitch_path ? 'missing'
           : 'excluded';
       }
       const res = await composePlatePdf({
-        plate_name: plate.name, rows: plate.rows, cols: plate.cols,
+        plate_name: scan.name, rows: scan.rows, cols: scan.cols,
         frames, well_states: states, cell_px: cellPx, output_dir: dir.path,
+        table_headers: columns.map((c) => c.label),
+        table_rows: wells.map((w) => columns.map((c) => cells[w.wellId]?.[c.key] ?? '')),
         // The resolution actually applied, never the one requested. Recording the
         // request is how the footer came to state a resolution that was not used.
-        footer: `matl ${plate.matl_sha256.slice(0, 8)} | vol ${volKey}(${maxXy})`
+        footer: `matl ${scan.matl_sha256.slice(0, 8)} | vol ${volKey}(${maxXy})`
               + `${clamped ? ` GPU上限${max3D}に制限` : ''}`
-              + ` | cell ${cellPx}px | ch ${chIdx.join(',')} | ${new Date().toISOString()}`,
+              + ` | cell ${cellPx}px | ${wells.length} wells | ${new Date().toISOString()}`,
       });
       setResult(
         `${res.wells} ウェルを書き出しました（${Math.round(res.bytes / 1024)} KB）\n${res.path}`
@@ -398,6 +448,30 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
                 空欄は未取得で、PDF でも空セルとしてこの位置に残ります。
               </p>
 
+              {/* Conditions table, then export */}
+              <div className="mt-4 pt-3 border-t border-[var(--border)]">
+                <div className="flex items-baseline justify-between mb-2 gap-2 flex-wrap">
+                  <h3 className="text-xs font-semibold">
+                    条件表（開いている {openWells.length} ウェル）
+                  </h3>
+                  <button
+                    onClick={() => seed(openWells.map((w) => snapshotOf(w, plate)), true)}
+                    disabled={openWells.length === 0 || exporting}
+                    title="自動列を現在のビューアの設定で埋め直します（手で直した値も上書きします）"
+                    className="text-[10px] underline text-[var(--text-secondary)]
+                               hover:text-white disabled:opacity-40"
+                  >
+                    自動列を現在の設定で更新
+                  </button>
+                </div>
+                <PlateTable wells={openWells} />
+                <p className="text-[10px] text-[var(--text-secondary)] mt-2 leading-relaxed">
+                  各ウェルは <strong>開いたタブの現在の状態</strong>（チャンネル・Min/Max・色・角度・Z 範囲）
+                  で書き出します。3D ビューで調整してからここに戻ってきてください。
+                  角度と Z 範囲はウェルごとに記憶されます。
+                </p>
+              </div>
+
               {/* 3D -> PDF */}
               <div className="mt-4 pt-3 border-t border-[var(--border)]">
                 <div className="flex items-end gap-3 flex-wrap">
@@ -431,11 +505,11 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
                   </label>
                   <button
                     onClick={exportPdf}
-                    disabled={exporting || !!loading || selected.size === 0}
+                    disabled={exporting || !!loading || openWells.length === 0}
                     className="px-4 py-2 rounded-lg bg-emerald-600 text-white text-xs font-medium
                                hover:opacity-90 disabled:opacity-40 transition"
                   >
-                    {progress || `3D → PDF を作成（${selected.size} ウェル）`}
+                    {progress || `3D → PDF を作成（${openWells.length} ウェル）`}
                   </button>
                   {exporting && (
                     <button

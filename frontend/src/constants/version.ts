@@ -5,6 +5,31 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.4.0 — 2026-08-07 — Plate export now takes each well as you left it, and carries
+//     a conditions table. The old flow read every well straight off disk with one
+//     global contrast and one fixed angle, so the figure could only ever show a
+//     setting nobody had looked at. Now the wells are opened as ordinary tabs,
+//     tuned one at a time in the viewer, and the export reads what each tab is
+//     actually set to — channels, colours, Min/Max, angle, Z slab, per well.
+//     That required the 3D view to stop being local state. Orbit and Z range
+//     lived inside Volume3DViewer, so switching wells reset them: setting up
+//     eight wells was impossible, because checking the first one again undid it.
+//     They are per-image now. A well seen for the first time keeps the current
+//     angle rather than snapping back — a plate figure wants one direction — while
+//     its Z slab starts at the full stack, which is per-volume.
+//     The table is seeded from what each well is set to and is then yours: edit
+//     any cell, add and delete columns, rename headers. A hand-edited cell is not
+//     overwritten by re-seeding — "CH1, CH2" is what the app knows, "GFP, DAPI" is
+//     what the figure needs to say — and only the explicit refill button overrules
+//     that. Columns marked 図 print over the top-left of their well's image; every
+//     column appears on a second PDF page, in the same file, because a figure and
+//     the conditions behind it get separated the moment they are two downloads.
+//     Another glyph hole, found by looking at the output: Hiragino Sans GB has
+//     every Japanese character and no U+00B5, so "10 µM" printed with a box in it
+//     while the font passed the check added yesterday — that check probed one
+//     kanji. Fonts are now scored across the characters this figure actually
+//     prints (µ ° β ± × ℃ Å, kana, kanji), and µ is folded to the identical-
+//     looking U+03BC before drawing, which fixes it in every font rather than one.
 //   1.3.0 — 2026-08-07 — Plate-to-PDF export, wired end to end, then audited before
 //     going to Windows for testing on real data. The audit found 24 real defects in
 //     this feature and every blocker was silent — each one produced a finished PDF
@@ -276,4 +301,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.3.0';
+export const VERSION = '1.4.0';

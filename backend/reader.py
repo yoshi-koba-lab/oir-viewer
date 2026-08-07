@@ -751,6 +751,39 @@ def _detect_channel_types(meta, n_c: int, channel_names: list[str]) -> list[str]
     return types
 
 
+def declared_z_length(reader_j) -> int:
+    """The Z length the vendor metadata says was acquired, or 0 if it does not say.
+
+    Olympus records each acquisition axis in the series metadata as an
+    `axis axis #N` / `axis maxSize #N` pair, and a copy that is missing its
+    continuation chunks keeps those values intact — which is exactly what makes
+    them worth comparing against the Z the reader can actually expose.
+
+    Shared with the plate export path (plate.py), so both decide "this file is
+    only part of itself" by the same measure. Returns 0 rather than raising: a
+    file whose metadata does not name a Z axis is not evidence of a problem.
+    """
+    try:
+        table = reader_j.getSeriesMetadata()
+        if table is None:
+            return 0
+        found = 0
+        for i in range(1, 17):
+            axis = table.get(f"axis axis #{i}")
+            size = table.get(f"axis maxSize #{i}")
+            if axis is None or size is None:
+                continue
+            if str(axis).strip().upper() != "ZSTACK":
+                continue
+            try:
+                found = max(found, int(float(str(size))))
+            except ValueError:
+                continue
+        return found
+    except Exception:
+        return 0
+
+
 def _detect_incomplete_oir(reader_j, path: str) -> str:
     """Warn when an OIR is missing the companion files that hold most of its pixels.
 
@@ -763,23 +796,7 @@ def _detect_incomplete_oir(reader_j, path: str) -> str:
     so comparing it against what the reader actually exposes catches the case.
     """
     try:
-        table = reader_j.getSeriesMetadata()
-        if table is None:
-            return ""
-
-        declared_z = 0
-        for i in range(1, 17):
-            axis = table.get(f"axis axis #{i}")
-            size = table.get(f"axis maxSize #{i}")
-            if axis is None or size is None:
-                continue
-            if str(axis).strip().upper() != "ZSTACK":
-                continue
-            try:
-                declared_z = max(declared_z, int(float(str(size))))
-            except ValueError:
-                continue
-
+        declared_z = declared_z_length(reader_j)
         actual_z = int(reader_j.getSizeZ())
         if declared_z <= actual_z:
             return ""

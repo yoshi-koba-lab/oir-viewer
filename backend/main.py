@@ -957,6 +957,9 @@ class PlateFrame(BaseModel):
     col: int
     #: base64 PNG of the rendered well.
     png_b64: str
+    #: Lines printed over the top-left of this well's image. Empty falls back to
+    #: the well ID, so a cell is never unlabelled.
+    caption: list[str] = []
 
 
 class PlatePdfRequest(BaseModel):
@@ -971,6 +974,10 @@ class PlatePdfRequest(BaseModel):
     cell_px: int = 600
     output_dir: str
     footer: str = ""
+    #: Conditions table, written as a second page in the same PDF. Empty omits
+    #: the page entirely rather than adding a blank one.
+    table_headers: list[str] = []
+    table_rows: list[list[str]] = []
 
 
 @app.post("/api/plate/pdf")
@@ -988,7 +995,8 @@ def plate_pdf(req: PlatePdfRequest):
             return JSONResponse(status_code=400,
                                 content={"error": f"保存先が見つかりません: {out_dir}"})
         frames = [
-            plate.WellFrame(f.well_id, f.row, f.col, base64.b64decode(f.png_b64))
+            plate.WellFrame(f.well_id, f.row, f.col, base64.b64decode(f.png_b64),
+                            list(f.caption))
             for f in req.frames
         ]
         if not frames:
@@ -999,6 +1007,8 @@ def plate_pdf(req: PlatePdfRequest):
             out_dir / f"{safe}_plate3d_{stamp}.pdf",
             req.plate_name, int(req.rows), int(req.cols),
             frames, dict(req.well_states), int(req.cell_px), req.footer,
+            table_headers=list(req.table_headers),
+            table_rows=[list(r) for r in req.table_rows],
         )
         return {"path": str(out), "wells": len(frames), "bytes": out.stat().st_size}
     except ValueError as e:
