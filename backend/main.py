@@ -47,7 +47,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
-from reader import ImageReader, describe_runtime, prewarm_jvm as _prewarm_jvm, selftest
+from reader import (
+    ImageMetadata, ImageReader, describe_runtime, prewarm_jvm as _prewarm_jvm, selftest,
+)
 from processor import adjust_contrast, auto_contrast, compute_histogram, to_png_bytes
 from roi import line_profile, measure_roi
 import plate
@@ -68,8 +70,15 @@ def _save_session() -> None:
     tmp_path = ""
     try:
         os.makedirs(APP_DIR, exist_ok=True)
+        # Dimensions travel with the path so the next startup can show the tabs
+        # without opening anything.
         entries = [
-            {"source_path": r.metadata.source_path, "filename": r.metadata.filename}
+            {
+                "source_path": r.metadata.source_path, "filename": r.metadata.filename,
+                "num_channels": r.metadata.num_channels, "num_z": r.metadata.num_z,
+                "num_t": r.metadata.num_t,
+                "width": r.metadata.width, "height": r.metadata.height,
+            }
             for r in images.values()
             if r.metadata.source_path and os.path.exists(r.metadata.source_path)
         ]
@@ -92,7 +101,20 @@ def _save_session() -> None:
 
 
 def _restore_session() -> int:
-    """Re-open files recorded in the last session. Returns how many were restored."""
+    """Re-list the files from the last session. Returns how many were restored.
+
+    Nothing is read here. The previous version called load_file() on every
+    remembered path inside the startup lifespan, which for eight plate wells of
+    real data is 34 GB of pixels before the server answers its first request —
+    the app could not start at all, and the failure looked like a crash rather
+    than like "the last session was too big". Each file becomes a deferred
+    reader instead: the tab is there, and the pixels arrive when it is opened.
+
+    Dimensions come from the session file so the tab list is right without
+    touching the disk. They are only a cache — the first real load re-reads the
+    file and overwrites them — so a file edited between sessions corrects itself
+    rather than being trusted forever.
+    """
     import json
     if not os.path.exists(SESSION_FILE):
         return 0
@@ -114,13 +136,77 @@ def _restore_session() -> int:
         if not path or not os.path.exists(path):
             continue
         try:
+            meta = ImageMetadata(
+                filename=entry.get("filename") or os.path.basename(path),
+                source_path=path,
+                num_channels=int(entry.get("num_channels") or 1),
+                num_z=int(entry.get("num_z") or 1),
+                num_t=int(entry.get("num_t") or 1),
+                width=int(entry.get("width") or 0),
+                height=int(entry.get("height") or 0),
+            )
             r = ImageReader()
-            r.load_file(path)
+            r.defer(path, meta)
             add_image(r)
             restored += 1
         except Exception as e:
             print(f"Session restore skipped {path}: {e}")
     return restored
+
+
+def _selftest_session() -> int:
+    """Prove restoring a session reads no pixels. Returns an exit code.
+
+    This is the bug that shipped in 1.4.0: restore called load_file() on every
+    remembered path inside the startup lifespan, so a session holding eight
+    plate wells tried to decode 34 GB before the server answered anything and
+    the app could not start. It is invisible in development, where the session
+    holds one small file — the size of the failure is a property of the user's
+    data, not of the code — so it is checked here rather than by trying it.
+    """
+    global images, active_id
+    import json
+    import tempfile
+
+    saved_images, saved_active, saved_file = images, active_id, SESSION_FILE
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            # A path that exists and could be opened, so restore has no excuse
+            # to skip it: the point is that it declines to read it anyway.
+            target = os.path.join(tmp, "well.tif")
+            import tifffile
+            tifffile.imwrite(target, np.zeros((4, 32, 32), dtype=np.uint16))
+            globals()["SESSION_FILE"] = os.path.join(tmp, "session.json")
+            with open(SESSION_FILE, "w") as f:
+                json.dump({"images": [{
+                    "source_path": target, "filename": "well.tif",
+                    "num_channels": 1, "num_z": 4, "num_t": 1,
+                    "width": 32, "height": 32,
+                }]}, f)
+            images, active_id = {}, None
+            n = _restore_session()
+            resident = sum(r.loaded_bytes for r in images.values())
+            listed = [r.metadata.num_z for r in images.values()]
+    except Exception as e:
+        print(f"selftest FAILED: session restore -> {type(e).__name__}: {e}", flush=True)
+        return 20
+    finally:
+        images, active_id = saved_images, saved_active
+        globals()["SESSION_FILE"] = saved_file
+
+    if n != 1:
+        print(f"selftest FAILED: restored {n} images, expected 1", flush=True)
+        return 21
+    if resident:
+        print(f"selftest FAILED: restore read {resident} bytes of pixels; "
+              "startup must not decode last session's files", flush=True)
+        return 22
+    if listed != [4]:
+        print(f"selftest FAILED: restored tab lost its dimensions ({listed})", flush=True)
+        return 23
+    print(f"selftest: session restore OK (0 pixel bytes, budget "
+          f"{IMAGE_BUDGET_BYTES / 1024 ** 3:.1f} GB)", flush=True)
+    return 0
 
 
 @asynccontextmanager
@@ -161,11 +247,88 @@ app.add_middleware(
 )
 
 
+def _physical_ram_bytes() -> int:
+    """Total RAM, or 0 when it cannot be determined."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class _MemStatus(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            st = _MemStatus()
+            st.dwLength = ctypes.sizeof(_MemStatus)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return int(st.ullTotalPhys)
+            return 0
+        return int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
+    except Exception:
+        return 0
+
+
+#: How many bytes of decoded pixels all open images may hold between them.
+#:
+#: A fraction of the machine rather than a fixed number, because the same figure
+#: means opposite things on a 192 GB workstation and a 16 GB laptop. One real
+#: plate well is 2911x2923x50x5 uint16 = 4.25 GB, so eight of them is 34 GB:
+#: fine on the workstation, fatal anywhere else. 40% leaves room for the JVM,
+#: the slice cache, Electron and the OS.
+_RAM = _physical_ram_bytes()
+try:
+    _budget_env = os.environ.get("OIR_PIXEL_BUDGET_MB", "")
+    IMAGE_BUDGET_BYTES = (int(_budget_env) * 1024 * 1024 if _budget_env
+                          else (int(_RAM * 0.40) if _RAM else 4 * 1024 ** 3))
+except ValueError:
+    IMAGE_BUDGET_BYTES = int(_RAM * 0.40) if _RAM else 4 * 1024 ** 3
+
+#: Image ids in the order they were last used, oldest first.
+_lru: list[str] = []
+
+
+def _touch(image_id: str) -> None:
+    if image_id in _lru:
+        _lru.remove(image_id)
+    _lru.append(image_id)
+
+
+def _enforce_budget(keep: str | None = None) -> None:
+    """Drop the pixels of least-recently-used images until under budget.
+
+    Every open image used to hold its full (T,C,Z,Y,X) array for as long as the
+    tab existed, so the plate workflow — open eight wells, tune each — added up
+    to 34 GB of real data and took the app down with it. Tabs stay; their pixels
+    do not, and come back when the tab is looked at again.
+    """
+    total = sum(r.loaded_bytes for r in images.values())
+    if total <= IMAGE_BUDGET_BYTES:
+        return
+    for img_id in list(_lru):
+        if total <= IMAGE_BUDGET_BYTES:
+            break
+        if img_id == keep or img_id == active_id or img_id not in images:
+            continue
+        freed = images[img_id].unload()
+        if freed:
+            total -= freed
+            print(f"Unloaded {images[img_id].metadata.filename} "
+                  f"({freed / 1048576:.0f} MB) to stay within the pixel budget",
+                  flush=True)
+
+
 def get_reader(image_id: str | None = None) -> ImageReader:
     """Get the reader for a given image ID, or the active one."""
     rid = image_id or active_id
     if rid is None or rid not in images:
         raise RuntimeError("No image loaded")
+    _touch(rid)
     return images[rid]
 
 
@@ -175,6 +338,10 @@ def add_image(reader: ImageReader) -> str:
     img_id = uuid.uuid4().hex[:8]
     images[img_id] = reader
     active_id = img_id
+    _touch(img_id)
+    # A newly opened well is the one being looked at, so older ones give up
+    # their pixels rather than this one being refused.
+    _enforce_budget(keep=img_id)
     _save_session()
     return img_id
 
@@ -198,12 +365,26 @@ async def list_images():
 
 
 @app.post("/api/images/{image_id}/activate")
-async def activate_image(image_id: str):
-    """Set an image as active."""
+def activate_image(image_id: str):
+    """Set an image as active, reading its pixels if this is the first look.
+
+    Sync rather than async on purpose: reading a well is seconds of blocking I/O
+    and CPU, and on the event loop that would freeze every other request,
+    including the ones the UI makes to show that it is loading. FastAPI runs a
+    `def` endpoint in its thread pool.
+    """
     global active_id
     if image_id not in images:
         return JSONResponse(status_code=404, content={"error": "Image not found"})
     active_id = image_id
+    _touch(image_id)
+    try:
+        images[image_id].ensure_loaded()
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse(status_code=400, content={"error": _describe(e)})
+    # After loading, not before: the well just read is the one to keep.
+    _enforce_budget(keep=image_id)
     return images[image_id].metadata.to_dict()
 
 
@@ -211,6 +392,8 @@ async def activate_image(image_id: str):
 async def close_image(image_id: str):
     """Close and remove an image."""
     global active_id
+    if image_id in _lru:
+        _lru.remove(image_id)
     if image_id not in images:
         return JSONResponse(status_code=404, content={"error": "Image not found"})
     del images[image_id]
@@ -1575,7 +1758,8 @@ def main():
     if "--selftest" in sys.argv:
         rc = selftest()
         rc_plate = plate.selftest()
-        raise SystemExit(rc or rc_plate)
+        rc_session = _selftest_session()
+        raise SystemExit(rc or rc_plate or rc_session)
     use_webview = "--no-webview" not in sys.argv and not getattr(sys, "frozen", False)
     if use_webview:
         try:

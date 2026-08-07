@@ -304,6 +304,50 @@ class ImageReader:
     def __init__(self):
         self.data: np.ndarray | None = None  # shape: (T, C, Z, Y, X)
         self.metadata = ImageMetadata()
+        #: Set when this reader stands for a file whose pixels have not been read.
+        #: A restored session registers one of these per remembered file, so
+        #: startup costs nothing regardless of how much was open last time.
+        self.deferred_path: str | None = None
+
+    @property
+    def loaded_bytes(self) -> int:
+        """Resident pixel bytes, for the budget that decides what to evict."""
+        return int(self.data.nbytes) if self.data is not None else 0
+
+    def defer(self, path: str, metadata: ImageMetadata) -> None:
+        """Stand for a file without reading it. Pixels arrive on first use."""
+        self.data = None
+        self.deferred_path = path
+        self.metadata = metadata
+
+    def unload(self) -> int:
+        """Drop the pixels, keeping the file re-openable. Returns bytes freed.
+
+        Only meaningful for a reader that knows where its file is — dummy data
+        and uploads that have since been deleted cannot be read back, so those
+        keep their pixels rather than becoming permanently empty tabs.
+        """
+        if self.data is None:
+            return 0
+        path = self.deferred_path or self.metadata.source_path
+        if not path or not os.path.exists(path):
+            return 0
+        freed = self.loaded_bytes
+        self.deferred_path = path
+        self.data = None
+        return freed
+
+    def ensure_loaded(self) -> None:
+        """Read the pixels if this reader is only standing for a file so far."""
+        if self.data is not None:
+            return
+        path = self.deferred_path
+        if not path:
+            raise RuntimeError("No image loaded")
+        # Cleared first: a failed load must not leave the reader claiming it can
+        # retry forever against a file that is gone or unreadable.
+        self.deferred_path = None
+        self.load_file(path)
 
     def load_file(self, path: str) -> ImageMetadata:
         """Load an image file. Dispatches by extension."""
@@ -653,8 +697,7 @@ class ImageReader:
 
     def get_slice(self, c: int, z: int, t: int) -> np.ndarray:
         """Get a single 2D slice. Returns uint16 array (H, W)."""
-        if self.data is None:
-            raise RuntimeError("No image loaded")
+        self.ensure_loaded()
         # Clamp on both sides: a negative index would wrap and quietly return a
         # completely different slice.
         t = max(0, min(t, self.data.shape[0] - 1))
@@ -664,8 +707,7 @@ class ImageReader:
 
     def get_mip(self, c: int, t: int) -> np.ndarray:
         """Maximum Intensity Projection along Z for a given channel and time."""
-        if self.data is None:
-            raise RuntimeError("No image loaded")
+        self.ensure_loaded()
         t = max(0, min(t, self.data.shape[0] - 1))
         c = max(0, min(c, self.data.shape[1] - 1))
         return np.max(self.data[t, c], axis=0)
@@ -680,8 +722,7 @@ class ImageReader:
             z_to: end Z index (inclusive, 0-based)
             method: "max", "min", or "avg"
         """
-        if self.data is None:
-            raise RuntimeError("No image loaded")
+        self.ensure_loaded()
         t = max(0, min(t, self.data.shape[0] - 1))
         c = max(0, min(c, self.data.shape[1] - 1))
         z_from = max(0, min(z_from, self.data.shape[2] - 1))
@@ -697,8 +738,7 @@ class ImageReader:
 
     def get_volume(self, t: int) -> np.ndarray:
         """Get full volume data (C, Z, Y, X) for a given time point."""
-        if self.data is None:
-            raise RuntimeError("No image loaded")
+        self.ensure_loaded()
         t = max(0, min(t, self.data.shape[0] - 1))
         return self.data[t]
 

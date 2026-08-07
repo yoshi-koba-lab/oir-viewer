@@ -5,6 +5,27 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.4.1 — 2026-08-07 — The app would not start after a plate session. Restoring the
+//     previous session called load_file() on every remembered path, inside the
+//     startup lifespan, so it decoded them all before the server answered
+//     anything. One real well is 2911x2923x50x5 uint16 = 4.25 GB; eight of them
+//     is 34 GB, which is what the user watched it take before it died. Reported
+//     from Windows as "33 GB and then an error", and the guess in the report —
+//     that it was reopening the previous files — was exactly right.
+//     Restore now registers each file without reading it, using the dimensions
+//     recorded in session.json so the tabs are right with no disk access at all.
+//     Pixels arrive when a tab is actually opened. Measured: eight wells restore
+//     with 0 pixel bytes and no measurable RSS change.
+//     Lazily loading is not enough on its own, because opening all eight tabs
+//     then reaches the same 34 GB. Loaded pixels are now held against a budget
+//     of 40% of physical RAM — a fraction, not a constant, since the same number
+//     means opposite things on a 192 GB workstation and a 16 GB laptop — and the
+//     least recently used image gives its pixels back when the budget is
+//     exceeded. The tab stays; it reloads when looked at again.
+//     --selftest covers it, and the check was verified by reintroducing the bug:
+//     the old behaviour fails it. This class of defect is invisible in
+//     development, where the session holds one small file, because the size of
+//     the failure is a property of the user's data rather than of the code.
 //   1.4.0 — 2026-08-07 — Plate export now takes each well as you left it, and carries
 //     a conditions table. The old flow read every well straight off disk with one
 //     global contrast and one fixed angle, so the figure could only ever show a
@@ -301,4 +322,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.4.0';
+export const VERSION = '1.4.1';
