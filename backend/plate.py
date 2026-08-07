@@ -806,12 +806,10 @@ def compose_pdf(
     draw.text((margin, page_h - margin // 2), normalize_text(footer),
               fill="#808080", font=f_cell, anchor="ls")
 
-    # Never overwrite an earlier figure.
+    # Written exactly where asked. Whether replacing something is acceptable was
+    # settled before this was called — silently sliding to `_01` produced folders
+    # of near-identical figures with no way to tell which was which.
     final = out_path
-    n = 1
-    while final.exists():
-        final = out_path.with_name(f"{out_path.stem}_{n:02d}{out_path.suffix}")
-        n += 1
     extra = []
     if table_headers and table_rows:
         # Same file, not a sidecar: the figure and the conditions it was taken

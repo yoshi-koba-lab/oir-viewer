@@ -355,6 +355,10 @@ export async function chooseFolder(): Promise<ChooseFolderResponse> {
 
 export interface SaveRequest {
   output_dir: string;
+  /** Stem to save under. Empty keeps each image's own filename. */
+  basename?: string;
+  /** Replace existing files. Omitted, a collision is refused and nothing written. */
+  overwrite?: boolean;
   image_ids: string[];
   channels: number[];
   channel_colors: number[][];
@@ -380,8 +384,45 @@ export interface SaveResponse {
   output_dir: string;
 }
 
+/**
+ * Files a save would have replaced. Thrown rather than returned, so a caller
+ * that does not handle it cannot mistake a refusal for a completed save.
+ */
+export class OverwriteConflict extends Error {
+  files: string[];
+  count: number;
+  more: number;
+  outputDir: string;
+
+  constructor(files: string[], count: number, more: number, outputDir: string) {
+    super(`${count} 個のファイルが既にあります`);
+    this.name = 'OverwriteConflict';
+    this.files = files;
+    this.count = count;
+    this.more = more;
+    this.outputDir = outputDir;
+  }
+}
+
+/** Recognise the backend's "these already exist" refusal. Nothing was written. */
+async function throwIfConflict(res: Response): Promise<void> {
+  if (res.status !== 409) return;
+  let body: { files?: string[]; count?: number; more?: number; output_dir?: string } = {};
+  try { body = JSON.parse(await res.text()); } catch { /* fall through to a plain error */ }
+  if (!body.count) return;
+  throw new OverwriteConflict(
+    body.files ?? [], body.count, body.more ?? 0, body.output_dir ?? '',
+  );
+}
+
 export async function saveImages(req: SaveRequest): Promise<SaveResponse> {
-  return postJson<SaveResponse>('/api/save', req, '保存に失敗');
+  const res = await fetch('/api/save', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  });
+  await throwIfConflict(res);
+  return readJson<SaveResponse>(res, '保存に失敗');
 }
 
 export interface ProjectionRequest {
@@ -423,6 +464,8 @@ export interface RenderImagePayload {
 }
 
 export interface SaveRenderRequest {
+  /** Replace existing files instead of refusing. */
+  overwrite?: boolean;
   output_dir: string;
   basename: string;
   format: 'png' | 'tiff';
@@ -430,7 +473,13 @@ export interface SaveRenderRequest {
 }
 
 export async function saveRender(req: SaveRenderRequest): Promise<SaveResponse> {
-  return postJson<SaveResponse>('/api/save-render', req, '画像の保存に失敗');
+  const res = await fetch('/api/save-render', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  });
+  await throwIfConflict(res);
+  return readJson<SaveResponse>(res, '画像の保存に失敗');
 }
 
 /* ---- Volume data for 3D rendering ---- */
@@ -688,9 +737,19 @@ export async function composePlatePdf(body: {
   cell_px: number;
   output_dir: string;
   footer: string;
+  /** File to write, without extension. Empty uses the plate name + a timestamp. */
+  filename?: string;
+  /** Replace an existing PDF instead of refusing. */
+  overwrite?: boolean;
   /** Conditions table, written as a second page of the same PDF. */
   table_headers?: string[];
   table_rows?: string[][];
 }): Promise<PlatePdfResult> {
-  return postJson<PlatePdfResult>('/api/plate/pdf', body, 'PDF の作成に失敗');
+  const res = await fetch('/api/plate/pdf', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  await throwIfConflict(res);
+  return readJson<PlatePdfResult>(res, 'PDF の作成に失敗');
 }

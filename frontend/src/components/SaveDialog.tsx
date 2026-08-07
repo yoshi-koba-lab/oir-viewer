@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useImageStore } from '../stores/imageStore';
-import { saveImages, chooseFolder, type SaveRequest } from '../utils/api';
+import { saveImages, chooseFolder, OverwriteConflict, type SaveRequest } from '../utils/api';
+import { dirnameOf, stemOf, filenameProblem } from '../utils/paths';
 
 interface Props {
   open: boolean;
@@ -24,7 +25,6 @@ type SaveRequestPerImage = SaveRequest & { image_channels: Record<string, Channe
 interface SaveResult {
   saved: string[];
   output_dir: string;
-  renamed?: { requested: string; written: string }[];
   skipped?: string[];
 }
 
@@ -40,6 +40,16 @@ export function SaveDialog({ open, onClose }: Props) {
   const activeId = activeImageId ?? imageList.find((img) => img.active)?.id;
 
   const [outputDir, setOutputDir] = useState('~/Desktop');
+  /**
+   * The name to save under. Seeded from the image but always shown and always
+   * editable — "save as" is the only mode, because the previous behaviour named
+   * the files itself and then quietly renamed them again on a collision.
+   */
+  const [baseName, setBaseName] = useState('');
+  /** Set when the backend refused because files are already there. */
+  const [conflict, setConflict] = useState<
+    { files: string[]; count: number; more: number } | null
+  >(null);
   const [browsing, setBrowsing] = useState(false);
   const [format, setFormat] = useState<Format>('tiff');
   const [bitDepth, setBitDepth] = useState<'8' | '16'>('16');
@@ -67,13 +77,18 @@ export function SaveDialog({ open, onClose }: Props) {
     if (!open || !metadata) return;
     setSelectedChannels(new Set(Array.from({ length: metadata.num_channels }, (_, i) => i)));
     setSelectedImages(new Set(activeId ? [activeId] : []));
-    // Default output dir to source file's directory
+    // Default output dir to source file's directory.
+    //
+    // Both separators: a Windows path has no forward slash at all, so stripping
+    // only after "/" left the whole path including the filename, and the
+    // default output folder was a folder that did not exist.
     if (metadata.source_path) {
-      const dir = metadata.source_path.replace(/\/[^/]+$/, '');
+      const dir = dirnameOf(metadata.source_path);
       if (dir && !dir.startsWith('/tmp') && !dir.startsWith('/private/var') && !dir.startsWith('/private/tmp')) {
         setOutputDir(dir);
       }
     }
+    setBaseName(stemOf(metadata.filename));
     setZMode('range');
     setZFrom(1);
     setZTo(metadata.num_z);
@@ -176,10 +191,18 @@ export function SaveDialog({ open, onClose }: Props) {
       });
   };
 
-  const handleSave = async () => {
+  const handleSave = async (overwrite = false) => {
     if (!outputDir.trim()) {
       setError('保存先フォルダを入力してください');
       return;
+    }
+    // Only meaningful for a single image; a batch keeps each image's own name.
+    if (selectedImages.size === 1) {
+      const bad = filenameProblem(baseName);
+      if (bad) {
+        setError(bad);
+        return;
+      }
     }
     if (!saveSeparate && !saveMerge) {
       setError('SeparateかMergeの少なくとも一つを選択してください');
@@ -197,6 +220,7 @@ export function SaveDialog({ open, onClose }: Props) {
     setError('');
     setSuccessMsg('');
     setWarnMsg('');
+    setConflict(null);
     setSaving(true);
 
     try {
@@ -212,6 +236,8 @@ export function SaveDialog({ open, onClose }: Props) {
 
       const req: SaveRequestPerImage = {
         output_dir: outputDir.trim(),
+        basename: selectedImages.size === 1 ? baseName.trim() : '',
+        overwrite,
         image_ids: ids,
         channels: activeIndices,
         channel_colors: activeIndices.map((i) => [...channels[i].color]),
@@ -251,9 +277,6 @@ export function SaveDialog({ open, onClose }: Props) {
       }
       setSuccessMsg(`${result.saved.length} files saved to ${result.output_dir}`);
       const notes: string[] = [];
-      if (result.renamed?.length) {
-        notes.push(`${result.renamed.length}件は既存ファイルを上書きせず連番を付けました`);
-      }
       if (result.skipped?.length) notes.push(result.skipped.join(' / '));
       if (notes.length) {
         setWarnMsg(notes.join(' / '));  // keep the dialog open so the user reads it
@@ -261,7 +284,13 @@ export function SaveDialog({ open, onClose }: Props) {
         setTimeout(() => onClose(), 1500);
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Save failed');
+      // A refusal is a question, not a failure: nothing was written, and the
+      // same request goes through once the user says to replace them.
+      if (e instanceof OverwriteConflict) {
+        setConflict({ files: e.files, count: e.count, more: e.more });
+      } else {
+        setError(e instanceof Error ? e.message : 'Save failed');
+      }
     } finally {
       setSaving(false);
     }
@@ -290,6 +319,35 @@ export function SaveDialog({ open, onClose }: Props) {
               {browsing ? '...' : 'Browse'}
             </button>
           </div>
+        </Section>
+
+        {/* Filename */}
+        <Section title="ファイル名">
+          {selectedImages.size > 1 ? (
+            <p className="text-[11px] text-[var(--text-secondary)] leading-relaxed">
+              {selectedImages.size} 枚を選択中のため、各画像は元のファイル名で
+              画像ごとのサブフォルダに保存されます。
+            </p>
+          ) : (
+            <>
+              <input
+                type="text"
+                value={baseName}
+                onChange={(e) => { setBaseName(e.target.value); setConflict(null); }}
+                placeholder="ファイル名（拡張子なし）"
+                className="w-full px-3 py-2 rounded bg-[var(--bg-primary)] border border-[var(--border)] text-sm text-[var(--text-primary)] placeholder:text-[var(--text-secondary)] focus:outline-none focus:border-[var(--accent)]"
+              />
+              {filenameProblem(baseName) ? (
+                <p className="text-[11px] text-red-400 mt-1">{filenameProblem(baseName)}</p>
+              ) : (
+                <p className="text-[10px] text-[var(--text-secondary)] mt-1 leading-relaxed">
+                  例: <code>{baseName || 'name'}_CH1{metadata.num_z > 1 && zMode === 'range' ? '_Z001' : ''}
+                  {format === 'tiff' ? '.tif' : format === 'png' ? '.png' : '.jpg'}</code>
+                  {' '}— チャンネル名や Z/T の番号が自動で付きます。
+                </p>
+              )}
+            </>
+          )}
         </Section>
 
         {/* Format */}
@@ -566,11 +624,73 @@ export function SaveDialog({ open, onClose }: Props) {
             Cancel
           </button>
           <button
-            onClick={handleSave}
-            disabled={saving}
+            onClick={() => handleSave(false)}
+            disabled={saving || !!conflict}
             className="px-4 py-2 rounded text-xs bg-[var(--accent)] text-white hover:opacity-90 transition disabled:opacity-50"
           >
-            {saving ? 'Saving...' : 'Save'}
+            {saving ? 'Saving...' : '保存'}
+          </button>
+        </div>
+      </div>
+
+      {conflict && (
+        <OverwriteConfirm
+          conflict={conflict}
+          busy={saving}
+          onCancel={() => setConflict(null)}
+          onConfirm={() => handleSave(true)}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * Asks before replacing files. Nothing has been written at this point — the
+ * backend checked every destination and stopped — so cancelling really does
+ * leave the folder untouched.
+ */
+export function OverwriteConfirm({
+  conflict, busy, onCancel, onConfirm,
+}: {
+  conflict: { files: string[]; count: number; more: number };
+  busy: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-6"
+         onClick={onCancel}>
+      <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg
+                      p-5 w-[460px] shadow-2xl"
+           onClick={(e) => e.stopPropagation()}>
+        <h3 className="text-sm font-bold mb-2">同じ名前のファイルがあります</h3>
+        <p className="text-xs text-[var(--text-secondary)] mb-3 leading-relaxed">
+          {conflict.count} 個のファイルを<strong className="text-red-400">上書き</strong>します。
+          元のファイルは戻せません。
+        </p>
+        <ul className="text-[11px] font-mono bg-[var(--bg-primary)] border border-[var(--border)]
+                       rounded p-2 max-h-40 overflow-y-auto mb-4 space-y-0.5">
+          {conflict.files.map((f) => <li key={f} className="truncate">{f}</li>)}
+          {conflict.more > 0 && (
+            <li className="text-[var(--text-secondary)]">ほか {conflict.more} 個</li>
+          )}
+        </ul>
+        <div className="flex justify-end gap-2">
+          <button
+            onClick={onCancel}
+            className="px-4 py-2 rounded text-xs bg-[var(--border)] text-[var(--text-secondary)]
+                       hover:text-white transition"
+          >
+            キャンセル
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={busy}
+            className="px-4 py-2 rounded text-xs bg-red-600 text-white hover:opacity-90
+                       transition disabled:opacity-50"
+          >
+            {busy ? '上書き中…' : '上書きする'}
           </button>
         </div>
       </div>

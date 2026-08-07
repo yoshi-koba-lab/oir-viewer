@@ -3,9 +3,11 @@ import * as THREE from 'three';
 import { useImageStore } from '../stores/imageStore';
 import { useViewStore } from '../stores/viewStore';
 import {
-  fetchVolumeBin, chooseFolder, saveRender,
+  fetchVolumeBin, chooseFolder, saveRender, OverwriteConflict,
   type RenderImagePayload,
 } from '../utils/api';
+import { stemOf, filenameProblem } from '../utils/paths';
+import { OverwriteConfirm } from './SaveDialog';
 import {
   SCALEBAR_BLOCK_H,
   drawScalebarAt,
@@ -115,6 +117,11 @@ export function Volume3DViewer() {
   // null = follow whatever is currently visible; a Set = explicit override.
   const [saveChannels, setSaveChannels] = useState<Set<number> | null>(null);
   const [saveDir, setSaveDir] = useState('');
+  /** Name to save under; seeded from the image, always editable. */
+  const [saveName, setSaveName] = useState('');
+  const [conflict, setConflict] = useState<
+    { files: string[]; count: number; more: number } | null
+  >(null);
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState('');
   const [saveErr, setSaveErr] = useState('');
@@ -579,7 +586,7 @@ export function Volume3DViewer() {
     return pool.filter((i) => channels[i]?.visible);
   }, [channels, saveChannels, volInfo]); // volInfo changes when a volume finishes loading
 
-  const handleSave = useCallback(async () => {
+  const handleSave = useCallback(async (overwrite = false) => {
     setSaveErr('');
     setSaveMsg('');
     if (!metadata) return;
@@ -622,17 +629,27 @@ export function Volume3DViewer() {
 
       const res = await saveRender({
         output_dir: dir,
-        basename: metadata.filename,
+        basename: saveName.trim() || stemOf(metadata.filename),
         format: saveFormat,
         images,
+        overwrite,
       });
       setSaveMsg(`${res.saved.length} 件保存: ${res.output_dir}`);
     } catch (e) {
-      setSaveErr(e instanceof Error ? e.message : '保存に失敗しました');
+      // Nothing was written; this is a question about replacing files.
+      if (e instanceof OverwriteConflict) {
+        setConflict({ files: e.files, count: e.count, more: e.more });
+      } else {
+        setSaveErr(e instanceof Error ? e.message : '保存に失敗しました');
+      }
     } finally {
       setSaving(false);
     }
-  }, [metadata, saveMerge, savePerChannel, saveChannelIndices, saveDir, saveFormat, captureFrame]);
+    // saveName belongs here: without it this closure keeps the name from the
+    // render it was created in, so typing one and pressing save wrote the old
+    // one — the exact thing the field exists to control.
+  }, [metadata, saveMerge, savePerChannel, saveChannelIndices, saveDir, saveFormat,
+      saveName, captureFrame]);
 
   // Wheel zoom is bound natively with { passive: false }: React routes onWheel
   // through a passive root listener, so preventDefault() there is ignored and the
@@ -979,12 +996,29 @@ export function Volume3DViewer() {
             </div>
           )}
 
+          <div>
+            <input
+              type="text"
+              value={saveName}
+              onChange={(e) => { setSaveName(e.target.value); setConflict(null); }}
+              placeholder={stemOf(metadata.filename)}
+              className="w-full px-2 py-1 rounded bg-black/40 border border-white/20
+                         text-[11px] text-white placeholder:text-white/30
+                         focus:outline-none focus:border-[var(--accent)]"
+            />
+            {filenameProblem(saveName || stemOf(metadata.filename)) && (
+              <div className="text-[10px] text-red-400 mt-0.5">
+                {filenameProblem(saveName || stemOf(metadata.filename))}
+              </div>
+            )}
+          </div>
+
           <button
-            onClick={handleSave}
-            disabled={saving}
+            onClick={() => handleSave(false)}
+            disabled={saving || !!conflict}
             className="w-full px-2 py-1 rounded bg-[var(--accent)] text-white text-xs hover:opacity-90 disabled:opacity-50 transition"
           >
-            {saving ? '保存中…' : '表示中の条件で保存'}
+            {saving ? '保存中…' : '名前を付けて保存'}
           </button>
           {saveDir && (
             <button
@@ -1028,6 +1062,15 @@ export function Volume3DViewer() {
           image here. Rendered after the readouts so a bar dragged into a corner
           stays visible and grabbable instead of disappearing under them. */}
       <ScalebarOverlay metrics={scalebar} pad={14} />
+
+      {conflict && (
+        <OverwriteConfirm
+          conflict={conflict}
+          busy={saving}
+          onCancel={() => setConflict(null)}
+          onConfirm={() => handleSave(true)}
+        />
+      )}
     </div>
   );
 }

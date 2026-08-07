@@ -1161,6 +1161,11 @@ class PlatePdfRequest(BaseModel):
     #: the page entirely rather than adding a blank one.
     table_headers: list[str] = []
     table_rows: list[list[str]] = []
+    #: File to write, without extension. Empty falls back to the plate name plus
+    #: a timestamp.
+    filename: str = ""
+    #: Replace a file that is already there instead of refusing.
+    overwrite: bool = False
 
 
 @app.post("/api/plate/pdf")
@@ -1184,10 +1189,18 @@ def plate_pdf(req: PlatePdfRequest):
         ]
         if not frames:
             return JSONResponse(status_code=400, content={"error": "描画されたウェルがありません"})
-        safe = _safe_name_part(req.plate_name) or "plate"
-        stamp = time.strftime("%Y%m%d-%H%M%S")
+        # A typed name is used as given. Without one the plate names the file and
+        # a timestamp keeps repeats apart, which is the old behaviour.
+        if req.filename:
+            stem = _safe_name_part(os.path.splitext(req.filename)[0]) or "plate"
+        else:
+            safe = _safe_name_part(req.plate_name) or "plate"
+            stem = f"{safe}_plate3d_{time.strftime('%Y%m%d-%H%M%S')}"
+        target = out_dir / f"{stem}.pdf"
+        if target.exists() and not req.overwrite:
+            return _conflict_response([str(target)], str(out_dir))
         out = plate.compose_pdf(
-            out_dir / f"{safe}_plate3d_{stamp}.pdf",
+            target,
             req.plate_name, int(req.rows), int(req.cols),
             frames, dict(req.well_states), int(req.cell_px), req.footer,
             table_headers=list(req.table_headers),
@@ -1295,6 +1308,12 @@ class SaveRequest(BaseModel):
     t_to: int = 0                  # inclusive (0-based)
     current_z: int = 0
     current_t: int = 0
+    #: Stem to save under, replacing the image's own filename. Only honoured for
+    #: a single image; a batch keeps each image's name.
+    basename: str = ""
+    #: Replace files that are already there. Without it, a collision is reported
+    #: with the names involved and nothing at all is written.
+    overwrite: bool = False
     bit_depth_output: str = "16"   # "8" or "16" (16 only for TIFF)
 
 
@@ -1393,19 +1412,64 @@ def _resolve_channel_settings(req: SaveRequest, img_id: str, meta) -> tuple[list
     return settings, dropped
 
 
-def _free_path(filepath: str) -> str:
-    """filepath, or its next free _NN variant so an existing export survives."""
-    if not os.path.exists(filepath):
-        return filepath
-    stem, ext = os.path.splitext(filepath)
-    if stem.endswith(".ome"):
-        stem, ext = stem[:-4], ".ome" + ext
-    idx = 1
-    while True:
-        candidate = f"{stem}_{idx:02d}{ext}"
-        if not os.path.exists(candidate):
-            return candidate
-        idx += 1
+#: How many conflicting names to name in the warning before summarising.
+_CONFLICT_SHOWN = 12
+
+_PROJ_LABEL = {"max": "MaxProj", "min": "MinProj", "avg": "AvgProj"}
+
+
+def _zt_suffix(z_val, t_val, is_proj: bool, z_list: list, t_list: list,
+               method: str) -> str:
+    """The Z/T part of an export filename.
+
+    Module level, and used by both the collision check and the write, so the
+    name the user is warned about is the name that actually gets written. It was
+    briefly a closure defined between the two passes, which is worse than
+    duplication: the first pass raised UnboundLocalError and every save failed.
+    """
+    parts = []
+    if is_proj:
+        parts.append(_PROJ_LABEL.get(method, "Proj"))
+    elif len(z_list) > 1:
+        parts.append(f"Z{z_val:03d}")
+    if len(t_list) > 1:
+        parts.append(f"T{t_val:03d}")
+    joined = "_".join(parts)
+    return f"_{joined}" if joined else ""
+
+
+def _conflicts(paths: list[str]) -> list[str]:
+    """Which of these already exist, in order, without duplicates."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in paths:
+        if p in seen:
+            continue
+        seen.add(p)
+        if os.path.exists(p):
+            out.append(p)
+    return out
+
+
+def _conflict_response(paths: list[str], out_dir: str) -> JSONResponse:
+    """Refuse the write and say exactly what would have been replaced.
+
+    Returned before anything is written, so answering "no" costs nothing and
+    answering "yes" repeats the request with overwrite set. Earlier versions
+    silently renamed a colliding export to `_01`, which loses nothing but is its
+    own surprise: you ask for a file, get a differently-named one, and end up
+    with a directory of near-duplicates you cannot tell apart.
+    """
+    shown = [os.path.basename(p) for p in paths[:_CONFLICT_SHOWN]]
+    return JSONResponse(status_code=409, content={
+        "conflict": True,
+        "output_dir": out_dir,
+        "count": len(paths),
+        "files": shown,
+        "more": max(0, len(paths) - len(shown)),
+        "error": (f"{len(paths)} 個のファイルが既にあります。"
+                  "上書きしてよければ「上書きする」を選んでください。"),
+    })
 
 
 #: Characters Windows rejects in a filename. macOS accepts * ? " < > | happily,
@@ -1423,12 +1487,14 @@ def _safe_name_part(name: str) -> str:
 
 
 def _save_image_file(img_rgb: np.ndarray, fmt: str, filepath: str) -> str:
-    """Save RGB array to a file, auto-suffixing rather than overwriting.
+    """Save an RGB array to exactly this path. Returns the path written.
 
-    Returns the path actually written, which the caller reports to the UI.
+    No auto-suffixing: the caller has already established that overwriting here
+    is intended, either because nothing was in the way or because the user said
+    so. Renaming behind their back is what produced folders of `_01`, `_02`
+    files that nobody could tell apart afterwards.
     """
     from PIL import Image as PILImage
-    filepath = _free_path(filepath)
     if fmt == "tiff":
         import tifffile
         tifffile.imwrite(filepath, img_rgb, photometric='rgb')
@@ -1453,6 +1519,9 @@ class SaveRenderRequest(BaseModel):
     basename: str
     format: str = "png"          # "png" | "tiff"
     images: list[RenderImage]
+    #: Replace files that are already there. Without it a collision is reported
+    #: and nothing is written, so the user gets to decide.
+    overwrite: bool = False
 
 
 @app.post("/api/save-render")
@@ -1476,10 +1545,21 @@ def save_render(req: SaveRenderRequest):
         ext = ".tif" if req.format == "tiff" else ".png"
         stem = _safe_name_part(os.path.splitext(req.basename or "render")[0])
 
+        # Every destination is known from the names alone, so the collision
+        # check happens before any pixels are decoded or written — a refusal
+        # leaves the folder exactly as it was.
+        usable = [i for i in req.images if i.width > 0 and i.height > 0]
+        targets = [
+            os.path.join(out_dir, f"{stem}_3D_{_safe_name_part(i.name)}{ext}")
+            for i in usable
+        ]
+        if not req.overwrite:
+            clash = _conflicts(targets)
+            if clash:
+                return _conflict_response(clash, out_dir)
+
         saved: list[str] = []
-        for img in req.images:
-            if img.width <= 0 or img.height <= 0:
-                continue
+        for img in usable:
             raw = base64.b64decode(img.data_b64)
             expected = img.width * img.height * 4
             if len(raw) != expected:
@@ -1518,8 +1598,12 @@ def save_images(req: SaveRequest):
                 raise RuntimeError("No image loaded")
 
         saved_files: list[str] = []
-        renamed: list[dict[str, str]] = []
         skipped: list[str] = []
+        #: Every destination this request will write, gathered before any of it
+        #: happens so the whole export can be refused as one.
+        planned: list[str] = []
+        #: Per-image state carried from the planning pass to the writing pass.
+        pending: list[tuple] = []
         for img_id in image_ids:
             # A stale id (image closed while the dialog was open) must not abort
             # the batch after some files have already been written.
@@ -1528,7 +1612,14 @@ def save_images(req: SaveRequest):
                 continue
             r = get_reader(img_id)
             meta = r.metadata
-            basename = os.path.splitext(os.path.basename(meta.filename))[0] or "image"
+            # A typed name replaces the file's own, but only when saving one
+            # image: across a batch it would collapse every image onto the same
+            # set of filenames, and the per-image subfolder is what keeps them
+            # apart rather than the name.
+            if req.basename and len(image_ids) == 1:
+                basename = _safe_name_part(os.path.splitext(req.basename)[0]) or "image"
+            else:
+                basename = os.path.splitext(os.path.basename(meta.filename))[0] or "image"
 
             # Each image exports with its own channel set / LUT / contrast.
             settings, dropped = _resolve_channel_settings(req, img_id, meta)
@@ -1547,14 +1638,6 @@ def save_images(req: SaveRequest):
                 os.makedirs(img_dir, exist_ok=True)
             else:
                 img_dir = out_dir
-
-            def write(img_rgb: np.ndarray, name: str, _dir: str = img_dir) -> None:
-                """Save into this image's folder, never clobbering an earlier export."""
-                wanted = os.path.join(_dir, name)
-                written = _save_image_file(img_rgb, req.format, wanted)
-                saved_files.append(written)
-                if written != wanted:
-                    renamed.append({"requested": wanted, "written": written})
 
             # Resolve per-image Z range, tolerating a malformed override entry
             img_z_from, img_z_to = req.z_from, req.z_to
@@ -1582,23 +1665,45 @@ def save_images(req: SaveRequest):
             t_to = max(t_from, min(t_to, n_t - 1))
             t_list = list(range(t_from, t_to + 1))
 
+            # Names depend on nothing but the settings, so every destination for
+            # this image is known before a single plane is read. Collected here
+            # and checked across all images before anything is written, so a
+            # refusal cannot leave a half-finished export behind.
+            for t_val in t_list:
+                for z_val in z_list:
+                    zt = _zt_suffix(z_val, t_val, z_val == "proj",
+                                    z_list, t_list, req.projection_method)
+                    if req.save_separate:
+                        for s in settings:
+                            raw = (meta.channel_names[s.channel]
+                                   if s.channel < len(meta.channel_names) else f"Ch{s.channel}")
+                            planned.append(
+                                os.path.join(img_dir, f"{basename}_{_safe_name_part(raw)}{zt}{ext}"))
+                    if req.save_merge and settings:
+                        planned.append(os.path.join(img_dir, f"{basename}_merge{zt}{ext}"))
+            pending.append((img_id, r, meta, settings, basename, img_dir,
+                            z_list, t_list, img_z_from, img_z_to))
+
+        if not req.overwrite:
+            clash = _conflicts(planned)
+            if clash:
+                return _conflict_response(clash, out_dir)
+
+        for (img_id, r, meta, settings, basename, img_dir,
+             z_list, t_list, img_z_from, img_z_to) in pending:
+
+            def write(img_rgb: np.ndarray, name: str, _dir: str = img_dir) -> None:
+                """Save into this image's folder at exactly the planned name."""
+                path = os.path.join(_dir, name)
+                saved_files.append(_save_image_file(img_rgb, req.format, path))
+
             for t_val in t_list:
                 for z_val in z_list:
                     is_proj = z_val == "proj"
                     z_idx = 0 if is_proj else z_val
 
-                    # Build suffix for Z/T
-                    parts = []
-                    if is_proj:
-                        method_label = {"max": "MaxProj", "min": "MinProj", "avg": "AvgProj"}
-                        parts.append(method_label.get(req.projection_method, "Proj"))
-                    elif len(z_list) > 1:
-                        parts.append(f"Z{z_val:03d}")
-                    if len(t_list) > 1:
-                        parts.append(f"T{t_val:03d}")
-                    zt_suffix = "_".join(parts)
-                    if zt_suffix:
-                        zt_suffix = "_" + zt_suffix
+                    zt_suffix = _zt_suffix(z_val, t_val, is_proj,
+                                           z_list, t_list, req.projection_method)
 
                     # Get slice data and contrast for each selected channel
                     ch_slices: list[np.ndarray] = []
@@ -1639,7 +1744,6 @@ def save_images(req: SaveRequest):
         return {
             "saved": saved_files,
             "output_dir": out_dir,
-            "renamed": renamed,
             "skipped": skipped,
         }
     except Exception as e:

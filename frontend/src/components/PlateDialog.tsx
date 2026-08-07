@@ -9,7 +9,10 @@ import { usePlateStore } from '../stores/plateStore';
 import { PlateRenderer, parseVolume } from '../utils/plateRender';
 import { collectOpenWells, snapshotOf } from '../utils/plateWells';
 import { gpuLimits } from '../utils/gpuLimits';
+import { OverwriteConflict } from '../utils/api';
+import { filenameProblem } from '../utils/paths';
 import { PlateTable } from './PlateTable';
+import { OverwriteConfirm } from './SaveDialog';
 
 /**
  * Reads an Olympus MATL acquisition and shows what it contains, in the plate's
@@ -49,6 +52,11 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
   const abortRef = useRef<AbortController | null>(null);
   /** True from the moment an export starts until it has finished or failed. */
   const [exporting, setExporting] = useState(false);
+  /** Name for the PDF. Empty falls back to the plate name plus a timestamp. */
+  const [pdfName, setPdfName] = useState('');
+  const [conflict, setConflict] = useState<
+    { files: string[]; count: number; more: number } | null
+  >(null);
   // Each well's own contrast and angle are what get baked in, so the table and
   // the export both have to re-read when the tabs or the active tab change.
   const imageList = useImageStore((s) => s.imageList);
@@ -138,7 +146,7 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
    * appear in the PDF as an empty cell — indistinguishable from a well nobody
    * imaged — so the first failure aborts and nothing is written.
    */
-  const exportPdf = async () => {
+  const exportPdf = async (overwrite = false) => {
     const scan = plate;
     if (!scan) return;
     // Flush the tab being looked at. Its settings live in the live store fields
@@ -252,6 +260,8 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
       const res = await composePlatePdf({
         plate_name: scan.name, rows: scan.rows, cols: scan.cols,
         frames, well_states: states, cell_px: cellPx, output_dir: dir.path,
+        filename: pdfName.trim(),
+        overwrite,
         table_headers: columns.map((c) => c.label),
         table_rows: wells.map((w) => columns.map((c) => cells[w.wellId]?.[c.key] ?? '')),
         // The resolution actually applied, never the one requested. Recording the
@@ -270,7 +280,13 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
       // A cancel aborts the fetch, which surfaces here as an AbortError. That is
       // the user's own action, not a failure to report as one.
       if (cancelRef.current) setResult('中止しました。PDF は作成していません。');
-      else setError(e instanceof Error ? e.message : String(e));
+      // Nothing was written; ask before replacing. The wells are already
+      // rendered, so confirming does not repeat the expensive part... it does,
+      // in fact, and that is the honest trade: keeping every frame in memory to
+      // avoid it is what makes a 24-well export run out of room.
+      else if (e instanceof OverwriteConflict) {
+        setConflict({ files: e.files, count: e.count, more: e.more });
+      } else setError(e instanceof Error ? e.message : String(e));
     } finally {
       abortRef.current = null;
       renderer?.dispose();
@@ -301,6 +317,7 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
   const ready = plate?.wells.filter((w) => w.enabled && w.stitch_path).length ?? 0;
 
   return (
+    <>
     <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/70 p-6"
          onClick={requestClose}>
       <div className="bg-[var(--bg-panel)] border border-[var(--border)] rounded-xl shadow-2xl
@@ -503,9 +520,23 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
                       ))}
                     </select>
                   </label>
+                  <label className="text-[10px] text-[var(--text-secondary)] flex-1 min-w-[12rem]">
+                    ファイル名（省略時はプレート名＋日時）
+                    <input
+                      type="text"
+                      value={pdfName}
+                      onChange={(e) => { setPdfName(e.target.value); setConflict(null); }}
+                      disabled={exporting}
+                      placeholder={plate.name}
+                      className="block w-full mt-1 bg-[var(--bg-primary)] border border-[var(--border)]
+                                 rounded px-2 py-1 text-xs text-[var(--text-primary)]
+                                 placeholder:text-[var(--text-secondary)]"
+                    />
+                  </label>
                   <button
-                    onClick={exportPdf}
-                    disabled={exporting || !!loading || openWells.length === 0}
+                    onClick={() => exportPdf(false)}
+                    disabled={exporting || !!loading || openWells.length === 0 || !!conflict
+                              || !!(pdfName.trim() && filenameProblem(pdfName))}
                     className="px-4 py-2 rounded-lg bg-emerald-600 text-white text-xs font-medium
                                hover:opacity-90 disabled:opacity-40 transition"
                   >
@@ -539,5 +570,15 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
         )}
       </div>
     </div>
+
+      {conflict && (
+        <OverwriteConfirm
+          conflict={conflict}
+          busy={exporting}
+          onCancel={() => setConflict(null)}
+          onConfirm={() => exportPdf(true)}
+        />
+      )}
+    </>
   );
 }

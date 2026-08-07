@@ -5,6 +5,29 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.5.0 — 2026-08-07 — Saving names the file, and never replaces one silently.
+//     Every export used to name its own files and, on a collision, quietly slide
+//     to `_01`, `_02`. Nothing was ever destroyed — the report of "it overwrites
+//     without asking" turned out to be the opposite, and reading every write path
+//     is what established that — but the result is a folder of near-identical
+//     files that cannot be told apart afterwards, from a name nobody chose.
+//     There is now a filename field, filled in from the image and always
+//     editable, on all three paths: channel/merge export, the 3D view, and the
+//     plate PDF. Auto-suffixing is gone. Instead the backend computes every
+//     destination before decoding a single plane, and if any of them exists it
+//     answers 409 with the list and writes nothing at all — so cancelling really
+//     does leave the folder as it was, and confirming replaces exactly what the
+//     dialog named. Verified through the UI: 25 files, cancel leaves every mtime
+//     and checksum untouched, confirm updates them and creates no `_01`.
+//     A batch of several images keeps each image's own name, because one typed
+//     name across a batch would collapse them onto the same set of files.
+//     Names are checked while they can still be corrected — the Windows reserved
+//     set (\ / : * ? " < > |, trailing dot or space, CON/PRN/NUL/COM1…) is
+//     refused in the field rather than sanitised after the work is done.
+//     Also a Windows-only defect found on the way: the default output folder was
+//     computed by stripping everything after the last "/", and a Windows path has
+//     none — so it kept the filename and offered a folder that does not exist.
+//     Path handling now understands both separators.
 //   1.4.1 — 2026-08-07 — The app would not start after a plate session. Restoring the
 //     previous session called load_file() on every remembered path, inside the
 //     startup lifespan, so it decoded them all before the server answered
@@ -322,4 +345,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.4.1';
+export const VERSION = '1.5.0';
