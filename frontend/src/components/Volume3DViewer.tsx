@@ -621,6 +621,13 @@ export function Volume3DViewer() {
     setSaveErr('');
     setSaveMsg('');
     if (!metadata) return;
+    // Refused here, not silently sanitised by the backend: a name the user did
+    // not type is the exact failure 1.5.0 exists to prevent.
+    const nameProblem = filenameProblem(saveName.trim() || stemOf(metadata.filename));
+    if (nameProblem) {
+      setSaveErr(nameProblem);
+      return;
+    }
     if (!saveMerge && !savePerChannel) {
       setSaveErr('MERGE か CH別 のどちらかを選んでください');
       return;

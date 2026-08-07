@@ -30,6 +30,55 @@ def auto_contrast(img: np.ndarray, percentile: float = 0.1) -> tuple[float, floa
     return low, high
 
 
+def auto_contrast_from_counts(counts: np.ndarray,
+                              percentile: float = 0.1) -> tuple[float, float]:
+    """auto_contrast's answer, taken from a value histogram instead of the pixels.
+
+    auto_contrast has to hold the whole channel to call np.percentile, which is
+    the one thing the streaming volume path cannot afford: expanded to float32,
+    one channel of the real plate data is 1.585 GiB. Counting is separable, so
+    the caller accumulates `counts` a plane at a time and reads the percentiles
+    off the totals here, never materialising the channel.
+
+    `counts[v]` is how many pixels have exactly the value v, so the array is as
+    long as the value range (65536 for uint16) rather than as long as the data.
+
+    Not an approximation. A percentile is a position in the sorted data, and the
+    cumulative counts locate that position exactly; the interpolation below is
+    numpy's default 'linear' method, so on integer data this returns bit-identical
+    values to auto_contrast(). Sampling planes would have been the cheaper answer
+    and a different one — the 99.9th percentile of a subset is not the 99.9th
+    percentile of the volume, and it moves with which planes were picked, so the
+    same well would render at a different brightness depending on its Z count.
+    """
+    total = int(counts.sum())
+    if total <= 0:
+        return 0.0, 1.0
+    # counts[v] -> number of pixels <= v, which is what turns a rank into a value.
+    cum = np.cumsum(counts)
+
+    def value_at(q: float) -> float:
+        # numpy 'linear': the value at position q/100*(n-1) of the sorted data,
+        # interpolated between the two order statistics that straddle it.
+        pos = q / 100.0 * (total - 1)
+        lo_rank, hi_rank = int(np.floor(pos)), int(np.ceil(pos))
+        # The k-th smallest value is the first v whose cumulative count exceeds k.
+        lo_val = float(np.searchsorted(cum, lo_rank, side="right"))
+        hi_val = float(np.searchsorted(cum, hi_rank, side="right"))
+        # numpy's _lerp interpolates from whichever end is nearer, and the two
+        # forms differ in the last bit. Following it keeps this function exactly
+        # equal to auto_contrast rather than merely equal to a rounding.
+        frac = pos - lo_rank
+        if frac >= 0.5:
+            return hi_val - (hi_val - lo_val) * (1 - frac)
+        return lo_val + (hi_val - lo_val) * frac
+
+    low, high = value_at(percentile), value_at(100.0 - percentile)
+    if high <= low:
+        high = low + 1.0
+    return low, high
+
+
 # Full-scale values of the bit depths microscopes actually produce. Snapping to
 # these keeps the histogram's x-axis stable while the user steps through slices.
 _FULL_SCALES = (255, 1023, 4095, 16383, 65535)

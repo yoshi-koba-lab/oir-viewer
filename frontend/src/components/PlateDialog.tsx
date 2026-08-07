@@ -89,8 +89,13 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
    * just spent time changing exactly that. Reading settings is cheap — no pixels
    * are touched.
    */
+  // No saveViewState here: collectOpenWells reads the ACTIVE tab from the live
+  // store fields, so nothing needs flushing to render the table — and writing
+  // to the store during render is the kind of side effect React is allowed to
+  // punish at any time. exportPdf still flushes, because the export reads
+  // imageViewStates for inactive tabs at a moment of its own choosing.
   const openWells = useMemo(
-    () => { useImageStore.getState().saveViewState(); return collectOpenWells(plate); },
+    () => collectOpenWells(plate),
     // imageList/activeImageId changing is what makes this stale.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [plate, imageList, activeImageId],

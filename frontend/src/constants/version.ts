@@ -5,6 +5,36 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.5.2 — 2026-08-08 — The interactive 3D path stops being able to kill the app,
+//     and a whole-tree audit. Two hands worked on this one: a spawned session
+//     rebuilt /api/volume-bin to stream plane by plane (the old path expanded
+//     each channel to a 1.585 GiB float32 temporary, which is what silently
+//     killed the packaged backend on real wells on 2026-08-07), computing the
+//     auto window from an accumulated histogram — verified bit-identical to
+//     auto_contrast over 300 randomised trials, and the rewritten endpoint was
+//     exercised live at 128 and at full resolution before this commit, because
+//     it had never actually run in a process.
+//     The audit then found and fixed, with reproductions:
+//     Concurrent requests double-loaded the same image — measured 4 threads,
+//     4 full loads, which on real data is 4 x 4.25 GB for one image. Compare
+//     fetches by id without activating, so this was reachable in normal use.
+//     A per-reader lock now serialises it: same test, 1 load.
+//     Eviction could null the pixels mid-read (intermittent 500s); accessors now
+//     take a snapshot — 2.5 million reads raced against 176 unloads, no errors.
+//     The images/_lru bookkeeping is under one lock, so a close can no longer
+//     disappear an id between the budget's membership check and its unload.
+//     A deferred tab that failed to load once was bricked forever ("No image
+//     loaded" with no reason) — observed live when the external drive holding
+//     the data dropped. Failures now keep the path and every retry reports the
+//     real error; remount and it loads.
+//     The interactive 3D downsample had no anti-alias prefilter: the 1.3.0 fix
+//     (26 of 31 thin 2 px structures vanished at plate resolutions) had only
+//     ever been applied to the plate path. The view now shrinks through the
+//     same helper as the plate PDF and the export.
+//     Smaller: the 3D save refuses Windows-illegal names at entry instead of
+//     silently sanitising them; a dead query parameter left over from an
+//     abandoned edit is gone; the plate dialog no longer writes to the store
+//     during render.
 //   1.5.1 — 2026-08-07 — Min/Max had no effect at all in the 3D view. The shader has
 //     uMins/uMaxs and applies them correctly; what it was handed was 0 and 1 for
 //     every channel, hardcoded, so it was a pass-through. Moving the sliders did
@@ -364,4 +394,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.5.1';
+export const VERSION = '1.5.2';

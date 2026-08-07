@@ -50,7 +50,10 @@ from pydantic import BaseModel
 from reader import (
     ImageMetadata, ImageReader, describe_runtime, prewarm_jvm as _prewarm_jvm, selftest,
 )
-from processor import adjust_contrast, auto_contrast, compute_histogram, to_png_bytes
+from processor import (
+    adjust_contrast, auto_contrast, auto_contrast_from_counts, compute_histogram,
+    to_png_bytes,
+)
 from roi import line_profile, measure_roi
 import plate
 
@@ -292,11 +295,19 @@ except ValueError:
 #: Image ids in the order they were last used, oldest first.
 _lru: list[str] = []
 
+#: Guards `images`, `active_id` and `_lru` as one unit. Sync endpoints run on a
+#: thread pool while async ones run on the event loop, so a close could delete
+#: an id between _enforce_budget's membership check and its unload() — a
+#: KeyError-shaped 500 with no wrongdoing anywhere. RLock, because add_image
+#: calls _touch and _enforce_budget while already holding it.
+_state_lock = threading.RLock()
+
 
 def _touch(image_id: str) -> None:
-    if image_id in _lru:
-        _lru.remove(image_id)
-    _lru.append(image_id)
+    with _state_lock:
+        if image_id in _lru:
+            _lru.remove(image_id)
+        _lru.append(image_id)
 
 
 def _enforce_budget(keep: str | None = None) -> None:
@@ -307,20 +318,21 @@ def _enforce_budget(keep: str | None = None) -> None:
     to 34 GB of real data and took the app down with it. Tabs stay; their pixels
     do not, and come back when the tab is looked at again.
     """
-    total = sum(r.loaded_bytes for r in images.values())
-    if total <= IMAGE_BUDGET_BYTES:
-        return
-    for img_id in list(_lru):
+    with _state_lock:
+        total = sum(r.loaded_bytes for r in images.values())
         if total <= IMAGE_BUDGET_BYTES:
-            break
-        if img_id == keep or img_id == active_id or img_id not in images:
-            continue
-        freed = images[img_id].unload()
-        if freed:
-            total -= freed
-            print(f"Unloaded {images[img_id].metadata.filename} "
-                  f"({freed / 1048576:.0f} MB) to stay within the pixel budget",
-                  flush=True)
+            return
+        for img_id in list(_lru):
+            if total <= IMAGE_BUDGET_BYTES:
+                break
+            if img_id == keep or img_id == active_id or img_id not in images:
+                continue
+            freed = images[img_id].unload()
+            if freed:
+                total -= freed
+                print(f"Unloaded {images[img_id].metadata.filename} "
+                      f"({freed / 1048576:.0f} MB) to stay within the pixel budget",
+                      flush=True)
 
 
 def get_reader(image_id: str | None = None) -> ImageReader:
@@ -336,9 +348,10 @@ def add_image(reader: ImageReader) -> str:
     """Register a reader and return its ID."""
     global active_id
     img_id = uuid.uuid4().hex[:8]
-    images[img_id] = reader
-    active_id = img_id
-    _touch(img_id)
+    with _state_lock:
+        images[img_id] = reader
+        active_id = img_id
+        _touch(img_id)
     # A newly opened well is the one being looked at, so older ones give up
     # their pixels rather than this one being refused.
     _enforce_budget(keep=img_id)
@@ -392,13 +405,14 @@ def activate_image(image_id: str):
 async def close_image(image_id: str):
     """Close and remove an image."""
     global active_id
-    if image_id in _lru:
-        _lru.remove(image_id)
-    if image_id not in images:
-        return JSONResponse(status_code=404, content={"error": "Image not found"})
-    del images[image_id]
-    if active_id == image_id:
-        active_id = next(iter(images), None)
+    with _state_lock:
+        if image_id in _lru:
+            _lru.remove(image_id)
+        if image_id not in images:
+            return JSONResponse(status_code=404, content={"error": "Image not found"})
+        del images[image_id]
+        if active_id == image_id:
+            active_id = next(iter(images), None)
     _save_session()
     return {"closed": image_id, "active_id": active_id}
 
@@ -777,6 +791,12 @@ def get_volume(
         return JSONResponse(status_code=400, content={"error": str(e)})
 
 
+#: Distinct values a uint16 pixel can take, which is the length of the histogram
+#: the streaming volume path accumulates instead of keeping the pixels. Every
+#: reader path ends at uint16 (reader._to_uint16), so this covers all of them.
+_U16_LEVELS = 65536
+
+
 @app.get("/api/volume-bin")
 def get_volume_bin(
     t: int = Query(0),
@@ -796,12 +816,23 @@ def get_volume_bin(
     as one giant string, which fails outright around a gigabyte — exactly where
     the full-resolution option lands. Only the channels the renderer can actually
     use are sent (max_ch), since the rest would be transferred and discarded.
-    """
-    from scipy.ndimage import zoom as ndzoom
 
+    Built one plane at a time, the way plate.read_low_volume already does it.
+    The previous version expanded a whole channel with
+    `ndzoom(ch_vol.astype(np.float32), ...)`, which for one real plate well
+    (2910x2924x50, uint16) is a 1.585 GiB temporary per channel — on top of the
+    4.25 GB the reader is already holding, and repeated for every channel. On
+    2026-08-07 the packaged v1.5.0 backend died with no traceback and no crash
+    report immediately after answering this endpoint for a real well with two
+    wells open: the log just stops, which is what an out-of-memory kill looks
+    like from the inside. Nothing here now allocates more than one plane beyond
+    the reply itself.
+
+    The wire layout is unchanged, so the renderer needs no change.
+    """
     try:
         r = get_reader(id)
-        vol = r.get_volume(t)  # (C, Z, Y, X)
+        vol = r.get_volume(t)  # (C, Z, Y, X) uint16, a view — never copied here
         n_c, n_z, h, w = vol.shape
 
         full_res = max_dim <= 0
@@ -819,26 +850,74 @@ def get_volume_bin(
         out_z = int(round(n_z * scale_z))
         send_c = max(1, min(n_c, max_ch))
 
-        levels: list[tuple[int, int]] = []
-        planes: list[bytes] = []
+        # One buffer for the whole reply, filled in place. Collecting per-channel
+        # bytes and joining them holds the entire payload twice at the moment of
+        # the join — another 1.7 GB at full resolution, for no reason: every
+        # offset is known before the first plane is read.
+        head_bytes = 32 + 8 * send_c
+        ch_bytes = out_z * out_h * out_w
+        body = bytearray(head_bytes + ch_bytes * send_c)
+        mv = memoryview(body)
+        mv[:32] = np.array([send_c, out_z, out_h, out_w,
+                            n_c, n_z, h, w], dtype="<u4").tobytes()
+
+        resize_xy = (out_h, out_w) != (h, w)
         for c in range(send_c):
-            ch_vol = vol[c]  # (Z, Y, X) uint16
-            if scale_xy != 1.0 or scale_z != 1.0:
-                ch_vol = ndzoom(ch_vol.astype(np.float32),
-                                (scale_z, scale_xy, scale_xy),
-                                order=1).clip(0, 65535).astype(np.uint16)
+            src = vol[c]  # (Z, Y, X) view
+            if resize_xy or out_z != n_z:
+                # Staged at the OUTPUT size, so the biggest thing alive is the
+                # answer (26 MB at max_dim=512) rather than the source.
+                stage = np.empty((out_z, out_h, out_w), dtype=np.uint16)
+                counts = np.zeros(_U16_LEVELS, dtype=np.int64)
+                for zi in range(out_z):
+                    # Nearest source plane when Z is decimated, as plate.py does
+                    # it. The old 3D zoom interpolated across Z, inventing signal
+                    # between real optical sections; it also only ever ran when
+                    # n_z > 128, which this data (n_z = 50) never hits.
+                    src_z = (zi if out_z == n_z else
+                             min(n_z - 1, int(round(zi * (n_z - 1) / max(out_z - 1, 1)))))
+                    if resize_xy:
+                        # plate._resize_plane, not bare ndzoom: order=1 alone is
+                        # point sampling, and 1.3.0 measured it erasing 26 of 31
+                        # thin 2 px structures at plate resolutions. That fix
+                        # only ever landed on the plate path; the interactive
+                        # view kept losing exactly the structures being
+                        # inspected. Same helper now, so the view, the plate
+                        # PDF and the 3D export all shrink the same way.
+                        plane = plate._resize_plane(src[src_z], out_h, out_w)
+                        np.clip(plane, 0, 65535, out=plane)
+                        stage[zi] = plane
+                    else:
+                        stage[zi] = src[src_z]
+                    counts += np.bincount(stage[zi].reshape(-1),
+                                          minlength=_U16_LEVELS)
+            else:
+                # Asked for the source size: the reader's own array is already
+                # the staging buffer, so this costs a counting pass and nothing else.
+                stage = src
+                counts = np.zeros(_U16_LEVELS, dtype=np.int64)
+                for zi in range(out_z):
+                    counts += np.bincount(stage[zi].reshape(-1),
+                                          minlength=_U16_LEVELS)
 
-            low, high = auto_contrast(ch_vol.ravel())
+            # Same window as before, from a histogram of the same values rather
+            # than from the values themselves — see auto_contrast_from_counts.
+            low, high = auto_contrast_from_counts(counts)
             rng = max(float(high - low), 1.0)
-            normed = ((ch_vol.astype(np.float32) - low) / rng).clip(0, 1)
-            planes.append(np.ascontiguousarray((normed * 255).astype(np.uint8)).tobytes())
-            levels.append((int(low), int(high)))
+            base = head_bytes + c * ch_bytes
+            mv[32 + 8 * c:40 + 8 * c] = np.array([int(low), int(high)],
+                                                 dtype="<i4").tobytes()
+            dst = np.frombuffer(mv[base:base + ch_bytes],
+                                dtype=np.uint8).reshape(out_z, out_h, out_w)
+            for zi in range(out_z):
+                normed = (stage[zi].astype(np.float32) - low) / rng
+                np.clip(normed, 0, 1, out=normed)
+                dst[zi] = normed * 255
+            del stage, counts
 
-        header = np.array([send_c, out_z, out_h, out_w,
-                           n_c, n_z, h, w], dtype="<u4").tobytes()
-        meta = np.array(levels, dtype="<i4").tobytes()
-        return Response(content=header + meta + b"".join(planes),
-                        media_type="application/octet-stream")
+        # memoryview, not bytes(): Response.render passes it straight through,
+        # where bytes() would copy the finished payload one more time.
+        return Response(content=mv, media_type="application/octet-stream")
     except Exception as e:
         import traceback
         traceback.print_exc()

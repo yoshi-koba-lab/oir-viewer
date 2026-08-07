@@ -304,6 +304,14 @@ class ImageReader:
     def __init__(self):
         self.data: np.ndarray | None = None  # shape: (T, C, Z, Y, X)
         self.metadata = ImageMetadata()
+        # Serialises loading and unloading. FastAPI runs sync endpoints on a
+        # thread pool, and the Compare view requests several images by id
+        # without activating them first — so two requests racing into the same
+        # deferred reader both saw data=None and both read the whole file.
+        # Measured: 4 concurrent accesses, 4 full loads, which on real data is
+        # 4 x 4.25 GB of transient memory for one image. RLock, because
+        # ensure_loaded runs inside the accessors' snapshot section.
+        self._pixels_lock = threading.RLock()
         #: Set when this reader stands for a file whose pixels have not been read.
         #: A restored session registers one of these per remembered file, so
         #: startup costs nothing regardless of how much was open last time.
@@ -312,7 +320,8 @@ class ImageReader:
     @property
     def loaded_bytes(self) -> int:
         """Resident pixel bytes, for the budget that decides what to evict."""
-        return int(self.data.nbytes) if self.data is not None else 0
+        d = self.data          # snapshot: unload() can null the field mid-read
+        return int(d.nbytes) if d is not None else 0
 
     def defer(self, path: str, metadata: ImageMetadata) -> None:
         """Stand for a file without reading it. Pixels arrive on first use."""
@@ -327,27 +336,50 @@ class ImageReader:
         and uploads that have since been deleted cannot be read back, so those
         keep their pixels rather than becoming permanently empty tabs.
         """
-        if self.data is None:
-            return 0
-        path = self.deferred_path or self.metadata.source_path
-        if not path or not os.path.exists(path):
-            return 0
-        freed = self.loaded_bytes
-        self.deferred_path = path
-        self.data = None
-        return freed
+        with self._pixels_lock:
+            if self.data is None:
+                return 0
+            path = self.deferred_path or self.metadata.source_path
+            if not path or not os.path.exists(path):
+                return 0
+            freed = self.loaded_bytes
+            self.deferred_path = path
+            self.data = None
+            return freed
 
     def ensure_loaded(self) -> None:
-        """Read the pixels if this reader is only standing for a file so far."""
-        if self.data is not None:
-            return
-        path = self.deferred_path
-        if not path:
-            raise RuntimeError("No image loaded")
-        # Cleared first: a failed load must not leave the reader claiming it can
-        # retry forever against a file that is gone or unreadable.
-        self.deferred_path = None
-        self.load_file(path)
+        """Read the pixels if this reader is only standing for a file so far.
+
+        `deferred_path` survives a failure on purpose. It used to be cleared
+        before the load, so one unsuccessful attempt turned the tab into a
+        permanent "No image loaded" — with the real reason shown once and never
+        again. That is the wrong trade when the data lives on an external drive:
+        a disk that had spun down, or a moment's disconnect, bricked the tab
+        until the app was restarted. Every attempt now either loads it or reports
+        why, and the next attempt can still succeed.
+        """
+        with self._pixels_lock:
+            if self.data is not None:
+                return
+            path = self.deferred_path
+            if not path:
+                raise RuntimeError("No image loaded")
+            self.load_file(path)
+            # Only on success: from here the pixels are the source of truth.
+            self.deferred_path = None
+
+    def _pixels(self) -> np.ndarray:
+        """The pixel array, loaded if need be — as a snapshot.
+
+        Callers hold the returned array, not self.data: an eviction that runs
+        after this returns only drops the reader's reference, and numpy keeps
+        the memory alive for the caller until it is done. Taken under the lock
+        so eviction cannot interleave between the load and the snapshot.
+        """
+        with self._pixels_lock:
+            self.ensure_loaded()
+            assert self.data is not None
+            return self.data
 
     def load_file(self, path: str) -> ImageMetadata:
         """Load an image file. Dispatches by extension."""
@@ -697,20 +729,20 @@ class ImageReader:
 
     def get_slice(self, c: int, z: int, t: int) -> np.ndarray:
         """Get a single 2D slice. Returns uint16 array (H, W)."""
-        self.ensure_loaded()
+        data = self._pixels()
         # Clamp on both sides: a negative index would wrap and quietly return a
         # completely different slice.
-        t = max(0, min(t, self.data.shape[0] - 1))
-        c = max(0, min(c, self.data.shape[1] - 1))
-        z = max(0, min(z, self.data.shape[2] - 1))
-        return self.data[t, c, z]
+        t = max(0, min(t, data.shape[0] - 1))
+        c = max(0, min(c, data.shape[1] - 1))
+        z = max(0, min(z, data.shape[2] - 1))
+        return data[t, c, z]
 
     def get_mip(self, c: int, t: int) -> np.ndarray:
         """Maximum Intensity Projection along Z for a given channel and time."""
-        self.ensure_loaded()
-        t = max(0, min(t, self.data.shape[0] - 1))
-        c = max(0, min(c, self.data.shape[1] - 1))
-        return np.max(self.data[t, c], axis=0)
+        data = self._pixels()
+        t = max(0, min(t, data.shape[0] - 1))
+        c = max(0, min(c, data.shape[1] - 1))
+        return np.max(data[t, c], axis=0)
 
     def get_projection(self, c: int, t: int, z_from: int, z_to: int, method: str = "max") -> np.ndarray:
         """Z-projection over a specified range.
@@ -722,25 +754,25 @@ class ImageReader:
             z_to: end Z index (inclusive, 0-based)
             method: "max", "min", or "avg"
         """
-        self.ensure_loaded()
-        t = max(0, min(t, self.data.shape[0] - 1))
-        c = max(0, min(c, self.data.shape[1] - 1))
-        z_from = max(0, min(z_from, self.data.shape[2] - 1))
-        z_to = max(z_from, min(z_to, self.data.shape[2] - 1))
-        stack = self.data[t, c, z_from:z_to + 1]  # (Z_range, Y, X)
+        data = self._pixels()
+        t = max(0, min(t, data.shape[0] - 1))
+        c = max(0, min(c, data.shape[1] - 1))
+        z_from = max(0, min(z_from, data.shape[2] - 1))
+        z_to = max(z_from, min(z_to, data.shape[2] - 1))
+        stack = data[t, c, z_from:z_to + 1]  # (Z_range, Y, X)
         if method == "min":
             return np.min(stack, axis=0)
         elif method == "avg":
             # Round, not truncate — truncation biases every avg projection low.
-            return np.rint(np.mean(stack, axis=0)).astype(self.data.dtype)
+            return np.rint(np.mean(stack, axis=0)).astype(data.dtype)
         else:  # "max"
             return np.max(stack, axis=0)
 
     def get_volume(self, t: int) -> np.ndarray:
         """Get full volume data (C, Z, Y, X) for a given time point."""
-        self.ensure_loaded()
-        t = max(0, min(t, self.data.shape[0] - 1))
-        return self.data[t]
+        data = self._pixels()
+        t = max(0, min(t, data.shape[0] - 1))
+        return data[t]
 
 
 # Transmitted-light / DIC channel name patterns
