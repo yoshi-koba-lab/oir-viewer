@@ -216,6 +216,16 @@ Mac 用アプリを Windows で（またはその逆で）ビルドすること�
 フォームをそれぞれのランナーでビルドします。`v*` タグを push すると
 インストーラが Release に添付されます。
 
+## 開発を引き継ぐ方へ
+
+[HANDOFF.md](HANDOFF.md) を先に読んでください。コードを読んでも分からないこと —
+実データの規模（1ウェル 4.25 GB）が前提になっている設計、パッケージ版でしか
+出ない事故、Windows と macOS の差、そして過去に出荷してしまった不具合の原因 —
+がまとまっています。
+
+判断の根拠と実測値は [frontend/src/constants/version.ts](frontend/src/constants/version.ts)
+の変更履歴にあります。
+
 ## 構成
 
 ```
