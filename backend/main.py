@@ -2743,11 +2743,14 @@ def _publish_staged_files(
     staged_paths: list[str], targets: list[str], overwrite: bool,
     expected_revisions: dict[str, str],
     pre_publish: Callable[[], None] | None = None,
+    post_publish: Callable[[], None] | None = None,
 ) -> None:
-    """Publish a validated batch, rolling earlier names back on later failure."""
+    """Publish a validated batch and roll it back if final validation fails."""
     if len(staged_paths) != len(targets):
         raise ValueError("投影の一時ファイル数が保存先数と一致しません。")
-    if len(targets) == 1:
+    # Without a fallible post-publication check, one atomic replace cannot leave
+    # a partial batch and needs no potentially expensive copy of the old file.
+    if len(targets) == 1 and post_publish is None:
         changed_parent = _targets_with_changed_parent(targets, expected_revisions)
         if changed_parent:
             raise _TargetParentChangedDuringPublish(changed_parent)
@@ -2799,6 +2802,12 @@ def _publish_staged_files(
             for staged, target in zip(staged_paths, targets):
                 os.replace(staged, target)
                 published.append(target)
+            # Some formats become open tabs immediately after publication and
+            # need a final source token under the public path. Keep that
+            # fallible validation inside the transaction: a failure must restore
+            # every old target instead of returning 400 after changing files.
+            if post_publish:
+                post_publish()
         except Exception as publish_error:
             rollback_errors: list[str] = []
             for target in reversed(published):
@@ -3480,6 +3489,7 @@ def apply_projection(req: ProjectionRequest):
 
     staged_paths: list[str] = []
     staged_readers: list[ImageReader] = []
+    staged_ome_xmls: list[str] = []
     try:
         if req.method not in _PROJ_LABEL:
             raise ValueError(f"Unsupported projection method: {req.method}")
@@ -3618,6 +3628,7 @@ def apply_projection(req: ProjectionRequest):
             staged_reader = ImageReader()
             staged_reader.load_file(staged)
             staged_readers.append(staged_reader)
+            staged_ome_xmls.append(ome_xml)
             completed_units += 1
             _export_progress(
                 "verifying", completed_units, total_units,
@@ -3672,17 +3683,48 @@ def apply_projection(req: ProjectionRequest):
                     for source_meta in runtime_sources:
                         _assert_projection_source_unchanged(source_meta)
 
+                def bind_published_projection_sources() -> None:
+                    for index, (staged_reader, expected_ome, target) in enumerate(
+                        zip(staged_readers, staged_ome_xmls, targets)
+                    ):
+                        # Reopen the actual public name, not only its stat token.
+                        # An external process could replace the target between
+                        # os.replace and this callback; binding the old staged
+                        # pixels to that newer path would make the tab lie.
+                        published_reader = ImageReader()
+                        published_reader.load_file(target)
+                        if (staged_reader.data is None
+                                or published_reader.data is None
+                                or staged_reader.data.dtype != published_reader.data.dtype
+                                or staged_reader.data.shape != published_reader.data.shape
+                                or not np.array_equal(
+                                    staged_reader.data, published_reader.data,
+                                )):
+                            raise ValueError(
+                                "公開した OME-TIFF の画素が検証済み投影と一致しません。"
+                            )
+
+                        ome_before = snapshot_source(target)
+                        with tifffile.TiffFile(target) as published_tif:
+                            published_ome = published_tif.ome_metadata
+                        ome_after = snapshot_source(target)
+                        if (ome_before != ome_after
+                                or published_reader.metadata.source_identity
+                                != ome_after.identity
+                                or published_reader.metadata.source_revision
+                                != ome_after.revision
+                                or not published_ome):
+                            raise ValueError(
+                                "公開した OME-TIFF が最終検証中に変更されました。"
+                            )
+                        _assert_projection_ome(published_ome, expected_ome)
+                        staged_readers[index] = published_reader
+
                 _publish_staged_files(
                     staged_paths, targets, req.overwrite, commit_expected,
                     pre_publish=validate_projection_sources,
+                    post_publish=bind_published_projection_sources,
                 )
-                for staged_reader, target in zip(staged_readers, targets):
-                    published = snapshot_source(target)
-                    staged_reader.metadata.filename = os.path.basename(target)
-                    staged_reader.metadata.source_path = os.path.realpath(target)
-                    staged_reader.metadata.source_identity = published.identity
-                    staged_reader.metadata.source_revision = published.revision
-                    staged_reader.deferred_path = None
             except _TargetParentChangedDuringPublish as e:
                 return _changed_parent_response(e.paths)
             except _TargetChangedDuringPublish as e:
@@ -3795,6 +3837,35 @@ def _selftest_export_targets() -> int:
             if (not isinstance(missing_3d, JSONResponse)
                     or missing_3d.status_code != 400 or os.path.exists(absent_3d)):
                 raise AssertionError("3D save recreated a missing output directory")
+
+            # A format may need one final source-token/readback check under its
+            # public filename. If that check fails, even a single confirmed
+            # overwrite must restore the old bytes before surfacing the error.
+            post_target = Path(tmp, "post-publish.bin")
+            post_stage = Path(tmp, ".post-publish-stage.bin")
+            post_target.write_bytes(b"old public bytes")
+            post_stage.write_bytes(b"new staged bytes")
+            post_expected = {
+                os.path.abspath(post_target): _target_state(post_target),
+            }
+
+            def fail_post_publication_validation() -> None:
+                raise RuntimeError("injected post-publication validation failure")
+
+            try:
+                _publish_staged_files(
+                    [str(post_stage)], [str(post_target)], True, post_expected,
+                    post_publish=fail_post_publication_validation,
+                )
+            except RuntimeError as exc:
+                if "post-publication" not in str(exc):
+                    raise
+            else:
+                raise AssertionError("post-publication failure was accepted")
+            if (post_target.read_bytes() != b"old public bytes"
+                    or post_stage.exists()
+                    or list(Path(tmp).glob(".oirrollback-*"))):
+                raise AssertionError("post-publication failure did not roll back")
 
             duplicate_render = save_render(SaveRenderRequest(
                 output_dir=tmp, basename="duplicate", format="png",

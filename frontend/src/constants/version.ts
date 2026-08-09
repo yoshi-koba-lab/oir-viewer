@@ -45,11 +45,27 @@
 //     including a hard-link or symlink alias, is rejected before pixel/base64 work
 //     and checked again at the publication boundary; overwrite confirmation never
 //     permits replacing source microscopy data with a rendered RGB image.
+//     Projection also reopens the public OME-TIFF and compares its pixels, OME
+//     provenance and source token to the verified stage before registering its
+//     tab. That final check remains inside the rollback transaction, so a failure
+//     restores even a single overwritten target rather than returning an error
+//     after changing the user's file.
 //     A non-empty 2D `image_ids` list is likewise an exact, all-or-nothing
 //     selection. If any explicit id became stale after the dialog opened, the
 //     request fails before pixels rather than falling back to the active tab or
 //     publishing the surviving prefix under the requested name. Active-image
 //     fallback remains only for legacy callers that supply no ids at all.
+//     The first v1.5.6 Windows main build then exposed a source-revision boundary:
+//     a same-size continuation-chunk rewrite could occur inside one filesystem
+//     timestamp tick, leaving every portable stat field unchanged. Windows now
+//     binds the main file and every split member to its NTFS/ReFS per-file USN
+//     and emits `source-rev:v2`, invalidating the ambiguous older tokens. The
+//     packaged Windows selftest keeps an immediate same-size rewrite as the
+//     regression and also refuses a source with an active writer. If a
+//     filesystem cannot provide this guarantee (for example
+//     FAT/exFAT, SMB or a disabled change journal), the source or staged
+//     projection OME-TIFF is rejected with a move-to-local-NTFS/ReFS
+//     instruction; it never falls back to stat-only.
 //     The final source-build Plate path was then run end to end on the local copy
 //     of the real acquisition: 105 files / 73,916,686,439 bytes, with all eight
 //     ready wells B02-B05 and C02-C05. Independent scan, inventory and summary

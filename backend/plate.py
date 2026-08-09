@@ -25,7 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
-from source_state import snapshot_source
+from source_state import _selftest_windows_usn_parser, snapshot_source
 
 MATL_NAMES = ("matl.omp2info", "matl_forVSIimages.omp2info")
 
@@ -1236,6 +1236,7 @@ def _selftest_source_state() -> int:
     import unicodedata
 
     try:
+        _selftest_windows_usn_parser()
         with tempfile.TemporaryDirectory() as tmp:
             left_dir, right_dir = Path(tmp, "left"), Path(tmp, "right")
             left_dir.mkdir()
@@ -1252,11 +1253,15 @@ def _selftest_source_state() -> int:
             if first.identity == alias.identity:
                 raise AssertionError("hardlink in another acquisition shared source identity")
 
-            chunk.write_bytes(b"chunk-b")
+            # Change the size as well as the bytes.  A same-size rewrite can
+            # land in one filesystem timestamp tick on Windows, where a
+            # stat-only revision cannot distinguish the two snapshots.
+            chunk.write_bytes(b"chunk-b-longer")
             changed_chunk = snapshot_source(left)
-            if (changed_chunk.identity != first.identity
-                    or changed_chunk.revision == first.revision):
-                raise AssertionError("split chunk change did not change only the revision")
+            if changed_chunk.identity != first.identity:
+                raise AssertionError("split chunk change altered the source identity")
+            if changed_chunk.revision == first.revision:
+                raise AssertionError("split chunk change did not change the revision")
 
             extra = left_dir / "Stitch_B02_G001_00002"
             extra.write_bytes(b"more")
@@ -1269,11 +1274,53 @@ def _selftest_source_state() -> int:
             bracket_chunk = left_dir / "sample[1]_00001"
             bracket_chunk.write_bytes(b"part-a")
             bracket_before = snapshot_source(bracket)
+            # Keep the size identical: on Windows this specifically proves the
+            # USN-backed revision catches a rewrite even when every portable
+            # stat field is deliberately restored to its earlier value.
+            bracket_stat = bracket_chunk.stat()
             bracket_chunk.write_bytes(b"part-b")
+            if os.name == "nt":
+                os.utime(
+                    bracket_chunk,
+                    ns=(bracket_stat.st_atime_ns, bracket_stat.st_mtime_ns),
+                )
+                restored = bracket_chunk.stat()
+                portable_before = (
+                    bracket_stat.st_dev, bracket_stat.st_ino,
+                    bracket_stat.st_mode, bracket_stat.st_nlink,
+                    bracket_stat.st_size, bracket_stat.st_mtime_ns,
+                    bracket_stat.st_ctime_ns,
+                )
+                portable_after = (
+                    restored.st_dev, restored.st_ino, restored.st_mode,
+                    restored.st_nlink, restored.st_size, restored.st_mtime_ns,
+                    restored.st_ctime_ns,
+                )
+                if portable_before != portable_after:
+                    raise AssertionError(
+                        "Windows same-size probe did not preserve portable stat fields"
+                    )
             bracket_after = snapshot_source(bracket)
-            if (bracket_before.members != 2
-                    or bracket_before.revision == bracket_after.revision):
+            if bracket_before.members != 2:
                 raise AssertionError("bracketed OIR stem lost its continuation chunk")
+            if bracket_before.revision == bracket_after.revision:
+                raise AssertionError("bracketed OIR chunk change kept its revision")
+            if os.name == "nt":
+                with open(bracket_chunk, "r+b") as active_writer:
+                    active_writer.seek(0)
+                    active_writer.write(b"part-c")
+                    active_writer.flush()
+                    try:
+                        snapshot_source(bracket)
+                    except OSError as exc:
+                        if getattr(exc, "winerror", None) != 32:
+                            raise AssertionError(
+                                f"active writer returned unexpected Windows error: {exc}"
+                            ) from exc
+                    else:
+                        raise AssertionError(
+                            "Windows source snapshot accepted an active writer"
+                        )
 
             if sys.platform == "darwin":
                 composed = left_dir / "caf\u00e9.oir"
@@ -1282,11 +1329,12 @@ def _selftest_source_state() -> int:
                 composed_chunk.write_bytes(b"part-a")
                 decomposed = Path(unicodedata.normalize("NFD", str(composed)))
                 unicode_before = snapshot_source(decomposed)
-                composed_chunk.write_bytes(b"part-b")
+                composed_chunk.write_bytes(b"part-b-longer")
                 unicode_after = snapshot_source(decomposed)
-                if (unicode_before.members != 2
-                        or unicode_before.revision == unicode_after.revision):
+                if unicode_before.members != 2:
                     raise AssertionError("Unicode alias lost its continuation chunk")
+                if unicode_before.revision == unicode_after.revision:
+                    raise AssertionError("Unicode alias chunk change kept its revision")
 
                 mixed = left_dir / "MixedCase.oir"
                 mixed.write_bytes(b"main")
@@ -1295,10 +1343,12 @@ def _selftest_source_state() -> int:
                 case_before = snapshot_source(left_dir / "mixedcase.oir")
                 mixed_chunk.write_bytes(b"part-b")
                 case_after = snapshot_source(left_dir / "mixedcase.oir")
-                if (case_before.members != 2
-                        or case_before.identity != case_after.identity
-                        or case_before.revision == case_after.revision):
+                if case_before.members != 2:
                     raise AssertionError("macOS case alias lost its continuation chunk")
+                if case_before.identity != case_after.identity:
+                    raise AssertionError("macOS case alias changed source identity")
+                if case_before.revision == case_after.revision:
+                    raise AssertionError("macOS case alias chunk change kept its revision")
 
             if os.name == "nt":
                 mixed = left_dir / "MixedCase.oir"
@@ -1306,11 +1356,12 @@ def _selftest_source_state() -> int:
                 mixed_chunk = left_dir / "MixedCase_00001"
                 mixed_chunk.write_bytes(b"part-a")
                 case_before = snapshot_source(left_dir / "mixedcase.oir")
-                mixed_chunk.write_bytes(b"part-b")
+                mixed_chunk.write_bytes(b"part-b-longer")
                 case_after = snapshot_source(left_dir / "mixedcase.oir")
-                if (case_before.members != 2
-                        or case_before.revision == case_after.revision):
+                if case_before.members != 2:
                     raise AssertionError("Windows path case lost its continuation chunk")
+                if case_before.revision == case_after.revision:
+                    raise AssertionError("Windows case alias chunk change kept its revision")
 
             replacement = left_dir / "replacement.oir"
             replacement.write_bytes(b"main")
