@@ -41,11 +41,15 @@ if os.name == "nt":
     _CLOSE_HANDLE.argtypes = [wintypes.HANDLE]
     _CLOSE_HANDLE.restype = wintypes.BOOL
 
-    # FSCTL_READ_FILE_USN_DATA is FILE_ANY_ACCESS, so desired access can be
-    # zero.  Sharing only reads is deliberate: an already-open writer/delete
-    # handle makes CreateFileW fail, and this snapshot fails closed instead of
-    # accepting pixels while their source is still being mutated.
+    # A zero/attributes-only desired access is not governed by the data-sharing
+    # flags and therefore does not prove that an already-open writer is absent.
+    # Request real read access and share only reads: an existing or later
+    # writer/delete handle then makes CreateFileW fail, and the snapshot fails
+    # closed instead of accepting pixels while their source is being mutated.
+    _GENERIC_READ = 0x80000000
+    _GENERIC_WRITE = 0x40000000
     _FILE_SHARE_READ = 0x00000001
+    _FILE_SHARE_ALL = 0x00000001 | 0x00000002 | 0x00000004
     _OPEN_EXISTING = 3
     _FSCTL_READ_FILE_USN_DATA = 0x000900EB
     _INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
@@ -178,12 +182,13 @@ def _selftest_windows_usn_parser() -> None:
 
 
 def _open_windows_source_handle(path: Path):
-    """Open a metadata handle that refuses concurrent write/delete access."""
+    """Open a read handle that refuses concurrent write/delete access."""
     if os.name != "nt":
         raise RuntimeError("Windows source handle requested on a non-Windows host")
 
     handle = _CREATE_FILE_W(
-        os.fspath(path), 0, _FILE_SHARE_READ, None, _OPEN_EXISTING, 0, None,
+        os.fspath(path), _GENERIC_READ, _FILE_SHARE_READ,
+        None, _OPEN_EXISTING, 0, None,
     )
     if handle == _INVALID_HANDLE_VALUE:
         error = ctypes.get_last_error()
@@ -196,6 +201,31 @@ def _open_windows_source_handle(path: Path):
             )
         raise ctypes.WinError(error)
     return handle
+
+
+def _selftest_windows_writer_exclusion(path: Path) -> None:
+    """Prove the runtime handle refuses a real Win32 write-access handle."""
+    if os.name != "nt":
+        return
+
+    writer = _CREATE_FILE_W(
+        os.fspath(path), _GENERIC_WRITE, _FILE_SHARE_ALL,
+        None, _OPEN_EXISTING, 0, None,
+    )
+    if writer == _INVALID_HANDLE_VALUE:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        try:
+            _stat_record(path, path.name)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) != 32:
+                raise AssertionError(
+                    f"active writer returned unexpected Windows error: {exc}"
+                ) from exc
+        else:
+            raise AssertionError("Windows source snapshot accepted an active writer")
+    finally:
+        _CLOSE_HANDLE(writer)
 
 
 def _windows_file_usn(handle, path: Path) -> str:

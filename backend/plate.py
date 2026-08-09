@@ -25,7 +25,11 @@ from pathlib import Path
 
 import numpy as np
 
-from source_state import _selftest_windows_usn_parser, snapshot_source
+from source_state import (
+    _selftest_windows_usn_parser,
+    _selftest_windows_writer_exclusion,
+    snapshot_source,
+)
 
 MATL_NAMES = ("matl.omp2info", "matl_forVSIimages.omp2info")
 
@@ -1306,21 +1310,10 @@ def _selftest_source_state() -> int:
             if bracket_before.revision == bracket_after.revision:
                 raise AssertionError("bracketed OIR chunk change kept its revision")
             if os.name == "nt":
-                with open(bracket_chunk, "r+b") as active_writer:
-                    active_writer.seek(0)
-                    active_writer.write(b"part-c")
-                    active_writer.flush()
-                    try:
-                        snapshot_source(bracket)
-                    except OSError as exc:
-                        if getattr(exc, "winerror", None) != 32:
-                            raise AssertionError(
-                                f"active writer returned unexpected Windows error: {exc}"
-                            ) from exc
-                    else:
-                        raise AssertionError(
-                            "Windows source snapshot accepted an active writer"
-                        )
+                # Use CreateFileW in the helper rather than Python's ``open``:
+                # CRT share defaults are an implementation detail and do not
+                # pin the Win32 access/share combination this guard relies on.
+                _selftest_windows_writer_exclusion(bracket_chunk)
 
             if sys.platform == "darwin":
                 composed = left_dir / "caf\u00e9.oir"
