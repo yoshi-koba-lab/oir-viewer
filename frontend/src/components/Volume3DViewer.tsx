@@ -18,7 +18,9 @@ import {
 } from '../utils/scalebar';
 import { ScalebarOverlay } from './ScalebarOverlay';
 import { ScalebarSettings } from './ScalebarSettings';
-import { vertexShader, fragmentShader } from '../utils/volumeShader';
+import {
+  VOLUME_CAMERA_FOV_DEG, vertexShader, fragmentShader,
+} from '../utils/volumeShader';
 
 /** Vertex shader (GLSL3): pass position to fragment for ray-marching. */
 
@@ -229,7 +231,7 @@ export function Volume3DViewer() {
     const scene = new THREE.Scene();
     sceneRef.current = scene;
 
-    const camera = new THREE.PerspectiveCamera(50, 1, 0.01, 100);
+    const camera = new THREE.PerspectiveCamera(VOLUME_CAMERA_FOV_DEG, 1, 0.01, 100);
     cameraRef.current = camera;
 
     // Create shader material

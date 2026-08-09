@@ -11,11 +11,17 @@ import numpy as np
 from pathlib import Path
 from dataclasses import dataclass, field
 
+from source_state import snapshot_source
+
 
 @dataclass
 class ImageMetadata:
     filename: str = ""
     source_path: str = ""  # full path to original file
+    # Frozen when pixels are read. The UI must never reuse display settings for
+    # a same-named well whose physical file or split chunks differ.
+    source_identity: str = ""
+    source_revision: str = ""
     num_channels: int = 0
     num_z: int = 0
     num_t: int = 0
@@ -40,6 +46,8 @@ class ImageMetadata:
         return {
             "filename": self.filename,
             "source_path": self.source_path,
+            "source_identity": self.source_identity,
+            "source_revision": self.source_revision,
             "num_channels": self.num_channels,
             "num_z": self.num_z,
             "num_t": self.num_t,
@@ -316,6 +324,11 @@ class ImageReader:
         #: A restored session registers one of these per remembered file, so
         #: startup costs nothing regardless of how much was open last time.
         self.deferred_path: str | None = None
+        #: False only for the dimensions-only placeholder restored from the
+        #: session file. Pixel-budget eviction keeps the real metadata, so it
+        #: must not force a 4.25 GB well to be read again just to answer
+        #: /api/metadata.
+        self._metadata_authoritative = False
 
     @property
     def loaded_bytes(self) -> int:
@@ -328,6 +341,7 @@ class ImageReader:
         self.data = None
         self.deferred_path = path
         self.metadata = metadata
+        self._metadata_authoritative = False
 
     def unload(self) -> int:
         """Drop the pixels, keeping the file re-openable. Returns bytes freed.
@@ -364,9 +378,35 @@ class ImageReader:
             path = self.deferred_path
             if not path:
                 raise RuntimeError("No image loaded")
+            expected_identity = self.metadata.source_identity
+            expected_revision = self.metadata.source_revision
+            if expected_identity or expected_revision:
+                current = snapshot_source(path)
+                if ((expected_identity and current.identity != expected_identity)
+                        or (expected_revision and current.revision != expected_revision)):
+                    raise RuntimeError(
+                        "元画像または分割 OIR の続きが、前回の読み込み後に変更されました。"
+                        "このタブを閉じて、画像を開き直してください。"
+                    )
             self.load_file(path)
             # Only on success: from here the pixels are the source of truth.
             self.deferred_path = None
+
+    def ensure_metadata(self) -> bool:
+        """Make cached session metadata authoritative; return whether it loaded.
+
+        Current file readers discover rich metadata while opening the pixels,
+        so upgrading an old session placeholder necessarily loads that one
+        image. Once loaded, eviction may drop the pixels but deliberately keeps
+        this flag and the metadata: a later metadata request is then free.
+        """
+        with self._pixels_lock:
+            if self._metadata_authoritative:
+                return False
+            self.ensure_loaded()
+            if not self._metadata_authoritative:
+                raise RuntimeError("Image metadata did not finish loading")
+            return True
 
     def _pixels(self) -> np.ndarray:
         """The pixel array, loaded if need be — as a snapshot.
@@ -395,16 +435,29 @@ class ImageReader:
                 f"{p.name} は分割保存された .oir の続きのデータで、単体では開けません。\n"
                 f"同じフォルダの {base}.oir を開いてください（続きのファイルは自動的に読まれます）。"
             )
+        before = snapshot_source(p)
         if ext in (".oir", ".oib", ".oif", ".nd2", ".lif", ".czi"):
-            return self._load_bioformats(path)
+            metadata = self._load_bioformats(path)
         elif ext in (".tif", ".tiff"):
-            return self._load_tiff(path)
+            metadata = self._load_tiff(path)
         else:
             # Try tifffile first, fall back to bioformats
             try:
-                return self._load_tiff(path)
+                metadata = self._load_tiff(path)
             except Exception:
-                return self._load_bioformats(path)
+                metadata = self._load_bioformats(path)
+
+        after = snapshot_source(p)
+        if before.identity != after.identity or before.revision != after.revision:
+            self.data = None
+            raise RuntimeError(
+                "画像または分割 OIR の続きが読み込み中に変更されました。"
+                "不完全な画素は使用していません。もう一度開いてください。"
+            )
+        metadata.source_identity = after.identity
+        metadata.source_revision = after.revision
+        self._metadata_authoritative = True
+        return metadata
 
     # Keep old name as alias
     def load_oir(self, path: str) -> ImageMetadata:
@@ -725,6 +778,7 @@ class ImageReader:
             channel_colors=[],  # dummy: no embedded colors
             bit_depth=16,
         )
+        self._metadata_authoritative = True
         return self.metadata
 
     def get_slice(self, c: int, z: int, t: int) -> np.ndarray:
@@ -873,13 +927,11 @@ def _detect_incomplete_oir(reader_j, path: str) -> str:
         if declared_z <= actual_z:
             return ""
 
-        # Distinguish "chunks are missing" from an odd-but-complete acquisition.
+        # Any declared/exposed mismatch is incomplete. A partly copied dataset
+        # often has `_00001` present but is still missing later chunks; accepting
+        # the first companion was the exact route to a plausible shallow stack.
         base = path[:-4] if path.lower().endswith(".oir") else path
-        first_chunk = f"{base}_00001"
         found = len([u for u in reader_j.getUsedFiles()])
-        if os.path.exists(first_chunk):
-            return ""  # companions are present; the reader is using them
-
         return (
             f"このファイルは分割保存された .oir の一部だけです（Zスライス {actual_z}/{declared_z} のみ読み込み、"
             f"参照できたファイル {found} 個）。同じフォルダにある "

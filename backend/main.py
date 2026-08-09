@@ -6,9 +6,13 @@ import sys
 import os
 import tempfile
 import threading
+import shutil
+import hashlib
 import base64
 import traceback
 import uuid
+import unicodedata
+from collections.abc import Callable
 
 
 def _force_utf8_stdio() -> None:
@@ -50,6 +54,7 @@ from pydantic import BaseModel
 from reader import (
     ImageMetadata, ImageReader, describe_runtime, prewarm_jvm as _prewarm_jvm, selftest,
 )
+from source_state import snapshot_source
 from processor import (
     adjust_contrast, auto_contrast, auto_contrast_from_counts, compute_histogram,
     to_png_bytes,
@@ -73,17 +78,25 @@ def _save_session() -> None:
     tmp_path = ""
     try:
         os.makedirs(APP_DIR, exist_ok=True)
+        # The API can open or close another image while an export registers its
+        # results. Freeze the metadata references before doing filesystem I/O;
+        # iterating the live dictionary here can otherwise fail after the files
+        # have already been published.
+        with _state_lock:
+            metadata = [reader.metadata for reader in images.values()]
         # Dimensions travel with the path so the next startup can show the tabs
         # without opening anything.
         entries = [
             {
-                "source_path": r.metadata.source_path, "filename": r.metadata.filename,
-                "num_channels": r.metadata.num_channels, "num_z": r.metadata.num_z,
-                "num_t": r.metadata.num_t,
-                "width": r.metadata.width, "height": r.metadata.height,
+                "source_path": meta.source_path, "filename": meta.filename,
+                "source_identity": meta.source_identity,
+                "source_revision": meta.source_revision,
+                "num_channels": meta.num_channels, "num_z": meta.num_z,
+                "num_t": meta.num_t,
+                "width": meta.width, "height": meta.height,
             }
-            for r in images.values()
-            if r.metadata.source_path and os.path.exists(r.metadata.source_path)
+            for meta in metadata
+            if meta.source_path and os.path.exists(meta.source_path)
         ]
         # Write-then-rename: truncating session.json in place leaves a corrupt file
         # if the write is interrupted, which then kills the next restore.
@@ -95,12 +108,13 @@ def _save_session() -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, SESSION_FILE)
-    except OSError:
+    except Exception as e:
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
+        print(f"Session save skipped: {type(e).__name__}: {e}", flush=True)
 
 
 def _restore_session() -> int:
@@ -139,9 +153,18 @@ def _restore_session() -> int:
         if not path or not os.path.exists(path):
             continue
         try:
+            current_source = snapshot_source(path)
+            saved_identity = str(entry.get("source_identity") or "")
+            saved_revision = str(entry.get("source_revision") or "")
+            if ((saved_identity and saved_identity != current_source.identity)
+                    or (saved_revision and saved_revision != current_source.revision)):
+                print(f"Session restore skipped changed source: {path}")
+                continue
             meta = ImageMetadata(
                 filename=entry.get("filename") or os.path.basename(path),
                 source_path=path,
+                source_identity=current_source.identity,
+                source_revision=current_source.revision,
                 num_channels=int(entry.get("num_channels") or 1),
                 num_z=int(entry.get("num_z") or 1),
                 num_t=int(entry.get("num_t") or 1),
@@ -167,49 +190,129 @@ def _selftest_session() -> int:
     holds one small file — the size of the failure is a property of the user's
     data, not of the code — so it is checked here rather than by trying it.
     """
-    global images, active_id
+    global images, active_id, _lru, IMAGE_BUDGET_BYTES
+    global APP_DIR, UPLOADS_DIR, SESSION_FILE
+    import asyncio
     import json
     import tempfile
 
-    saved_images, saved_active, saved_file = images, active_id, SESSION_FILE
+    saved_images, saved_active, saved_lru = images, active_id, _lru
+    saved_budget = IMAGE_BUDGET_BYTES
+    saved_app_dir, saved_uploads, saved_file = APP_DIR, UPLOADS_DIR, SESSION_FILE
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            # A path that exists and could be opened, so restore has no excuse
-            # to skip it: the point is that it declines to read it anyway.
-            target = os.path.join(tmp, "well.tif")
+            # Paths that exist and could be opened, so restore has no excuse to
+            # skip them: the point is that it declines to read either one until
+            # its authoritative metadata is requested.
+            targets = [os.path.join(tmp, f"well-{i}.ome.tif") for i in range(2)]
             import tifffile
-            tifffile.imwrite(target, np.zeros((4, 32, 32), dtype=np.uint16))
-            globals()["SESSION_FILE"] = os.path.join(tmp, "session.json")
+            for i, target in enumerate(targets):
+                tifffile.imwrite(
+                    target,
+                    np.full((4, 32, 32), i, dtype=np.uint16),
+                    ome=True,
+                    metadata={
+                        "axes": "ZYX",
+                        "PhysicalSizeX": 0.5 + i * 0.1,
+                        "PhysicalSizeY": 0.6 + i * 0.1,
+                        "PhysicalSizeZ": 2.7 + i * 0.1,
+                    },
+                )
+            APP_DIR = os.path.join(tmp, "app")
+            UPLOADS_DIR = os.path.join(APP_DIR, "uploads")
+            SESSION_FILE = os.path.join(APP_DIR, "session.json")
+            os.makedirs(UPLOADS_DIR)
             with open(SESSION_FILE, "w") as f:
-                json.dump({"images": [{
-                    "source_path": target, "filename": "well.tif",
-                    "num_channels": 1, "num_z": 4, "num_t": 1,
-                    "width": 32, "height": 32,
-                }]}, f)
-            images, active_id = {}, None
+                json.dump({"images": [
+                    {
+                        "source_path": target,
+                        "filename": os.path.basename(target),
+                        "num_channels": 1, "num_z": 4, "num_t": 1,
+                        "width": 32, "height": 32,
+                    }
+                    for target in targets
+                ]}, f)
+            images, active_id, _lru = {}, None, []
+            # Exactly one of these small test images. Loading the second through
+            # /api/metadata must evict the first under the ordinary pixel budget.
+            IMAGE_BUDGET_BYTES = 4 * 32 * 32 * np.dtype(np.uint16).itemsize
             n = _restore_session()
-            resident = sum(r.loaded_bytes for r in images.values())
+            resident_before = sum(r.loaded_bytes for r in images.values())
             listed = [r.metadata.num_z for r in images.values()]
+            api_list = asyncio.run(list_images())
+            ids = list(images)
+            # Make the placeholder visibly different from the file, including a
+            # scalar field, so this catches returning a dimensions-only cache.
+            for reader in images.values():
+                reader.metadata.bit_depth = 1
+
+            first_meta = get_metadata(ids[0])
+            resident_after_first = [images[i].loaded_bytes for i in ids]
+            second_meta = get_metadata(ids[1])
+            resident_after_second = [images[i].loaded_bytes for i in ids]
+
+            # The first reader now has no pixels but still owns real metadata.
+            # Asking for it again must not re-read it or disturb the resident
+            # second reader merely to answer channel names and physical sizes.
+            repeated_first = get_metadata(ids[0])
+            resident_after_repeat = [images[i].loaded_bytes for i in ids]
     except Exception as e:
         print(f"selftest FAILED: session restore -> {type(e).__name__}: {e}", flush=True)
         return 20
     finally:
-        images, active_id = saved_images, saved_active
-        globals()["SESSION_FILE"] = saved_file
+        images, active_id, _lru = saved_images, saved_active, saved_lru
+        IMAGE_BUDGET_BYTES = saved_budget
+        APP_DIR, UPLOADS_DIR, SESSION_FILE = saved_app_dir, saved_uploads, saved_file
 
-    if n != 1:
-        print(f"selftest FAILED: restored {n} images, expected 1", flush=True)
+    if n != 2:
+        print(f"selftest FAILED: restored {n} images, expected 2", flush=True)
         return 21
-    if resident:
-        print(f"selftest FAILED: restore read {resident} bytes of pixels; "
+    if resident_before:
+        print(f"selftest FAILED: restore read {resident_before} bytes of pixels; "
               "startup must not decode last session's files", flush=True)
         return 22
-    if listed != [4]:
+    if listed != [4, 4]:
         print(f"selftest FAILED: restored tab lost its dimensions ({listed})", flush=True)
         return 23
+    if (len(api_list) != 2 or any(
+            item.get("width") != 32 or item.get("height") != 32
+            for item in api_list)):
+        print(f"selftest FAILED: /api/images lost restored dimensions ({api_list})",
+              flush=True)
+        return 23
+    if (not isinstance(first_meta, dict) or first_meta.get("channel_names") != ["Ch0"]
+            or not np.isclose(first_meta.get("pixel_size_x", 0), 0.5)
+            or not np.isclose(first_meta.get("pixel_size_y", 0), 0.6)
+            or not np.isclose(first_meta.get("pixel_size_z", 0), 2.7)
+            or first_meta.get("bit_depth") != 16):
+        print(f"selftest FAILED: /api/metadata returned cached placeholder ({first_meta})",
+              flush=True)
+        return 24
+    if (not isinstance(second_meta, dict) or second_meta.get("channel_names") != ["Ch0"]
+            or not np.isclose(second_meta.get("pixel_size_x", 0), 0.6)
+            or not np.isclose(second_meta.get("pixel_size_y", 0), 0.7)
+            or not np.isclose(second_meta.get("pixel_size_z", 0), 2.8)
+            or second_meta.get("bit_depth") != 16):
+        print(f"selftest FAILED: second metadata upgrade was wrong ({second_meta})",
+              flush=True)
+        return 24
+    one_image = 4 * 32 * 32 * np.dtype(np.uint16).itemsize
+    if (resident_after_first != [one_image, 0]
+            or resident_after_second != [0, one_image]
+            or resident_after_repeat != resident_after_second):
+        print("selftest FAILED: metadata upgrade bypassed the pixel budget "
+              f"({resident_after_first}, {resident_after_second}, "
+              f"{resident_after_repeat})", flush=True)
+        return 25
+    if (not isinstance(repeated_first, dict)
+            or not np.isclose(repeated_first.get("pixel_size_z", 0), 2.7)):
+        print(f"selftest FAILED: evicted reader lost authoritative metadata "
+              f"({repeated_first})", flush=True)
+        return 24
     print(f"selftest: session restore OK (0 pixel bytes, budget "
-          f"{IMAGE_BUDGET_BYTES / 1024 ** 3:.1f} GB)", flush=True)
-    return 0
+          f"{IMAGE_BUDGET_BYTES / 1024 ** 3:.1f} GB; metadata upgraded one at a time)",
+          flush=True)
+    return _selftest_export_targets()
 
 
 @asynccontextmanager
@@ -362,17 +465,23 @@ def add_image(reader: ImageReader) -> str:
 @app.get("/api/images")
 async def list_images():
     """List all loaded images."""
+    with _state_lock:
+        snapshot = [(img_id, reader.metadata) for img_id, reader in images.items()]
+        snapshot_active = active_id
     result = []
-    for img_id, r in images.items():
+    for img_id, meta in snapshot:
         result.append({
             "id": img_id,
-            "filename": r.metadata.filename,
-            "num_channels": r.metadata.num_channels,
-            "num_z": r.metadata.num_z,
-            "num_t": r.metadata.num_t,
-            "width": r.metadata.width,
-            "height": r.metadata.height,
-            "active": img_id == active_id,
+            "filename": meta.filename,
+            "source_path": meta.source_path,
+            "source_identity": meta.source_identity,
+            "source_revision": meta.source_revision,
+            "num_channels": meta.num_channels,
+            "num_z": meta.num_z,
+            "num_t": meta.num_t,
+            "width": meta.width,
+            "height": meta.height,
+            "active": img_id == snapshot_active,
         })
     return result
 
@@ -437,7 +546,12 @@ def _describe(e: BaseException) -> str:
 @app.get("/api/open")
 def open_file(path: str = Query(...)):
     """Open an image file by path."""
+    locks = _locks_for_targets([path])
+    for lock in locks:
+        lock.acquire()
+    process_locks: list[object] = []
     try:
+        process_locks = _acquire_process_target_locks([path])
         print(f"Opening {path}", flush=True)
         r = ImageReader()
         r.load_file(path)
@@ -449,6 +563,10 @@ def open_file(path: str = Query(...)):
         # log file so the cause is recoverable without reproducing it.
         traceback.print_exc()
         return JSONResponse(status_code=400, content={"error": _describe(e)})
+    finally:
+        _release_process_target_locks(process_locks)
+        for lock in reversed(locks):
+            lock.release()
 
 
 def _safe_upload_name(raw: str | None) -> str:
@@ -483,27 +601,57 @@ async def upload_file(file: UploadFile = File(...)):
         if not os.path.realpath(dest).startswith(uploads_root + os.sep):
             raise RuntimeError("Invalid upload filename")
 
-        with open(dest, "wb") as out:
-            out.write(content)
+        locks = _locks_for_targets([dest])
+        for lock in locks:
+            lock.acquire()
+        process_locks: list[object] = []
+        try:
+            process_locks = _acquire_process_target_locks([dest])
+            with open(dest, "wb") as out:
+                out.write(content)
 
-        r = ImageReader()
-        r.load_file(dest)
-        r.metadata.filename = base
-        img_id = add_image(r)
-        return {**r.metadata.to_dict(), "id": img_id}
+            r = ImageReader()
+            r.load_file(dest)
+            r.metadata.filename = base
+            img_id = add_image(r)
+            return {**r.metadata.to_dict(), "id": img_id}
+        finally:
+            _release_process_target_locks(process_locks)
+            for lock in reversed(locks):
+                lock.release()
     except Exception as e:
         traceback.print_exc()
         return JSONResponse(status_code=400, content={"error": _describe(e)})
 
 
 @app.get("/api/metadata")
-async def get_metadata(id: str | None = Query(None)):
-    """Get current image metadata."""
+def get_metadata(id: str | None = Query(None)):
+    """Get authoritative metadata, upgrading one restored placeholder first.
+
+    A session restore deliberately reads zero pixels and therefore only knows
+    dimensions. Returning that placeholder made the frontend keep Ch0 labels,
+    zero pixel sizes and the default bit depth even after a later volume load
+    replaced the reader's metadata. This endpoint is the ordering boundary:
+    the frontend receives the real metadata before it can request/display a
+    slice or 3D volume. It is synchronous so a large well is read in FastAPI's
+    worker pool rather than blocking the event loop.
+    """
     try:
-        r = get_reader(id)
-        return {**r.metadata.to_dict(), "id": id or active_id}
+        image_id = id or active_id
+        r = get_reader(image_id)
+        upgraded = r.ensure_metadata()
+        # An old placeholder currently has to open the image to discover its
+        # rich metadata. Admit exactly this image, then evict older pixels under
+        # the same budget used by activate/slice/volume paths.
+        _enforce_budget(keep=image_id)
+        if upgraded:
+            # Dimensions in an old session are a cache too. Persist the values
+            # the reader just established so even the lightweight tab list is
+            # corrected on the next launch.
+            _save_session()
+        return {**r.metadata.to_dict(), "id": image_id}
     except Exception as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
+        return JSONResponse(status_code=400, content={"error": _describe(e)})
 
 
 @app.get("/api/image")
@@ -1045,6 +1193,9 @@ def choose_files():
         return JSONResponse(status_code=400, content={"error": str(e)})
 
 
+_PROJ_LABEL = {"max": "MaxProj", "min": "MinProj", "avg": "AvgProj"}
+
+
 class ProjectionRequest(BaseModel):
     image_ids: list[str]
     method: str = "max"        # "max" | "min" | "avg"
@@ -1052,26 +1203,571 @@ class ProjectionRequest(BaseModel):
     z_to: int = -1             # 0-based inclusive, -1 = last slice
     t: int = 0                 # time point to project
     output_dir: str = ""       # explicit output folder; falls back to source dir or ~/Desktop
+    #: File to write, without extension. Honoured only for one image; a batch
+    #: keeps each source name so several images cannot collapse onto one file.
+    filename: str = ""
+    #: Replace a file that is already there. The source image itself is never a
+    #: legal target, even with this set.
+    overwrite: bool = False
+    #: Identity of each file the user actually approved replacing. A bare
+    #: overwrite flag is not enough when rendering can take minutes.
+    expected_revisions: dict[str, str] = {}
 
 
-def _next_suffix_path(base_dir: str, stem: str, ext: str = ".ome.tif") -> str:
-    """Find the next available _XX suffix for a projection file."""
-    idx = 1
-    while True:
-        name = f"{stem}_{idx:02d}{ext}"
-        fpath = os.path.join(base_dir, name)
-        if not os.path.exists(fpath):
-            return fpath
-        idx += 1
+def _image_stem(name: str) -> str:
+    """A plain image stem, treating `.ome.tif` as one extension."""
+    base = os.path.basename(name.strip())
+    lower = base.lower()
+    for ext in (".ome.tiff", ".ome.tif"):
+        if lower.endswith(ext):
+            return base[:-len(ext)]
+    return os.path.splitext(base)[0]
+
+
+def _projection_request_stem(name: str) -> str:
+    """Projection name typed by the user, optionally ending in `.ome.tif`."""
+    base = name.strip()
+    lower = base.lower()
+    for ext in (".ome.tiff", ".ome.tif"):
+        if lower.endswith(ext):
+            base = base[:-len(ext)]
+            break
+    # This value is already a stem by API contract. Generic splitext would turn
+    # the UI preview `sample.v2.ome.tif` into the unrelated `sample.ome.tif`.
+    return _validated_export_stem(base)
+
+
+def _validated_export_stem(name: str) -> str:
+    """Accept one literal user-entered stem or fail instead of renaming it."""
+    stem = name.strip()
+    if not stem:
+        raise ValueError("ファイル名が空です。")
+    if any(ch in _ILLEGAL_NAME_CHARS for ch in stem):
+        raise ValueError('ファイル名に使えない文字が含まれています。')
+    if stem.endswith((".", " ")):
+        raise ValueError('ファイル名の末尾に「.」や空白は使えません。')
+    if len(stem) > 180 or len(stem.encode("utf-8")) > 200:
+        raise ValueError('ファイル名が長すぎます（180文字・UTF-8で200バイト以内）。')
+    first = stem.split(".", 1)[0].upper()
+    if re.fullmatch(r"CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]", first):
+        raise ValueError(f"{first} は Windows で予約された名前です。")
+    return stem
+
+
+def _path_key(path: str) -> str:
+    """Conservative key for paths that must never name the same file."""
+    exact = os.path.realpath(os.path.abspath(path))
+    # HFS+/APFS can expose one directory entry through composed and decomposed
+    # Unicode spellings. Treating those as separate planned exports lets the
+    # second item overwrite the first without a conflict.
+    return unicodedata.normalize("NFC", exact).casefold()
+
+
+def _file_revision(path: str | Path) -> str | None:
+    """Cheap identity token for detecting a changed replacement target."""
+    try:
+        lst = os.lstat(path)
+    except OSError:
+        return None
+    link = (f"{lst.st_dev}:{lst.st_ino}:{lst.st_mode}:{lst.st_size}:"
+            f"{lst.st_mtime_ns}:{lst.st_ctime_ns}")
+    try:
+        st = os.stat(path)
+        followed = (f"{st.st_dev}:{st.st_ino}:{st.st_mode}:{st.st_size}:"
+                    f"{st.st_mtime_ns}:{st.st_ctime_ns}")
+    except OSError:
+        followed = "broken"
+    return f"v2:{link}:{followed}"
+
+
+def _target_path_digest(path: str | Path) -> str:
+    """Bind an approval token to one exact destination, not just its folder."""
+    exact = os.path.realpath(os.path.abspath(str(path)))
+    if sys.platform == "darwin":
+        exact = unicodedata.normalize("NFC", exact)
+    if os.name == "nt":
+        exact = os.path.normcase(exact)
+    return hashlib.sha256(exact.encode("utf-8")).hexdigest()
+
+
+def _target_parent_identity(path: str | Path) -> str:
+    parent = os.path.dirname(os.path.abspath(str(path))) or os.curdir
+    try:
+        st = os.stat(parent)
+        if not os.path.isdir(parent):
+            return "invalid"
+    except OSError:
+        return "invalid"
+    if os.name == "nt":
+        # st_ino is frequently zero on Windows/FAT/network filesystems. Hold a
+        # real directory handle long enough to obtain the volume serial and file
+        # index that distinguish a replacement drive mounted at the same letter.
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _ByHandleFileInformation(ctypes.Structure):
+                _fields_ = [
+                    ("dwFileAttributes", wintypes.DWORD),
+                    ("ftCreationTime", wintypes.FILETIME),
+                    ("ftLastAccessTime", wintypes.FILETIME),
+                    ("ftLastWriteTime", wintypes.FILETIME),
+                    ("dwVolumeSerialNumber", wintypes.DWORD),
+                    ("nFileSizeHigh", wintypes.DWORD),
+                    ("nFileSizeLow", wintypes.DWORD),
+                    ("nNumberOfLinks", wintypes.DWORD),
+                    ("nFileIndexHigh", wintypes.DWORD),
+                    ("nFileIndexLow", wintypes.DWORD),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            create = kernel32.CreateFileW
+            create.argtypes = [
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+            ]
+            create.restype = wintypes.HANDLE
+            get_info = kernel32.GetFileInformationByHandle
+            get_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ByHandleFileInformation)]
+            get_info.restype = wintypes.BOOL
+            close = kernel32.CloseHandle
+            close.argtypes = [wintypes.HANDLE]
+            close.restype = wintypes.BOOL
+
+            handle = create(
+                parent, 0, 0x00000001 | 0x00000002 | 0x00000004,
+                None, 3, 0x02000000, None,
+            )
+            invalid_handle = ctypes.c_void_p(-1).value
+            if handle in (None, invalid_handle):
+                return "invalid"
+            try:
+                info = _ByHandleFileInformation()
+                if not get_info(handle, ctypes.byref(info)):
+                    return "invalid"
+                file_index = (int(info.nFileIndexHigh) << 32) | int(info.nFileIndexLow)
+                if not info.dwVolumeSerialNumber and not file_index:
+                    return "invalid"
+                return f"win-{int(info.dwVolumeSerialNumber):08x}-{file_index:016x}"
+            finally:
+                close(handle)
+        except Exception:
+            return "invalid"
+    if not st.st_ino:
+        return "invalid"
+    return f"{st.st_dev}-{st.st_ino}"
+
+
+def _target_state(path: str | Path) -> str:
+    """Path-bound file state including the destination filesystem identity."""
+    path_digest = _target_path_digest(path)
+    parent = _target_parent_identity(path)
+    if parent == "invalid":
+        return f"target:v3:{path_digest}:invalid:invalid"
+    revision = _file_revision(path)
+    if revision is not None:
+        return f"target:v3:{path_digest}:{parent}:file:{revision}"
+    # Do not include directory times: creating our same-directory stage changes
+    # them. Device + inode still detects an unmounted/replaced external drive.
+    return f"target:v3:{path_digest}:{parent}:missing"
+
+
+def _target_state_parts(state: str) -> tuple[str, str, str]:
+    parts = state.split(":", 5)
+    if len(parts) < 5 or parts[0:2] != ["target", "v3"]:
+        return "", "", "invalid"
+    return parts[2], parts[3], parts[4]
+
+
+def _require_stable_target_parent(path: str | Path) -> None:
+    if _target_state_parts(_target_state(path))[2] == "invalid":
+        raise ValueError(
+            f"保存先の同一性を確認できません: {os.path.dirname(os.path.abspath(str(path)))}。"
+            "外付けドライブを確認し、保存先を選び直してください。"
+        )
+
+
+_export_locks_guard = threading.Lock()
+_export_locks: dict[str, threading.Lock] = {}
+
+
+def _locks_for_targets(paths: list[str | Path]) -> list[threading.Lock]:
+    """Stable per-target locks, ordered so a batch cannot deadlock another."""
+    keys = sorted({_path_key(str(p)) for p in paths})
+    with _export_locks_guard:
+        return [_export_locks.setdefault(key, threading.Lock()) for key in keys]
+
+
+def _acquire_process_target_locks(paths: list[str | Path]) -> list[object]:
+    """Cross-process commit locks shared by packaged and source backends."""
+    lock_dir = os.path.join(APP_DIR, "export-locks")
+    os.makedirs(lock_dir, exist_ok=True)
+    handles: list[object] = []
+    try:
+        for key in sorted({_path_key(str(path)) for path in paths}):
+            digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+            handle = open(os.path.join(lock_dir, f"{digest}.lock"), "a+b")
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                deadline = time.monotonic() + 30
+                while True:
+                    handle.seek(0)
+                    try:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("保存先が別の処理で使用中です。")
+                        time.sleep(0.02)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            handles.append(handle)
+        return handles
+    except Exception:
+        _release_process_target_locks(handles)
+        raise
+
+
+def _release_process_target_locks(handles: list[object]) -> None:
+    for handle in reversed(handles):
+        try:
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def _target_write_conflicts(
+    paths: list[str | Path],
+    overwrite: bool,
+    expected_revisions: dict[str, str],
+) -> list[str]:
+    """Targets that appeared, vanished, or changed since user confirmation."""
+    conflicts: list[str] = []
+    for raw in paths:
+        path = os.path.abspath(str(raw))
+        current = _target_state(path)
+        expected = expected_revisions.get(path, "")
+        _digest, _parent, current_kind = _target_state_parts(current)
+        if overwrite:
+            # Approval is target-specific. `overwrite=True` by itself is never
+            # authority to replace a file or to create another batch member.
+            if not expected or current != expected:
+                conflicts.append(path)
+        elif current_kind == "file" or (expected and current != expected):
+            # A normal create never overwrites, even if a caller happens to send
+            # the correct revision. This keeps the boolean contract meaningful.
+            conflicts.append(path)
+    return conflicts
+
+
+def _targets_with_changed_parent(
+    paths: list[str | Path], expected_revisions: dict[str, str],
+) -> list[str]:
+    """Destinations whose selected filesystem disappeared or was replaced."""
+    changed: list[str] = []
+    for raw in paths:
+        path = os.path.abspath(str(raw))
+        expected = expected_revisions.get(path, "")
+        if not expected:
+            continue
+        expected_path, expected_parent, _ekind = _target_state_parts(expected)
+        current_path, current_parent, _ckind = _target_state_parts(_target_state(path))
+        if (not expected_parent or current_parent != expected_parent
+                or not expected_path or current_path != expected_path):
+            changed.append(path)
+    return changed
+
+
+def _changed_parent_response(paths: list[str]) -> JSONResponse:
+    names = ", ".join(os.path.basename(path) for path in paths[:3])
+    return JSONResponse(status_code=409, content={
+        "conflict": False,
+        "error": (f"保存先のドライブまたはフォルダが途中で変わりました: {names}。"
+                  "別の場所への誤保存を防ぐため、保存先を選び直してください。"),
+    })
+
+
+def _confirmed_targets_missing(
+    paths: list[str | Path], expected_revisions: dict[str, str],
+) -> list[str]:
+    """Approved existing targets that disappeared before publication."""
+    return [
+        os.path.abspath(str(path))
+        for path in paths
+        if _target_state_parts(
+            expected_revisions.get(os.path.abspath(str(path)), "")
+        )[2] == "file"
+        and _target_state_parts(_target_state(path))[2] != "file"
+    ]
+
+
+def _missing_target_response(paths: list[str]) -> JSONResponse:
+    names = ", ".join(os.path.basename(path) for path in paths[:3])
+    return JSONResponse(status_code=409, content={
+        "conflict": False,
+        "error": (f"上書きを確認したファイルがなくなりました: {names}。"
+                  "保存先を確認して、通常の作成からやり直してください。"),
+    })
+
+
+def _same_existing_file(a: str | Path, b: str | Path) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def _projection_source_conflicts(targets: list[str]) -> list[str]:
+    """Projection targets that alias any source in an open tab."""
+    with _state_lock:
+        sources = [
+            r.metadata.source_path for r in images.values()
+            if r.metadata.source_path
+        ]
+    out: list[str] = []
+    for target in targets:
+        if any(
+            _path_key(target) == _path_key(source)
+            or _same_existing_file(target, source)
+            for source in sources
+        ):
+            out.append(target)
+    return out
+
+
+def _unload_other_projection_sources(keep_id: str) -> None:
+    """Keep at most the source currently being projected resident."""
+    with _state_lock:
+        readers = [(image_id, reader) for image_id, reader in images.items()]
+    for image_id, reader in readers:
+        if image_id != keep_id:
+            reader.unload()
+
+
+def _fsync_file(path: str | Path) -> None:
+    """Flush a completed staged file before publishing its directory entry."""
+    with open(path, "rb") as f:
+        os.fsync(f.fileno())
+
+
+class _TargetChangedDuringPublish(Exception):
+    def __init__(self, paths: list[str]):
+        super().__init__("export targets changed before publication")
+        self.paths = paths
+
+
+class _TargetParentChangedDuringPublish(_TargetChangedDuringPublish):
+    """The selected destination filesystem changed while backups were copied."""
+
+
+def _publish_staged_files(
+    staged_paths: list[str], targets: list[str], overwrite: bool,
+    expected_revisions: dict[str, str],
+    pre_publish: Callable[[], None] | None = None,
+) -> None:
+    """Publish a validated batch, rolling earlier names back on later failure."""
+    if len(staged_paths) != len(targets):
+        raise ValueError("投影の一時ファイル数が保存先数と一致しません。")
+    if len(targets) == 1:
+        changed_parent = _targets_with_changed_parent(targets, expected_revisions)
+        if changed_parent:
+            raise _TargetParentChangedDuringPublish(changed_parent)
+        clash = _target_write_conflicts(targets, overwrite, expected_revisions)
+        if clash:
+            raise _TargetChangedDuringPublish(clash)
+        if pre_publish:
+            pre_publish()
+        os.replace(staged_paths[0], targets[0])
+        return
+
+    backups: dict[str, str | None] = {}
+    published: list[str] = []
+    recovery_backups: set[str] = set()
+    try:
+        # Preserve every old directory entry before changing the first target.
+        # Do not hardlink: creating one changes the source inode's ctime, which
+        # would invalidate the very revision token checked immediately below.
+        for target in targets:
+            if not os.path.lexists(target):
+                backups[target] = None
+                continue
+            fd, backup = tempfile.mkstemp(
+                dir=os.path.dirname(target),
+                prefix=".oirrollback-", suffix=".bak",
+            )
+            os.close(fd)
+            os.unlink(backup)
+            # Register before copy2: a full drive or disconnect can leave a large
+            # partial backup, and finally must still know to remove it.
+            backups[target] = backup
+            shutil.copy2(target, backup, follow_symlinks=False)
+
+        # A fallback copy on a filesystem without hardlinks may itself take
+        # seconds. Revalidate after all backups, at the last point before the
+        # first public name changes.
+        changed_parent = _targets_with_changed_parent(targets, expected_revisions)
+        if changed_parent:
+            raise _TargetParentChangedDuringPublish(changed_parent)
+        clash = _target_write_conflicts(targets, overwrite, expected_revisions)
+        if clash:
+            raise _TargetChangedDuringPublish(clash)
+        # Backups can take seconds on filesystems without hardlinks. Revalidate
+        # sources and open-tab aliases at the actual publication boundary too.
+        if pre_publish:
+            pre_publish()
+
+        try:
+            for staged, target in zip(staged_paths, targets):
+                os.replace(staged, target)
+                published.append(target)
+        except Exception as publish_error:
+            rollback_errors: list[str] = []
+            for target in reversed(published):
+                backup = backups[target]
+                try:
+                    if backup is None:
+                        if os.path.lexists(target):
+                            os.unlink(target)
+                    else:
+                        os.replace(backup, target)
+                        backups[target] = None
+                except OSError as e:
+                    if backup:
+                        recovery_backups.add(backup)
+                    rollback_errors.append(
+                        f"{os.path.basename(target)}: {e}"
+                        + (f" (recovery: {backup})" if backup else "")
+                    )
+            if rollback_errors:
+                raise RuntimeError(
+                    "投影の公開と旧版への復元に失敗しました: "
+                    + "; ".join(rollback_errors)
+                ) from publish_error
+            raise
+    finally:
+        for backup in backups.values():
+            if backup and backup not in recovery_backups and os.path.lexists(backup):
+                try:
+                    os.unlink(backup)
+                except OSError:
+                    pass
+
+
+def _projection_output_dir(req: ProjectionRequest, meta: ImageMetadata) -> str:
+    if req.output_dir:
+        out_dir = os.path.abspath(os.path.expanduser(req.output_dir))
+    elif (meta.source_path
+            and not meta.source_path.startswith(("/tmp", "/var", "/private/var", "/private/tmp"))):
+        out_dir = os.path.dirname(meta.source_path)
+    else:
+        out_dir = os.path.expanduser("~/Desktop")
+    if not os.path.isdir(out_dir):
+        raise ValueError(
+            f"保存先が見つかりません: {out_dir}。"
+            "外付けドライブを確認し、保存先を選び直してください。"
+        )
+    return out_dir
+
+
+def _projection_target(req: ProjectionRequest, meta: ImageMetadata, batch: bool) -> str:
+    """Resolve the exact projection path without reading a pixel."""
+    if req.filename.strip() and not batch:
+        raw_stem = _projection_request_stem(req.filename)
+    else:
+        raw_stem = f"{_image_stem(meta.filename)}_{_PROJ_LABEL[req.method]}"
+    stem = _validated_export_stem(_safe_name_part(raw_stem) or "projection")
+    target = os.path.join(_projection_output_dir(req, meta), f"{stem}.ome.tif")
+    _require_stable_target_parent(target)
+    return target
+
+
+def _projection_runtime_plan(
+    reader: ImageReader,
+    req: ProjectionRequest,
+    planned_target: str,
+    batch: bool,
+) -> tuple[ImageMetadata, int, int, int]:
+    """Load a deferred reader, then derive ranges from its authoritative metadata."""
+    cached = reader.metadata
+    _assert_projection_source_unchanged(cached)
+    reader.ensure_loaded()
+    meta = reader.metadata
+    _assert_projection_source_unchanged(meta)
+    if meta.warning:
+        raise ValueError(
+            f"{meta.filename}: {meta.warning}\n"
+            "不完全な Z スタックは投影していません。"
+        )
+
+    # Session metadata is intentionally only a lightweight cache. If the source
+    # changed on disk, never redirect an already-approved save to a different
+    # name or folder; report it and let a retry plan the now-current target.
+    current_target = _projection_target(req, meta, batch)
+    if _path_key(current_target) != _path_key(planned_target):
+        raise ValueError(
+            "画像情報が読み込み時に更新され、投影の保存先が変わりました。もう一度実行してください。"
+        )
+    if meta.source_path and _path_key(planned_target) == _path_key(meta.source_path):
+        raise ValueError(
+            "投影の保存先を元画像と同じファイルにはできません。別の名前を指定してください。"
+        )
+
+    if meta.num_z < 1 or meta.num_t < 1:
+        raise ValueError(f"画像の Z/T 次元が不正です: {meta.filename}")
+    z_to = req.z_to if req.z_to >= 0 else meta.num_z - 1
+    if req.z_from < 0 or req.z_from >= meta.num_z or z_to < req.z_from or z_to >= meta.num_z:
+        raise ValueError(
+            f"指定した Z 範囲は {meta.filename} の 1–{meta.num_z} を超えています。"
+        )
+    if req.t < 0 or req.t >= meta.num_t:
+        raise ValueError(
+            f"指定した T={req.t + 1} は {meta.filename} の 1–{meta.num_t} を超えています。"
+        )
+    z_from = req.z_from
+    t = req.t
+    return meta, z_from, z_to, t
+
+
+def _assert_projection_source_unchanged(meta: ImageMetadata) -> None:
+    """Reject a source whose physical file or split chunks no longer match."""
+    if not meta.source_path or not (meta.source_identity or meta.source_revision):
+        return
+    try:
+        current = snapshot_source(meta.source_path)
+    except OSError as e:
+        raise ValueError(
+            f"元画像が見つかりません: {meta.source_path}。ドライブを確認してください。"
+        ) from e
+    if ((meta.source_identity and current.identity != meta.source_identity)
+            or (meta.source_revision and current.revision != meta.source_revision)):
+        raise ValueError(
+            f"{meta.filename}: 元画像または分割 OIR の続きが、表示後に変更されました。"
+            "タブを閉じて画像を開き直してください。"
+        )
 
 
 def _build_ome_xml(meta, n_channels: int, height: int, width: int, method: str,
-                   z_from: int, z_to: int) -> str:
+                   z_from: int, z_to: int, t: int) -> str:
     """Build OME-XML metadata string for projected image."""
     from xml.etree.ElementTree import Element, SubElement, tostring
 
     ome = Element("OME", xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06")
-    img = SubElement(ome, "Image", ID="Image:0", Name=f"{meta.filename} ({method.upper()} Proj Z{z_from+1}-{z_to+1})")
+    img = SubElement(
+        ome, "Image", ID="Image:0",
+        Name=(f"{meta.filename} ({method.upper()} Proj "
+              f"T{t + 1} Z{z_from + 1}-{z_to + 1})"),
+    )
     pixels = SubElement(img, "Pixels",
                         ID="Pixels:0",
                         DimensionOrder="XYCZT",
@@ -1083,10 +1779,10 @@ def _build_ome_xml(meta, n_channels: int, height: int, width: int, method: str,
                         SizeT="1")
     if meta.pixel_size_x > 0:
         pixels.set("PhysicalSizeX", f"{meta.pixel_size_x:.6f}")
-        pixels.set("PhysicalSizeXUnit", "um")
+        pixels.set("PhysicalSizeXUnit", "µm")
     if meta.pixel_size_y > 0:
         pixels.set("PhysicalSizeY", f"{meta.pixel_size_y:.6f}")
-        pixels.set("PhysicalSizeYUnit", "um")
+        pixels.set("PhysicalSizeYUnit", "µm")
 
     for c in range(n_channels):
         ch_name = meta.channel_names[c] if c < len(meta.channel_names) else f"Ch{c}"
@@ -1094,7 +1790,85 @@ def _build_ome_xml(meta, n_channels: int, height: int, width: int, method: str,
     for c in range(n_channels):
         SubElement(pixels, "TiffData", FirstC=str(c), FirstZ="0", FirstT="0", IFD=str(c))
 
-    return '<?xml version="1.0" encoding="UTF-8"?>' + tostring(ome, encoding="unicode")
+    # tifffile requires an ASCII TIFF description. ElementTree keeps Unicode
+    # channel names losslessly as numeric XML references when encoded as ASCII.
+    return tostring(ome, encoding="ascii", xml_declaration=True).decode("ascii")
+
+
+def _projection_ome_signature(xml: str) -> tuple:
+    """Parse and validate the scientific metadata written with a projection."""
+    from xml.etree import ElementTree as ET
+
+    namespace = "http://www.openmicroscopy.org/Schemas/OME/2016-06"
+    q = lambda tag: f"{{{namespace}}}{tag}"
+    try:
+        root = ET.fromstring(xml)
+    except (ET.ParseError, TypeError) as e:
+        raise ValueError("OME-XML を読み戻せません。") from e
+    if root.tag != q("OME"):
+        raise ValueError("OME-XML のschemaが不正です。")
+    images_xml = root.findall(q("Image"))
+    if len(images_xml) != 1:
+        raise ValueError("OME-XML のImage数が一致しません。")
+    image = images_xml[0]
+    if image.attrib.get("ID") != "Image:0" or not image.attrib.get("Name"):
+        raise ValueError("OME-XML のImage IDまたは由来名が不正です。")
+    pixels_xml = image.findall(q("Pixels"))
+    if len(pixels_xml) != 1:
+        raise ValueError("OME-XML のPixels要素が一致しません。")
+    pixels = pixels_xml[0]
+    if pixels.attrib.get("ID") != "Pixels:0":
+        raise ValueError("OME-XML のPixels IDが不正です。")
+    try:
+        sizes = tuple(int(pixels.attrib[f"Size{axis}"]) for axis in "XYCZT")
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError("OME-XML の画像サイズが不正です。") from e
+    if (any(value <= 0 for value in sizes)
+            or pixels.attrib.get("DimensionOrder") != "XYCZT"
+            or pixels.attrib.get("Type") != "uint16"
+            or sizes[3:] != (1, 1)):
+        raise ValueError("OME-XML の投影次元または画素型が不正です。")
+    for axis in "XY":
+        value = pixels.attrib.get(f"PhysicalSize{axis}")
+        unit = pixels.attrib.get(f"PhysicalSize{axis}Unit")
+        if (value is None) != (unit is None):
+            raise ValueError("OME-XML の物理pixel sizeと単位が一致しません。")
+        if value is not None:
+            try:
+                physical = float(value)
+            except ValueError as e:
+                raise ValueError("OME-XML の物理pixel sizeが不正です。") from e
+            if not np.isfinite(physical) or physical <= 0 or unit != "µm":
+                raise ValueError("OME-XML の物理pixel sizeまたは単位が不正です。")
+    channels = pixels.findall(q("Channel"))
+    tiff_data = pixels.findall(q("TiffData"))
+    if len(channels) != sizes[2] or len(tiff_data) != sizes[2]:
+        raise ValueError("OME-XML のchannel数が一致しません。")
+    channel_signature = tuple(
+        (channel.attrib.get("ID"), channel.attrib.get("Name"),
+         channel.attrib.get("SamplesPerPixel"))
+        for channel in channels
+    )
+    tiff_signature = tuple(
+        (item.attrib.get("FirstC"), item.attrib.get("FirstZ"),
+         item.attrib.get("FirstT"), item.attrib.get("IFD"))
+        for item in tiff_data
+    )
+    expected_tiff = tuple((str(i), "0", "0", str(i)) for i in range(sizes[2]))
+    if (any(item[0] != f"Channel:0:{i}" or not item[1] or item[2] != "1"
+            for i, item in enumerate(channel_signature))
+            or tiff_signature != expected_tiff):
+        raise ValueError("OME-XML のchannel/IFD対応が不正です。")
+    return (
+        image.attrib.get("ID"), image.attrib.get("Name"),
+        tuple(sorted(pixels.attrib.items())), channel_signature, tiff_signature,
+    )
+
+
+def _assert_projection_ome(saved_xml: str, expected_xml: str) -> None:
+    """Require the reopened OME metadata to match every authored field."""
+    if _projection_ome_signature(saved_xml) != _projection_ome_signature(expected_xml):
+        raise ValueError("OME-XML の内容が書き出し条件と一致しません。")
 
 
 # ---------------------------------------------------------------- update check
@@ -1187,6 +1961,8 @@ def plate_scan(path: str = Query(...)):
 
 class PlateVolumeRequest(BaseModel):
     path: str
+    source_identity: str
+    source_revision: str
     channels: list[int]
     #: [[min, max], ...] aligned with `channels`. Required, never inferred: plate
     #: export must not auto-stretch, so the caller sends the window the user set.
@@ -1214,6 +1990,8 @@ def plate_volume_bin(req: PlateVolumeRequest):
     try:
         spec = plate.VolumeSpec(
             path=req.path,
+            source_identity=req.source_identity,
+            source_revision=req.source_revision,
             channels=list(req.channels),
             levels=[(float(a), float(b)) for a, b in req.levels],
             t=int(req.t),
@@ -1236,6 +2014,10 @@ class PlateFrame(BaseModel):
     well_id: str
     row: int
     col: int
+    #: Exact logical source whose verified volume produced this rendered frame.
+    source_path: str
+    source_identity: str
+    source_revision: str
     #: base64 PNG of the rendered well.
     png_b64: str
     #: Lines printed over the top-left of this well's image. Empty falls back to
@@ -1243,8 +2025,16 @@ class PlateFrame(BaseModel):
     caption: list[str] = []
 
 
-class PlatePdfRequest(BaseModel):
+class PlatePdfTargetRequest(BaseModel):
     plate_name: str
+    output_dir: str
+    #: File to write, without extension. Empty resolves to the plate name plus a
+    #: timestamp; the check endpoint returns that resolved name so the client can
+    #: freeze it for a long render.
+    filename: str = ""
+
+
+class PlatePdfRequest(PlatePdfTargetRequest):
     rows: int
     cols: int
     frames: list[PlateFrame]
@@ -1253,17 +2043,87 @@ class PlatePdfRequest(BaseModel):
     #: absent was never imaged. Only cells with no frame consult this.
     well_states: dict[str, str] = {}
     cell_px: int = 600
-    output_dir: str
     footer: str = ""
     #: Conditions table, written as a second page in the same PDF. Empty omits
     #: the page entirely rather than adding a blank one.
     table_headers: list[str] = []
     table_rows: list[list[str]] = []
-    #: File to write, without extension. Empty falls back to the plate name plus
-    #: a timestamp.
-    filename: str = ""
     #: Replace a file that is already there instead of refusing.
     overwrite: bool = False
+    #: Identity returned with the conflict the user approved. The final write
+    #: is refused if another process changes that file during the long render.
+    expected_revision: str = ""
+
+
+def _assert_plate_sources_unchanged(frames: list[PlateFrame]) -> None:
+    """Reject a PDF if any already-rendered well now names different bytes."""
+    seen: dict[str, str] = {}
+    for frame in frames:
+        path = frame.source_path.strip()
+        if not path or not frame.source_identity or not frame.source_revision:
+            raise ValueError(
+                f"{frame.well_id}: 元画像の検証情報がないため PDF は作成しません。"
+            )
+        try:
+            current = snapshot_source(path)
+        except OSError as e:
+            raise ValueError(
+                f"{frame.well_id}: 元画像が見つかりません。ドライブを確認してください。"
+            ) from e
+        if (current.identity != frame.source_identity
+                or current.revision != frame.source_revision):
+            raise ValueError(
+                f"{frame.well_id}: 描画後に元画像または分割 OIR の続きが変更されました。"
+                "PDF は作成していません。画像タブを開き直してください。"
+            )
+        other = seen.get(current.identity)
+        if other is not None and other != frame.well_id:
+            raise ValueError(
+                f"{other} と {frame.well_id} が同じ元画像を参照しています。"
+                "ウェル対応を確認してください。"
+            )
+        seen[current.identity] = frame.well_id
+
+
+def _plate_pdf_target(req: PlatePdfTargetRequest) -> tuple[Path, Path, str]:
+    """Resolve one PDF target before any rendered frame is decoded."""
+    out_dir = Path(req.output_dir).expanduser().resolve()
+    if not out_dir.is_dir():
+        raise ValueError(f"保存先が見つかりません: {out_dir}")
+    if req.filename:
+        # The API contract is an extension-less stem. Be tolerant of a literal
+        # trailing .pdf, but never use splitext(): a checked name such as
+        # ``figure.v2.final`` must remain identical when it is posted again
+        # after a long render.
+        raw = req.filename.strip()
+        if raw.lower().endswith(".pdf"):
+            raw = raw[:-4]
+        stem = _validated_export_stem(raw)
+    else:
+        safe = _safe_name_part(req.plate_name) or "plate"
+        stem = _validated_export_stem(
+            f"{safe}_plate3d_{time.strftime('%Y%m%d-%H%M%S')}"
+        )
+    target = out_dir / f"{stem}.pdf"
+    _require_stable_target_parent(target)
+    return out_dir, target, stem
+
+
+@app.post("/api/plate/pdf/check")
+def plate_pdf_check(req: PlatePdfTargetRequest):
+    """Resolve and check the PDF name without receiving or decoding well frames."""
+    try:
+        out_dir, target, stem = _plate_pdf_target(req)
+        if os.path.lexists(target):
+            return _conflict_response([str(target)], str(out_dir))
+        return {
+            "path": str(target), "filename": stem,
+            "revision": _target_state(target),
+        }
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": _describe(e)})
 
 
 @app.post("/api/plate/pdf")
@@ -1275,41 +2135,102 @@ def plate_pdf(req: PlatePdfRequest):
     partial set — a PDF missing a well that WAS acquired would look like a plate
     where that well was empty.
     """
+    staged = ""
     try:
-        out_dir = Path(req.output_dir).expanduser()
-        if not out_dir.is_dir():
-            return JSONResponse(status_code=400,
-                                content={"error": f"保存先が見つかりません: {out_dir}"})
+        out_dir, target, _stem = _plate_pdf_target(req)
+        # This check must precede base64 decoding. In the real workflow those
+        # frames cost minutes of volume reads and GPU rendering before this POST.
+        expected = ({os.path.abspath(str(target)): req.expected_revision}
+                    if req.expected_revision else {})
+        changed_parent = _targets_with_changed_parent([target], expected)
+        if changed_parent:
+            return _changed_parent_response(changed_parent)
+        missing = _confirmed_targets_missing([target], expected)
+        if req.overwrite and missing:
+            return _missing_target_response(missing)
+        clash = _target_write_conflicts([target], req.overwrite, expected)
+        if clash:
+            return _conflict_response(clash, str(out_dir))
+        if not expected:
+            expected = {os.path.abspath(str(target)): _target_state(target)}
+        # Validate placement before decoding even one PNG. Pillow otherwise
+        # drops out-of-grid frames and a dict silently replaces duplicate cells.
+        plate.validate_pdf_layout(
+            int(req.rows), int(req.cols), list(req.frames), dict(req.well_states),
+            int(req.cell_px), list(req.table_headers),
+            [list(row) for row in req.table_rows],
+        )
+        _assert_plate_sources_unchanged(list(req.frames))
         frames = [
-            plate.WellFrame(f.well_id, f.row, f.col, base64.b64decode(f.png_b64),
+            plate.WellFrame(f.well_id, f.row, f.col,
+                            base64.b64decode(f.png_b64, validate=True),
                             list(f.caption))
             for f in req.frames
         ]
-        if not frames:
-            return JSONResponse(status_code=400, content={"error": "描画されたウェルがありません"})
-        # A typed name is used as given. Without one the plate names the file and
-        # a timestamp keeps repeats apart, which is the old behaviour.
-        if req.filename:
-            stem = _safe_name_part(os.path.splitext(req.filename)[0]) or "plate"
-        else:
-            safe = _safe_name_part(req.plate_name) or "plate"
-            stem = f"{safe}_plate3d_{time.strftime('%Y%m%d-%H%M%S')}"
-        target = out_dir / f"{stem}.pdf"
-        if target.exists() and not req.overwrite:
-            return _conflict_response([str(target)], str(out_dir))
+        with tempfile.NamedTemporaryFile(
+            dir=out_dir, prefix=".oirpdf-", suffix=".pdf", delete=False,
+        ) as f:
+            staged = f.name
         out = plate.compose_pdf(
-            target,
+            Path(staged),
             req.plate_name, int(req.rows), int(req.cols),
             frames, dict(req.well_states), int(req.cell_px), req.footer,
             table_headers=list(req.table_headers),
             table_rows=[list(r) for r in req.table_rows],
         )
-        return {"path": str(out), "wells": len(frames), "bytes": out.stat().st_size}
+        _fsync_file(out)
+        size = out.stat().st_size
+        with open(out, "rb") as f:
+            head = f.read(5)
+            f.seek(max(0, size - 128))
+            tail = f.read()
+        if head != b"%PDF-" or b"%%EOF" not in tail:
+            raise ValueError("作成した PDF の検証に失敗しました。元のファイルは変更していません。")
+        _assert_plate_sources_unchanged(list(req.frames))
+
+        locks = _locks_for_targets([target])
+        for lock in locks:
+            lock.acquire()
+        process_locks: list[object] = []
+        try:
+            process_locks = _acquire_process_target_locks([target])
+            # Recheck immediately before atomic publication. Dropbox or another
+            # app may have changed the approved file during the long render.
+            changed_parent = _targets_with_changed_parent([target], expected)
+            if changed_parent:
+                return _changed_parent_response(changed_parent)
+            missing = _confirmed_targets_missing([target], expected)
+            if req.overwrite and missing:
+                return _missing_target_response(missing)
+            clash = _target_write_conflicts([target], req.overwrite, expected)
+            if clash:
+                return _conflict_response(clash, str(out_dir))
+            try:
+                _publish_staged_files(
+                    [staged], [str(target)], req.overwrite, expected,
+                    pre_publish=lambda: _assert_plate_sources_unchanged(list(req.frames)),
+                )
+            except _TargetParentChangedDuringPublish as e:
+                return _changed_parent_response(e.paths)
+            except _TargetChangedDuringPublish as e:
+                return _conflict_response(e.paths, str(out_dir))
+            staged = ""
+        finally:
+            _release_process_target_locks(process_locks)
+            for lock in reversed(locks):
+                lock.release()
+        return {"path": str(target), "wells": len(frames), "bytes": size}
     except ValueError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
     except Exception as e:
         traceback.print_exc()
         return JSONResponse(status_code=400, content={"error": _describe(e)})
+    finally:
+        if staged and os.path.exists(staged):
+            try:
+                os.unlink(staged)
+            except OSError:
+                pass
 
 
 @app.post("/api/projection")
@@ -1317,30 +2238,66 @@ def apply_projection(req: ProjectionRequest):
     """Project Z slices, save as OME-TIFF, and open in a new tab."""
     import tifffile
 
+    staged_paths: list[str] = []
+    staged_readers: list[ImageReader] = []
     try:
-        results: list[dict] = []
+        if req.method not in _PROJ_LABEL:
+            raise ValueError(f"Unsupported projection method: {req.method}")
+        if not req.image_ids:
+            raise ValueError("画像を1つ以上選択してください")
 
+        results: list[dict] = []
+        pending: list[tuple[str, ImageReader, ImageMetadata, str]] = []
+        runtime_sources: list[ImageMetadata] = []
+        batch = len(req.image_ids) > 1
+
+        # Resolve every destination before reading a single plane. A collision
+        # refusal therefore leaves both the source data and output folder intact.
         for img_id in req.image_ids:
             r = get_reader(img_id)
             meta = r.metadata
+            out_path = _projection_target(req, meta, batch)
+            pending.append((img_id, r, meta, out_path))
 
-            # Determine output directory
-            if req.output_dir:
-                out_dir = os.path.expanduser(req.output_dir)
-            elif meta.source_path and not meta.source_path.startswith(("/tmp", "/var", "/private/var", "/private/tmp")):
-                out_dir = os.path.dirname(meta.source_path)
-            else:
-                out_dir = os.path.expanduser("~/Desktop")
-            os.makedirs(out_dir, exist_ok=True)
+        target_keys = [_path_key(item[3]) for item in pending]
+        if len(set(target_keys)) != len(target_keys):
+            raise ValueError(
+                "複数の投影が同じ出力名になります。元ファイル名が重複していないか確認してください。"
+            )
 
-            stem = os.path.splitext(meta.filename)[0]
-            # Strip .ome if already present
-            if stem.endswith(".ome"):
-                stem = stem[:-4]
-            z_to = req.z_to if req.z_to >= 0 else meta.num_z - 1
-            z_from = max(0, min(req.z_from, meta.num_z - 1))
-            z_to = max(z_from, min(z_to, meta.num_z - 1))
-            t = min(req.t, meta.num_t - 1)
+        targets = [item[3] for item in pending]
+        if _projection_source_conflicts(targets):
+            raise ValueError(
+                "投影の保存先を開いている元画像と同じファイルにはできません。"
+                "別の名前を指定するか、その画像タブを閉じてください。"
+            )
+
+        changed_parent = _targets_with_changed_parent(targets, dict(req.expected_revisions))
+        if changed_parent:
+            return _changed_parent_response(changed_parent)
+        missing = _confirmed_targets_missing(targets, dict(req.expected_revisions))
+        if req.overwrite and missing:
+            return _missing_target_response(missing)
+        clash = _target_write_conflicts(
+            targets, req.overwrite, dict(req.expected_revisions),
+        )
+        if clash:
+            return _conflict_response(
+                clash, os.path.dirname(clash[0]), revision_paths=targets,
+            )
+        commit_expected = dict(req.expected_revisions)
+        for target in targets:
+            commit_expected.setdefault(os.path.abspath(target), _target_state(target))
+
+        for img_id, r, _cached_meta, out_path in pending:
+            # A restored session deliberately carries dimensions only. Loading
+            # can replace them with authoritative channel names, pixel sizes,
+            # channel count and ranges; use those for both pixels and OME-XML.
+            # Real wells are ~4.25 GB decoded. Evict even the active source before
+            # loading the next batch item; tabs remain and reload transparently.
+            _unload_other_projection_sources(img_id)
+            meta, z_from, z_to, t = _projection_runtime_plan(r, req, out_path, batch)
+            runtime_sources.append(meta)
 
             # Project all channels: result shape (C, Y, X)
             projected = []
@@ -1351,20 +2308,126 @@ def apply_projection(req: ProjectionRequest):
             h, w = proj_stack.shape[1], proj_stack.shape[2]
 
             # Build OME-XML
-            ome_xml = _build_ome_xml(meta, meta.num_channels, h, w, req.method, z_from, z_to)
+            ome_xml = _build_ome_xml(
+                meta, meta.num_channels, h, w, req.method, z_from, z_to, t,
+            )
 
-            # Save as OME-TIFF
-            out_path = _next_suffix_path(out_dir, stem)
-            tifffile.imwrite(out_path, proj_stack, photometric='minisblack',
+            # Write and numerically reopen a same-directory temporary file. If
+            # encoding, validation, or an external drive fails, the approved
+            # existing image is still untouched.
+            with tempfile.NamedTemporaryFile(
+                dir=os.path.dirname(out_path),
+                prefix=".oirp-", suffix=".ome.tif",
+                delete=False,
+            ) as f:
+                staged = f.name
+            staged_paths.append(staged)
+            tifffile.imwrite(staged, proj_stack, photometric='minisblack',
                              description=ome_xml, metadata=None)
+            _fsync_file(staged)
+            with tifffile.TiffFile(staged) as tif:
+                check = np.asarray(tif.asarray())
+                saved_ome = tif.ome_metadata
+            if check.ndim == 2 and proj_stack.shape[0] == 1:
+                check = check[np.newaxis, ...]
+            if (check.dtype != proj_stack.dtype or check.shape != proj_stack.shape
+                    or not np.array_equal(check, proj_stack) or not saved_ome):
+                raise ValueError(
+                    "作成した OME-TIFF の数値検証に失敗しました。"
+                    "元のファイルは変更していません。"
+                )
+            try:
+                _assert_projection_ome(saved_ome, ome_xml)
+            except ValueError as e:
+                raise ValueError(
+                    "作成した OME-TIFF のmetadata検証に失敗しました。"
+                    "元のファイルは変更していません。"
+                ) from e
+            _assert_projection_source_unchanged(meta)
+            # Prove the ordinary viewer can open this exact staged artifact
+            # before any public filename changes. These readers already hold the
+            # small 2D projections and can be registered after publication,
+            # avoiding a post-commit load failure reported as a save failure.
+            staged_reader = ImageReader()
+            staged_reader.load_file(staged)
+            staged_readers.append(staged_reader)
+            # The staged projection is now independent of the 5D source. Free it
+            # before the next well rather than peaking at two decoded wells.
+            r.unload()
 
-            # Load the saved file as a new image
-            new_reader = ImageReader()
-            new_reader.load_file(out_path)
+        # Recheck every source after all staged files are complete. A source that
+        # changed during another batch member must not acquire valid-looking
+        # output provenance under its now-different path.
+        for source_meta in runtime_sources:
+            _assert_projection_source_unchanged(source_meta)
+
+        # Validate every target together under stable locks, then publish each
+        # completed file with an atomic same-filesystem replace.
+        locks = _locks_for_targets(targets)
+        for lock in locks:
+            lock.acquire()
+        process_locks: list[object] = []
+        try:
+            process_locks = _acquire_process_target_locks(targets)
+            if _projection_source_conflicts(targets):
+                raise ValueError(
+                    "投影中に保存先と同じ元画像が開かれました。"
+                    "その画像タブを閉じて、もう一度実行してください。"
+                )
+            for source_meta in runtime_sources:
+                _assert_projection_source_unchanged(source_meta)
+            changed_parent = _targets_with_changed_parent(targets, commit_expected)
+            if changed_parent:
+                return _changed_parent_response(changed_parent)
+            missing = _confirmed_targets_missing(targets, commit_expected)
+            if req.overwrite and missing:
+                return _missing_target_response(missing)
+            clash = _target_write_conflicts(
+                targets, req.overwrite, commit_expected,
+            )
+            if clash:
+                return _conflict_response(
+                    clash, os.path.dirname(clash[0]), revision_paths=targets,
+                )
+            try:
+                def validate_projection_sources() -> None:
+                    if _projection_source_conflicts(targets):
+                        raise ValueError(
+                            "投影中に保存先と同じ元画像が開かれました。"
+                            "その画像タブを閉じて、もう一度実行してください。"
+                        )
+                    for source_meta in runtime_sources:
+                        _assert_projection_source_unchanged(source_meta)
+
+                _publish_staged_files(
+                    staged_paths, targets, req.overwrite, commit_expected,
+                    pre_publish=validate_projection_sources,
+                )
+                for staged_reader, target in zip(staged_readers, targets):
+                    published = snapshot_source(target)
+                    staged_reader.metadata.filename = os.path.basename(target)
+                    staged_reader.metadata.source_path = os.path.realpath(target)
+                    staged_reader.metadata.source_identity = published.identity
+                    staged_reader.metadata.source_revision = published.revision
+                    staged_reader.deferred_path = None
+            except _TargetParentChangedDuringPublish as e:
+                return _changed_parent_response(e.paths)
+            except _TargetChangedDuringPublish as e:
+                return _conflict_response(
+                    e.paths, os.path.dirname(e.paths[0]), revision_paths=targets,
+                )
+        finally:
+            _release_process_target_locks(process_locks)
+            for lock in reversed(locks):
+                lock.release()
+
+        for ((source_image_id, _reader, _meta, _planned), out_path,
+             new_reader) in zip(pending, targets, staged_readers):
             new_id = add_image(new_reader)
 
             results.append({
                 "id": new_id,
+                "source_image_id": source_image_id,
                 "path": out_path,
                 "filename": os.path.basename(out_path),
                 "metadata": new_reader.metadata.to_dict(),
@@ -1373,6 +2436,416 @@ def apply_projection(req: ProjectionRequest):
         return {"results": results}
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
+    finally:
+        for staged in staged_paths:
+            if os.path.exists(staged):
+                try:
+                    os.unlink(staged)
+                except OSError:
+                    pass
+
+
+def _selftest_export_targets() -> int:
+    """Prove export refusals happen before pixels are read or files are changed."""
+    global images, active_id, _lru, APP_DIR
+    import tempfile
+
+    class _NoPixelReader:
+        def __init__(self, meta: ImageMetadata):
+            self.metadata = meta
+            self.calls = 0
+
+        def get_projection(self, *_args, **_kwargs):
+            self.calls += 1
+            raise AssertionError("projection pixels were read before target validation")
+
+    class _DeferredMetadataReader:
+        def __init__(self, cached: ImageMetadata, actual: ImageMetadata):
+            self.metadata = cached
+            self.actual = actual
+            self.loaded = False
+
+        def ensure_loaded(self):
+            self.metadata = self.actual
+            self.loaded = True
+
+    saved_images, saved_active, saved_lru, saved_app_dir = images, active_id, _lru, APP_DIR
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            APP_DIR = os.path.join(tmp, "app")
+            os.makedirs(APP_DIR)
+            plate_source = Path(tmp, "plate-source.oir")
+            plate_source.write_bytes(b"plate source")
+            plate_source_state = snapshot_source(plate_source)
+
+            def test_plate_frame(well_id: str, row: int, col: int,
+                                 png_b64: str) -> PlateFrame:
+                return PlateFrame(
+                    well_id=well_id, row=row, col=col, png_b64=png_b64,
+                    source_path=str(plate_source),
+                    source_identity=plate_source_state.identity,
+                    source_revision=plate_source_state.revision,
+                )
+
+            plate_target = Path(tmp, "same.pdf")
+            sentinel = b"do not replace"
+            plate_target.write_bytes(sentinel)
+            plate_req = PlatePdfTargetRequest(
+                plate_name="test", output_dir=tmp, filename="same",
+            )
+            plate_conflict = plate_pdf_check(plate_req)
+            if (not isinstance(plate_conflict, JSONResponse)
+                    or plate_conflict.status_code != 409):
+                raise AssertionError("plate preflight did not report the existing PDF")
+
+            # Invalid base64 proves the final endpoint checks the target before it
+            # even decodes a frame. The old order returns 400 here instead of 409.
+            early = plate_pdf(PlatePdfRequest(
+                plate_name="test", rows=1, cols=1, output_dir=tmp, filename="same",
+                frames=[test_plate_frame("A01", 0, 0, "a")],
+            ))
+            if not isinstance(early, JSONResponse) or early.status_code != 409:
+                raise AssertionError("plate final check ran after frame decoding")
+            if plate_target.read_bytes() != sentinel:
+                raise AssertionError("plate conflict changed the existing PDF")
+
+            available = plate_pdf_check(PlatePdfTargetRequest(
+                plate_name="test", output_dir=tmp, filename="late",
+            ))
+            if not isinstance(available, dict):
+                raise AssertionError("available plate target was not resolved")
+            late_target = Path(available["path"])
+            late_target.write_bytes(sentinel)
+            late = plate_pdf(PlatePdfRequest(
+                plate_name="test", rows=1, cols=1, output_dir=tmp,
+                filename=available["filename"],
+                frames=[test_plate_frame("A01", 0, 0, "a")],
+            ))
+            if not isinstance(late, JSONResponse) or late.status_code != 409:
+                raise AssertionError("plate final check missed a post-preflight collision")
+            if late_target.read_bytes() != sentinel:
+                raise AssertionError("late plate conflict changed the target")
+
+            # An empty name is resolved once, then reused exactly after a long
+            # render instead of taking a second timestamp.
+            generated = plate_pdf_check(PlatePdfTargetRequest(
+                plate_name="plate.2026.08", output_dir=tmp,
+            ))
+            if not isinstance(generated, dict):
+                raise AssertionError("timestamped plate target was not resolved")
+            _dir, frozen_target, _stem = _plate_pdf_target(PlatePdfTargetRequest(
+                plate_name="plate.2026.08", output_dir=tmp,
+                filename=generated["filename"],
+            ))
+            if str(frozen_target) != generated["path"]:
+                raise AssertionError("resolved plate filename changed before final save")
+
+            dotted = plate_pdf_check(PlatePdfTargetRequest(
+                plate_name="test", output_dir=tmp, filename="figure.v2.final",
+            ))
+            if (not isinstance(dotted, dict)
+                    or dotted["filename"] != "figure.v2.final"
+                    or not dotted["path"].endswith("figure.v2.final.pdf")):
+                raise AssertionError("dots in a plate PDF stem changed the checked target")
+            _dir, dotted_final, dotted_stem = _plate_pdf_target(PlatePdfTargetRequest(
+                plate_name="test", output_dir=tmp, filename=dotted["filename"],
+            ))
+            if str(dotted_final) != dotted["path"] or dotted_stem != dotted["filename"]:
+                raise AssertionError("dotted plate target changed before final save")
+
+            # Approval tokens are bound to an exact filename and overwrite=False
+            # never replaces an existing target, even with a matching token.
+            other_missing = Path(tmp, "other.pdf")
+            missing_token = _target_state(Path(tmp, "unused.pdf"))
+            if not _target_write_conflicts(
+                [other_missing], False,
+                {os.path.abspath(other_missing): missing_token},
+            ):
+                raise AssertionError("missing-target revision was reusable for another name")
+            existing_token = _target_state(plate_target)
+            if not _target_write_conflicts(
+                [plate_target], False,
+                {os.path.abspath(plate_target): existing_token},
+            ):
+                raise AssertionError("overwrite=False accepted an existing target revision")
+            if _target_write_conflicts(
+                [plate_target], True,
+                {os.path.abspath(plate_target): existing_token},
+            ):
+                raise AssertionError("confirmed existing target revision was rejected")
+
+            fake_parent = (
+                f"target:v3:{_target_path_digest(other_missing)}:999-999:missing"
+            )
+            if not _targets_with_changed_parent(
+                [other_missing], {os.path.abspath(other_missing): fake_parent},
+            ):
+                raise AssertionError("changed destination filesystem was not detected")
+
+            broken = Path(tmp, "broken.pdf")
+            broken.symlink_to(Path(tmp, "does-not-exist"))
+            if _target_state_parts(_target_state(broken))[2] != "file":
+                raise AssertionError("broken symlink was treated as an available target")
+
+            bad_layout_target = Path(tmp, "bad-layout.pdf")
+            bad_layout = plate_pdf(PlatePdfRequest(
+                plate_name="test", rows=1, cols=1, output_dir=tmp,
+                filename="bad-layout", cell_px=300,
+                frames=[test_plate_frame("B02", 1, 1, "not-base64")],
+            ))
+            if (not isinstance(bad_layout, JSONResponse)
+                    or bad_layout.status_code != 400
+                    or bad_layout_target.exists()):
+                raise AssertionError("out-of-grid plate frame reached PDF composition")
+
+            duplicate_layout = plate_pdf(PlatePdfRequest(
+                plate_name="test", rows=1, cols=1, output_dir=tmp,
+                filename="duplicate-layout", cell_px=300,
+                frames=[
+                    test_plate_frame("A01", 0, 0, "not-base64"),
+                    test_plate_frame("A01", 0, 0, "not-base64"),
+                ],
+            ))
+            if not isinstance(duplicate_layout, JSONResponse) or duplicate_layout.status_code != 400:
+                raise AssertionError("duplicate plate frame reached PNG decoding")
+
+            stale_source_target = Path(tmp, "stale-source.pdf")
+            plate_source.write_bytes(b"changed before PDF")
+            stale_source = plate_pdf(PlatePdfRequest(
+                plate_name="test", rows=1, cols=1, output_dir=tmp,
+                filename="stale-source", cell_px=300,
+                frames=[test_plate_frame("A01", 0, 0, "not-base64")],
+            ))
+            if (not isinstance(stale_source, JSONResponse)
+                    or stale_source.status_code != 400
+                    or "描画後" not in json.loads(stale_source.body).get("error", "")
+                    or stale_source_target.exists()):
+                raise AssertionError("changed plate source reached PNG decoding or publication")
+
+            # Also change the source at the final publication boundary, after a
+            # valid PDF has already been composed. The staged PDF must be thrown
+            # away rather than attributing its old pixels to the new source.
+            import io
+            from PIL import Image
+            late_source = Path(tmp, "late-source.oir")
+            late_source.write_bytes(b"stable")
+            late_state = snapshot_source(late_source)
+            png_io = io.BytesIO()
+            Image.new("RGB", (2, 2), "black").save(png_io, "PNG")
+            late_frame = PlateFrame(
+                well_id="A01", row=0, col=0,
+                png_b64=base64.b64encode(png_io.getvalue()).decode("ascii"),
+                source_path=str(late_source),
+                source_identity=late_state.identity,
+                source_revision=late_state.revision,
+            )
+            late_target = Path(tmp, "late-source.pdf")
+            original_publish = _publish_staged_files
+
+            def change_source_before_publish(*args, **kwargs):
+                late_source.write_bytes(b"changed at publish")
+                return original_publish(*args, **kwargs)
+
+            globals()["_publish_staged_files"] = change_source_before_publish
+            try:
+                late_result = plate_pdf(PlatePdfRequest(
+                    plate_name="test", rows=1, cols=1, output_dir=tmp,
+                    filename="late-source", cell_px=300, frames=[late_frame],
+                ))
+            finally:
+                globals()["_publish_staged_files"] = original_publish
+            if (not isinstance(late_result, JSONResponse)
+                    or late_result.status_code != 400
+                    or "描画後" not in json.loads(late_result.body).get("error", "")
+                    or late_target.exists()):
+                raise AssertionError("plate source changed at publish but PDF was accepted")
+
+            source = os.path.join(tmp, "source.oir")
+            Path(source).write_bytes(b"source")
+            meta = ImageMetadata(
+                filename="source.oir", source_path=source, num_channels=1,
+                num_z=2, num_t=1, width=2, height=2,
+            )
+            reader = _NoPixelReader(meta)
+            target = os.path.join(tmp, "chosen.ome.tif")
+            Path(target).write_bytes(sentinel)
+            images, active_id, _lru = {"one": reader}, "one", []
+
+            conflict = apply_projection(ProjectionRequest(
+                image_ids=["one"], output_dir=tmp, filename="chosen",
+            ))
+            if not isinstance(conflict, JSONResponse) or conflict.status_code != 409:
+                raise AssertionError(f"existing projection target returned {conflict!r}")
+            if reader.calls or Path(target).read_bytes() != sentinel:
+                raise AssertionError("projection conflict read pixels or changed the target")
+            if Path(tmp, "chosen_01.ome.tif").exists():
+                raise AssertionError("projection silently created a suffixed file")
+
+            dotted_target = Path(tmp, "chosen.v2.final.ome.tif")
+            dotted_target.write_bytes(sentinel)
+            dotted = apply_projection(ProjectionRequest(
+                image_ids=["one"], output_dir=tmp, filename="chosen.v2.final",
+            ))
+            if not isinstance(dotted, JSONResponse) or dotted.status_code != 409:
+                raise AssertionError("dotted projection target was not checked exactly")
+            if reader.calls or dotted_target.read_bytes() != sentinel:
+                raise AssertionError("dotted projection conflict read pixels or changed target")
+            if Path(tmp, "chosen.v2.ome.tif").exists():
+                raise AssertionError("dotted projection stem was silently truncated")
+
+            cached_meta = ImageMetadata(
+                filename="restored.oir", source_path=os.path.join(tmp, "restored.oir"),
+                num_channels=1, num_z=2, num_t=1, width=2, height=2,
+            )
+            actual_meta = ImageMetadata(
+                filename="restored.oir", source_path=cached_meta.source_path,
+                num_channels=2, num_z=5, num_t=3, width=8, height=6,
+                pixel_size_x=0.123456, pixel_size_y=0.234567,
+                channel_names=["DAPI", "proSPC"],
+            )
+            deferred = _DeferredMetadataReader(cached_meta, actual_meta)
+            deferred_req = ProjectionRequest(
+                image_ids=["restored"], output_dir=tmp, filename="restored_projection",
+                z_from=1, z_to=4, t=2,
+            )
+            deferred_target = _projection_target(deferred_req, cached_meta, False)
+            runtime_meta, runtime_from, runtime_to, runtime_t = _projection_runtime_plan(
+                deferred, deferred_req, deferred_target, False,
+            )
+            runtime_xml = _build_ome_xml(
+                runtime_meta, runtime_meta.num_channels, runtime_meta.height,
+                runtime_meta.width, deferred_req.method, runtime_from, runtime_to,
+                runtime_t,
+            )
+            _assert_projection_ome(runtime_xml, runtime_xml)
+            if (not deferred.loaded or runtime_meta is not actual_meta
+                    or (runtime_from, runtime_to, runtime_t) != (1, 4, 2)
+                    or 'PhysicalSizeX="0.123456"' not in runtime_xml
+                    or 'PhysicalSizeXUnit="&#181;m"' not in runtime_xml
+                    or 'Name="proSPC"' not in runtime_xml
+                    or 'T3 Z2-5' not in runtime_xml):
+                raise AssertionError("deferred projection used cached metadata in its OME output")
+            try:
+                _projection_ome_signature(runtime_xml.replace("&#181;m", "um"))
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("schema-invalid OME length unit was accepted")
+
+            shallow = _DeferredMetadataReader(cached_meta, ImageMetadata(
+                filename="restored.oir", source_path=cached_meta.source_path,
+                num_channels=1, num_z=2, num_t=1, width=2, height=2,
+            ))
+            try:
+                _projection_runtime_plan(shallow, deferred_req, deferred_target, False)
+            except ValueError as e:
+                if "Z 範囲" not in str(e):
+                    raise
+            else:
+                raise AssertionError("projection silently clamped a stale Z range")
+
+            incomplete = _DeferredMetadataReader(cached_meta, ImageMetadata(
+                filename="restored.oir", source_path=cached_meta.source_path,
+                num_channels=1, num_z=2, num_t=1, width=2, height=2,
+                warning="Zスライス 2/5 のみ読み込み",
+            ))
+            try:
+                _projection_runtime_plan(incomplete, ProjectionRequest(
+                    image_ids=["restored"], output_dir=tmp,
+                    filename="incomplete_projection", z_from=0, z_to=1,
+                ), os.path.join(tmp, "incomplete_projection.ome.tif"), False)
+            except ValueError as e:
+                if "不完全な Z スタック" not in str(e):
+                    raise
+            else:
+                raise AssertionError("incomplete split OIR was accepted for projection")
+
+            source_tif = os.path.join(tmp, "source.ome.tif")
+            Path(source_tif).write_bytes(sentinel)
+            source_reader = _NoPixelReader(ImageMetadata(
+                filename="source.ome.tif", source_path=source_tif,
+                num_channels=1, num_z=2, num_t=1, width=2, height=2,
+            ))
+            images, active_id, _lru = {"source": source_reader}, "source", []
+            refused = apply_projection(ProjectionRequest(
+                image_ids=["source"], output_dir=tmp, filename="source", overwrite=True,
+            ))
+            if not isinstance(refused, JSONResponse) or refused.status_code != 400:
+                raise AssertionError("source image was accepted as its own projection target")
+            if source_reader.calls or Path(source_tif).read_bytes() != sentinel:
+                raise AssertionError("source-target refusal read or changed the source")
+
+            first = _NoPixelReader(ImageMetadata(
+                filename="same.oir", source_path=os.path.join(tmp, "a", "same.oir"),
+                num_channels=1, num_z=2, num_t=1, width=2, height=2,
+            ))
+            second = _NoPixelReader(ImageMetadata(
+                filename="same.oir", source_path=os.path.join(tmp, "b", "same.oir"),
+                num_channels=1, num_z=2, num_t=1, width=2, height=2,
+            ))
+            images, active_id, _lru = {"a": first, "b": second}, "a", []
+            duplicate = apply_projection(ProjectionRequest(
+                image_ids=["a", "b"], output_dir=tmp,
+            ))
+            if not isinstance(duplicate, JSONResponse) or duplicate.status_code != 400:
+                raise AssertionError("duplicate projection targets were accepted")
+            if first.calls or second.calls:
+                raise AssertionError("duplicate target validation read projection pixels")
+
+            composed_name = "caf\u00e9.oir"
+            decomposed_name = unicodedata.normalize("NFD", composed_name)
+            composed_target = os.path.join(tmp, "caf\u00e9.ome.tif")
+            decomposed_target = unicodedata.normalize("NFD", composed_target)
+            if _path_key(composed_target) != _path_key(decomposed_target):
+                raise AssertionError("Unicode aliases produced different target keys")
+            if (sys.platform == "darwin"
+                    and _target_path_digest(composed_target)
+                    != _target_path_digest(decomposed_target)):
+                raise AssertionError("Unicode aliases produced different approval tokens")
+            unicode_first = _NoPixelReader(ImageMetadata(
+                filename=composed_name,
+                source_path=os.path.join(tmp, "source-a", composed_name),
+                num_channels=1, num_z=2, num_t=1, width=2, height=2,
+            ))
+            unicode_second = _NoPixelReader(ImageMetadata(
+                filename=decomposed_name,
+                source_path=os.path.join(tmp, "source-b", decomposed_name),
+                num_channels=1, num_z=2, num_t=1, width=2, height=2,
+            ))
+            images, active_id, _lru = {
+                "unicode-a": unicode_first, "unicode-b": unicode_second,
+            }, "unicode-a", []
+            unicode_duplicate = apply_projection(ProjectionRequest(
+                image_ids=["unicode-a", "unicode-b"], output_dir=tmp,
+            ))
+            if (not isinstance(unicode_duplicate, JSONResponse)
+                    or unicode_duplicate.status_code != 400):
+                raise AssertionError("Unicode-alias projection targets were accepted")
+            if unicode_first.calls or unicode_second.calls:
+                raise AssertionError("Unicode target validation read projection pixels")
+
+            absent_dir = os.path.join(tmp, "detached-drive", "output")
+            try:
+                _projection_target(ProjectionRequest(
+                    image_ids=["a"], output_dir=absent_dir,
+                ), first.metadata, False)
+            except ValueError as e:
+                if "保存先が見つかりません" not in str(e):
+                    raise
+            else:
+                raise AssertionError("projection created or accepted a missing output folder")
+            if os.path.exists(absent_dir):
+                raise AssertionError("projection recreated a detached output path")
+    except Exception as e:
+        print(f"selftest FAILED: export targets -> {type(e).__name__}: {e}", flush=True)
+        return 24
+    finally:
+        images, active_id, _lru = saved_images, saved_active, saved_lru
+        APP_DIR = saved_app_dir
+
+    print("selftest: export targets OK (projection pixels/plate frames skipped on conflict)",
+          flush=True)
+    return 0
 
 
 class ChannelSetting(BaseModel):
@@ -1513,9 +2986,6 @@ def _resolve_channel_settings(req: SaveRequest, img_id: str, meta) -> tuple[list
 #: How many conflicting names to name in the warning before summarising.
 _CONFLICT_SHOWN = 12
 
-_PROJ_LABEL = {"max": "MaxProj", "min": "MinProj", "avg": "AvgProj"}
-
-
 def _zt_suffix(z_val, t_val, is_proj: bool, z_list: list, t_list: list,
                method: str) -> str:
     """The Z/T part of an export filename.
@@ -1549,7 +3019,9 @@ def _conflicts(paths: list[str]) -> list[str]:
     return out
 
 
-def _conflict_response(paths: list[str], out_dir: str) -> JSONResponse:
+def _conflict_response(
+    paths: list[str], out_dir: str, revision_paths: list[str] | None = None,
+) -> JSONResponse:
     """Refuse the write and say exactly what would have been replaced.
 
     Returned before anything is written, so answering "no" costs nothing and
@@ -1559,12 +3031,17 @@ def _conflict_response(paths: list[str], out_dir: str) -> JSONResponse:
     with a directory of near-duplicates you cannot tell apart.
     """
     shown = [os.path.basename(p) for p in paths[:_CONFLICT_SHOWN]]
+    revisions = {
+        os.path.abspath(p): _target_state(p)
+        for p in (revision_paths or paths)
+    }
     return JSONResponse(status_code=409, content={
         "conflict": True,
         "output_dir": out_dir,
         "count": len(paths),
         "files": shown,
         "more": max(0, len(paths) - len(shown)),
+        "revisions": revisions,
         "error": (f"{len(paths)} 個のファイルが既にあります。"
                   "上書きしてよければ「上書きする」を選んでください。"),
     })

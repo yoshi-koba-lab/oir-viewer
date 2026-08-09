@@ -1,5 +1,7 @@
 import * as THREE from 'three';
-import { vertexShader, fragmentShader } from './volumeShader';
+import {
+  VOLUME_CAMERA_FOV_DEG, vertexShader, fragmentShader,
+} from './volumeShader';
 import { volumeTooLarge } from './gpuLimits';
 import type { PlateVolumeInfo } from './api';
 
@@ -33,7 +35,7 @@ export interface VolumePayload {
    * render like the sample. All-equal (the fallback when the file gives no
    * voxel size) renders it as a cube, which is what an isotropic stack is.
    */
-  physical?: [number, number, number];
+  physical: [number, number, number];
 }
 
 /**
@@ -43,7 +45,7 @@ export interface VolumePayload {
  * the SOURCE, so the physical extent uses the source shape, not the downscaled
  * one — a 23x XY reduction does not make the sample squatter.
  */
-export function parseVolume(buf: ArrayBuffer, info?: PlateVolumeInfo): VolumePayload {
+export function parseVolume(buf: ArrayBuffer, info: PlateVolumeInfo): VolumePayload {
   const head = new Uint32Array(buf, 0, 8);
   const [nc, nz, h, w] = [head[0], head[1], head[2], head[3]];
   const perCh = nz * h * w;
@@ -53,12 +55,11 @@ export function parseVolume(buf: ArrayBuffer, info?: PlateVolumeInfo): VolumePay
     channels.push(new Uint8Array(buf, off, perCh));
     off += perCh;
   }
-  let physical: [number, number, number] | undefined;
-  const vx = info?.voxel;
-  const src = info?.source;                       // [n_c, n_z, h, w] of the source
-  if (vx && src && vx[0] > 0 && vx[1] > 0 && vx[2] > 0) {
-    physical = [src[3] * vx[0], src[2] * vx[1], src[1] * vx[2]];
-  }
+  const vx = info.voxel;
+  const src = info.source;                       // [n_c, n_z, h, w] of the source
+  const physical: [number, number, number] = [
+    src[3] * vx[0], src[2] * vx[1], src[1] * vx[2],
+  ];
   return { numChannels: nc, numZ: nz, height: h, width: w, channels, physical };
 }
 
@@ -94,7 +95,7 @@ export class PlateRenderer {
     this.renderer.setSize(size, size, false);
     this.renderer.setClearColor(0x000000, 1);
 
-    this.camera = new THREE.PerspectiveCamera(45, 1, 0.01, 100);
+    this.camera = new THREE.PerspectiveCamera(VOLUME_CAMERA_FOV_DEG, 1, 0.01, 100);
     this.material = new THREE.ShaderMaterial({
       glslVersion: THREE.GLSL3,
       vertexShader,
@@ -158,7 +159,7 @@ export class PlateRenderer {
     // and rendering it as a cube stretches Z tenfold. Without this the PDF is
     // the one view of the data with the wrong proportions, which is worse than
     // no PDF, because it still looks like a result.
-    const [pw, ph, pz] = vol.physical ?? [1, 1, 1];
+    const [pw, ph, pz] = vol.physical;
     const maxDim = Math.max(pw, ph, pz) || 1;
     const sx = pw / maxDim, sy = ph / maxDim, sz = pz / maxDim;
     this.mesh.scale.set(sx, sy, sz);

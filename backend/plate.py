@@ -25,6 +25,8 @@ from pathlib import Path
 
 import numpy as np
 
+from source_state import snapshot_source
+
 MATL_NAMES = ("matl.omp2info", "matl_forVSIimages.omp2info")
 
 #: Olympus stores stage geometry in nanometres.
@@ -49,6 +51,8 @@ class Well:
     tiles: int
     tile_grid: str    # "3x3"
     stitch_path: str | None
+    stitch_identity: str
+    stitch_revision: str
     stitch_bytes: int
     chunk_count: int
     #: Empty when the label and the stage coordinates agree.
@@ -77,7 +81,10 @@ class Plate:
                 {
                     "well_id": w.well_id, "row": w.row, "col": w.col,
                     "enabled": w.enabled, "tiles": w.tiles, "tile_grid": w.tile_grid,
-                    "stitch_path": w.stitch_path, "stitch_bytes": w.stitch_bytes,
+                    "stitch_path": w.stitch_path,
+                    "stitch_identity": w.stitch_identity,
+                    "stitch_revision": w.stitch_revision,
+                    "stitch_bytes": w.stitch_bytes,
                     "chunk_count": w.chunk_count, "position_warning": w.position_warning,
                 }
                 for w in self.wells
@@ -109,6 +116,39 @@ def _well_id_to_rc(well_id: str) -> tuple[int, int] | None:
     if not m:
         return None
     return ord(m.group(1).upper()) - ord("A"), int(m.group(2)) - 1
+
+
+def _require_stage_label_match(
+    well_id: str,
+    row: int,
+    col: int,
+    stage: dict[str, tuple[float, float]],
+    pitch_x: float | None,
+    pitch_y: float | None,
+) -> None:
+    """Reject a MATL label that disagrees with its independent stage position."""
+    if not pitch_x or not pitch_y or well_id not in stage or len(stage) < 2:
+        return
+
+    xs = [position[0] for position in stage.values()]
+    ys = [position[1] for position in stage.values()]
+    positions = [position for name in stage if (position := _well_id_to_rc(name))]
+    ref_col = min(position[1] for position in positions)
+    ref_row = min(position[0] for position in positions)
+    stage_col = ref_col + round((stage[well_id][0] - min(xs)) / pitch_x)
+    stage_row = ref_row + round((stage[well_id][1] - min(ys)) / pitch_y)
+    if (stage_row, stage_col) == (row, col):
+        return
+
+    if 0 <= stage_row < 26 and stage_col >= 0:
+        stage_well = f"{chr(65 + stage_row)}{stage_col + 1:02d}"
+    else:
+        stage_well = f"行 {stage_row + 1}、列 {stage_col + 1}"
+    raise ValueError(
+        "matl のウェルラベルとステージ座標が一致しません: "
+        f"ラベルは {well_id} ですが、ステージ座標からは {stage_well} と判定されました。"
+        "誤ったラベルの図を防ぐため、このプレートを開けません。"
+    )
 
 
 def _derive_stitch(tile_name: str) -> str | None:
@@ -186,25 +226,33 @@ def scan(where: str) -> Plate:
     for g in groups:
         d = _leaf_children(g)
         ai = [c for c in g if _tag(c) == "areaInfo"]
-        if not ai or "wellId" not in d:
+        rc = _well_id_to_rc(d.get("wellId", ""))
+        if not ai or rc is None:
             continue
         a = _leaf_children(ai[0])
         try:
-            stage[d["wellId"]] = (float(a["areaLeft"]), float(a["areaTop"]))
+            canonical = f"{chr(65 + rc[0])}{rc[1] + 1:02d}"
+            stage[canonical] = (float(a["areaLeft"]), float(a["areaTop"]))
         except (KeyError, ValueError):
             pass
 
     wells: list[Well] = []
+    seen_wells: set[str] = set()
+    seen_positions: set[tuple[int, int]] = set()
     for g in groups:
         d = _leaf_children(g)
-        wid = d.get("wellId", "").strip()
-        rc = _well_id_to_rc(wid)
+        raw_wid = d.get("wellId", "").strip()
+        rc = _well_id_to_rc(raw_wid)
         if rc is None:
-            warnings.append(f"ウェル名を解釈できません: {wid!r}（このウェルは除外します）")
-            continue
+            raise ValueError(f"ウェル名を解釈できません: {raw_wid!r}")
         row, col = rc
+        wid = f"{chr(65 + row)}{col + 1:02d}"
         if not (0 <= row < rows and 0 <= col < cols):
-            warnings.append(f"{wid} はプレート（{rows}行×{cols}列）の外を指しています")
+            raise ValueError(f"{wid} はプレート（{rows}行×{cols}列）の外を指しています")
+        if wid in seen_wells or (row, col) in seen_positions:
+            raise ValueError(f"matl に同じウェル位置が複数あります: {wid}")
+        seen_wells.add(wid)
+        seen_positions.add((row, col))
 
         areas = [a for a in g if _tag(a) == "area"]
         ai = [c for c in g if _tag(c) == "areaInfo"]
@@ -216,27 +264,21 @@ def scan(where: str) -> Plate:
         stitch = folder / stitch_name if stitch_name else None
         exists = bool(stitch and stitch.is_file())
         chunks = count_chunks(stitch) if exists and stitch is not None else 0
+        source = snapshot_source(stitch) if exists and stitch is not None else None
 
-        # Compare the label against the stage grid.
-        warn = ""
-        if pitch_x and pitch_y and wid in stage and len(stage) >= 2:
-            xs = [v[0] for v in stage.values()]
-            ys = [v[1] for v in stage.values()]
-            ref_col = min(_well_id_to_rc(k)[1] for k in stage if _well_id_to_rc(k))
-            ref_row = min(_well_id_to_rc(k)[0] for k in stage if _well_id_to_rc(k))
-            c_stage = ref_col + round((stage[wid][0] - min(xs)) / pitch_x)
-            r_stage = ref_row + round((stage[wid][1] - min(ys)) / pitch_y)
-            if (r_stage, c_stage) != (row, col):
-                warn = (f"ラベル {wid} は行{row}列{col}ですが、"
-                        f"ステージ座標では行{r_stage}列{c_stage}です")
+        # A warning is not safe here: the pixels would be rendered correctly but
+        # published under the wrong well label. Stop before any well can be opened.
+        _require_stage_label_match(wid, row, col, stage, pitch_x, pitch_y)
 
         wells.append(Well(
             well_id=wid, row=row, col=col,
             enabled=(d.get("enable", "true").lower() != "false"),
             tiles=len(areas), tile_grid=grid,
-            stitch_path=str(stitch) if exists else None,
-            stitch_bytes=(stitch.stat().st_size if exists and stitch else 0),
-            chunk_count=chunks, position_warning=warn,
+            stitch_path=str(stitch.resolve()) if exists and stitch else None,
+            stitch_identity=(source.identity if source else ""),
+            stitch_revision=(source.revision if source else ""),
+            stitch_bytes=(source.size if source else 0),
+            chunk_count=chunks, position_warning="",
         ))
 
     wells.sort(key=lambda w: (w.row, w.col))
@@ -358,6 +400,8 @@ def require_complete_split(reader_j, path: Path, actual_z: int) -> None:
 class VolumeSpec:
     """What to read, and the contrast to bake in. Nothing here is inferred."""
     path: str
+    source_identity: str
+    source_revision: str
     channels: list[int]
     #: Per entry in `channels`, the display window to apply. Never computed here:
     #: plate export must not auto-stretch, so the caller passes what the user set.
@@ -365,6 +409,26 @@ class VolumeSpec:
     t: int = 0
     #: Max XY of the returned volume; 0 for the source resolution unchanged.
     max_xy: int = PLATE_MAX_XY
+
+
+def _plate_source_dtype(pixel_type: int, format_tools, little: bool,
+                        filename: str) -> np.dtype:
+    """Use only pixel types whose values match the ordinary viewer exactly."""
+    end = "<" if little else ">"
+    if pixel_type == format_tools.UINT8:
+        return np.dtype("u1")
+    if pixel_type == format_tools.UINT16:
+        return np.dtype(end + "u2")
+    if pixel_type == format_tools.INT16:
+        return np.dtype(end + "i2")
+    # reader.py converts a whole floating-point volume to uint16 using its
+    # global range. Applying the viewer's uint16 levels to one raw float plane
+    # here would create a valid-looking but usually black PDF. Wider integers
+    # and doubles are likewise not represented by the ordinary viewer path.
+    raise ValueError(
+        f"{filename}: Plate PDF ではこの画素型を安全に再現できません "
+        f"(pixelType={pixel_type})。8-bit unsigned または 16-bit を使用してください。"
+    )
 
 
 def read_low_volume(spec: VolumeSpec) -> tuple[dict, bytes]:
@@ -397,8 +461,15 @@ def read_low_volume(spec: VolumeSpec) -> tuple[dict, bytes]:
     reader_j.setMetadataStore(ome)
     with _WELL_LOCK:
         try:
+            before = snapshot_source(p)
+            if (before.identity != spec.source_identity
+                    or before.revision != spec.source_revision):
+                raise ValueError(
+                    "ウェル画像または分割 OIR の続きが、表示調整後に変更されました。"
+                    "画像タブを開き直し、プレートを再選択してください。"
+                )
             reader_j.setId(str(p))
-            n_c, n_z = reader_j.getSizeC(), reader_j.getSizeZ()
+            n_c, n_z, n_t = reader_j.getSizeC(), reader_j.getSizeZ(), reader_j.getSizeT()
             h, w = reader_j.getSizeY(), reader_j.getSizeX()
             # Before a single plane is read: a well missing its continuation
             # chunks reads perfectly and renders a short stack, so the only way
@@ -411,31 +482,43 @@ def read_low_volume(spec: VolumeSpec) -> tuple[dict, bytes]:
             little = reader_j.isLittleEndian()
             FormatTools = scyjava.jimport("loci.formats.FormatTools")
             pt = reader_j.getPixelType()
-            end = "<" if little else ">"
-            if pt == FormatTools.UINT8:
-                dtype = np.dtype("u1")
-            elif pt == FormatTools.INT8:
-                dtype = np.dtype("i1")
-            elif pt == FormatTools.UINT16:
-                dtype = np.dtype(end + "u2")
-            elif pt == FormatTools.INT16:
-                dtype = np.dtype(end + "i2")
-            elif pt == FormatTools.UINT32:
-                dtype = np.dtype(end + "u4")
-            elif pt == FormatTools.INT32:
-                dtype = np.dtype(end + "i4")
-            elif pt == FormatTools.FLOAT:
-                dtype = np.dtype(end + "f4")
-            elif pt == FormatTools.DOUBLE:
-                dtype = np.dtype(end + "f8")
-            else:
-                raise ValueError(f"未対応の画素型です (pixelType={pt})")
+            dtype = _plate_source_dtype(pt, FormatTools, little, p.name)
 
-            want = [c for c in spec.channels if 0 <= c < n_c][:PLATE_MAX_CH]
+            def _phys(get) -> float:
+                try:
+                    v = get(0)
+                    return float(v.value().doubleValue()) if v is not None else 0.0
+                except Exception:
+                    return 0.0
+
+            voxel = [_phys(ome.getPixelsPhysicalSizeX),
+                     _phys(ome.getPixelsPhysicalSizeY),
+                     _phys(ome.getPixelsPhysicalSizeZ)]
+            if any(not np.isfinite(v) or v <= 0 for v in voxel):
+                raise ValueError(
+                    f"{p.name}: voxel size (X/Y/Z) を取得できないため、"
+                    "形状を推測した 3D 図は作成しません。"
+                )
+
+            want = list(spec.channels)
             if not want:
                 raise ValueError("読み込むチャンネルがありません")
-            if len(spec.levels) < len(want):
+            if len(want) > PLATE_MAX_CH:
+                raise ValueError(f"一度に描画できるチャンネルは {PLATE_MAX_CH} 個までです")
+            if len(set(want)) != len(want) or any(c < 0 or c >= n_c for c in want):
+                raise ValueError(
+                    f"指定チャンネルが {p.name} の範囲 1–{n_c} と一致しません。"
+                    "画像タブを開き直してください。"
+                )
+            if len(spec.levels) != len(want):
                 raise ValueError("チャンネル数と Min/Max の数が一致しません")
+            if spec.t < 0 or spec.t >= n_t:
+                raise ValueError(
+                    f"指定した T={spec.t + 1} は {p.name} の範囲 1–{n_t} を超えています。"
+                )
+            for lo, hi in spec.levels:
+                if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                    raise ValueError("Min/Max が不正です。各チャンネルで Max を Min より大きくしてください。")
 
             # 0 = no downscale. Otherwise a floor only, so a typo cannot ask for
             # a 4-pixel volume; there is deliberately no upper bound.
@@ -470,24 +553,25 @@ def read_low_volume(spec: VolumeSpec) -> tuple[dict, bytes]:
             # the window that WAS applied rather than anything measured.
             meta = np.array([(int(lo), int(hi)) for lo, hi in spec.levels[:len(want)]],
                             dtype="<i4").tobytes()
-            def _phys(get) -> float:
-                try:
-                    v = get(0)
-                    return float(v.value().doubleValue()) if v is not None else 0.0
-                except Exception:
-                    return 0.0
-
             info = {
                 "channels": want, "out": [out_z, out_h, out_w], "max_xy": cap,
                 "source": [n_c, n_z, h, w], "bytes": len(header) + len(meta) + sum(map(len, planes)),
-                # µm per voxel. 0 means the file did not say, and the renderer
-                # then treats the volume as isotropic — the same fallback the
-                # interactive view uses.
-                "voxel": [_phys(ome.getPixelsPhysicalSizeX),
-                          _phys(ome.getPixelsPhysicalSizeY),
-                          _phys(ome.getPixelsPhysicalSizeZ)],
+                "source_identity": before.identity,
+                "source_revision": before.revision,
+                "t": int(spec.t),
+                "levels": [[float(lo), float(hi)] for lo, hi in spec.levels],
+                # µm per voxel. All three are required above; Plate PDF never
+                # guesses an isotropic shape when acquisition metadata is absent.
+                "voxel": voxel,
             }
-            return info, header + meta + b"".join(planes)
+            payload = header + meta + b"".join(planes)
+            after = snapshot_source(p)
+            if after.identity != before.identity or after.revision != before.revision:
+                raise ValueError(
+                    "ウェル画像または分割 OIR の続きが読み込み中に変更されました。"
+                    "このウェルの画素は PDF に使用していません。"
+                )
+            return info, payload
         finally:
             # A Java reader left open holds the file and its memory-mapped chunks.
             try:
@@ -617,6 +701,66 @@ class WellFrame:
     caption: list[str] = field(default_factory=list)
 
 
+def validate_pdf_layout(
+    rows: int,
+    cols: int,
+    frames: list,
+    well_states: dict[str, str],
+    cell_px: int,
+    table_headers: list[str] | None,
+    table_rows: list[list[str]] | None,
+) -> None:
+    """Reject anything Pillow's grid would otherwise crop or silently replace."""
+    if not (1 <= rows <= 26 and 1 <= cols <= 99):
+        raise ValueError("プレートの行列数が不正です")
+    if cell_px not in PDF_CELL_CHOICES.values():
+        raise ValueError("PDF セル解像度が不正です")
+    if rows * cols * cell_px * cell_px > 250_000_000:
+        raise ValueError("選択したプレートサイズとセル解像度では PDF が大きすぎます")
+    if not frames or len(frames) > rows * cols:
+        raise ValueError("描画されたウェル数が不正です")
+
+    seen_ids: set[str] = set()
+    seen_positions: set[tuple[int, int]] = set()
+    for frame in frames:
+        row, col = int(frame.row), int(frame.col)
+        if not (0 <= row < rows and 0 <= col < cols):
+            raise ValueError(f"{frame.well_id}: PDF グリッドの範囲外です")
+        expected_id = f"{chr(65 + row)}{col + 1:02d}"
+        if frame.well_id != expected_id:
+            raise ValueError(
+                f"ウェル名 {frame.well_id} と位置 ({row + 1}, {col + 1}) が一致しません"
+            )
+        if frame.well_id in seen_ids or (row, col) in seen_positions:
+            raise ValueError(f"同じウェルが複数のフレームにあります: {frame.well_id}")
+        if len(frame.caption) > 20 or any(len(line) > 1000 for line in frame.caption):
+            raise ValueError(f"{frame.well_id}: キャプションが長すぎます")
+        seen_ids.add(frame.well_id)
+        seen_positions.add((row, col))
+
+    for well_id, state in well_states.items():
+        rc = _well_id_to_rc(well_id)
+        if rc is None or not (0 <= rc[0] < rows and 0 <= rc[1] < cols):
+            raise ValueError(f"空ウェル状態の位置が不正です: {well_id}")
+        canonical = f"{chr(65 + rc[0])}{rc[1] + 1:02d}"
+        if well_id != canonical or state not in EMPTY_CELL_LABELS:
+            raise ValueError(f"空ウェル状態が不正です: {well_id}={state}")
+
+    headers = table_headers or []
+    body = table_rows or []
+    if bool(headers) != bool(body):
+        raise ValueError("条件表の見出しと行が一致しません")
+    if headers:
+        if len(headers) > 64 or len(body) != len(frames):
+            raise ValueError("条件表の行数が描画ウェル数と一致しません")
+        if any(len(row) != len(headers) for row in body):
+            raise ValueError("条件表の列数が一致しません")
+        if any(len(header) > 1000 for header in headers):
+            raise ValueError("条件表の見出しが長すぎます")
+        if any(len(cell) > 5000 for row in body for cell in row):
+            raise ValueError("条件表のセルが長すぎます")
+
+
 def _render_table_page(
     headers: list[str],
     rows: list[list[str]],
@@ -730,6 +874,9 @@ def compose_pdf(
     downstream could catch it. A well that was supposed to render and failed never
     reaches here at all — the caller fails the whole export instead.
     """
+    validate_pdf_layout(
+        rows, cols, frames, well_states, cell_px, table_headers, table_rows,
+    )
     from PIL import Image, ImageDraw, ImageFont
 
     pad = max(2, int(cell_px * _PAD_F))
@@ -739,9 +886,6 @@ def compose_pdf(
     gutter = label_h * 2
 
     page_w = margin * 2 + gutter + cols * (cell_px + pad)
-    page_h = margin * 2 + title_h + label_h + rows * (cell_px + pad)
-    page = Image.new("RGB", (page_w, page_h), "white")
-    draw = ImageDraw.Draw(page)
 
     chosen, _ = resolve_font_name()
 
@@ -756,6 +900,42 @@ def compose_pdf(
         return ImageFont.load_default(px)
 
     f_title, f_label, f_cell = font(max(12, title_h // 2)), font(max(9, label_h * 2 // 3)), font(max(8, label_h // 2))
+
+    # Provenance must not be ellipsized or clipped. Prefer a separator before
+    # falling back to a character boundary, so a long T list remains complete
+    # and readable even on a one-column plate. Reserve real page height below
+    # the grid for every resulting line.
+    footer_text = normalize_text(footer)
+    probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    footer_lines: list[str] = []
+    if footer_text:
+        available = page_w - margin * 2
+        line = ""
+        for char in footer_text:
+            candidate = line + char
+            if line and probe.textlength(candidate, font=f_cell) > available:
+                split_at = max(line.rfind(" ") + 1,
+                               line.rfind(",") + 1,
+                               line.rfind("|") + 1)
+                if split_at > 0:
+                    footer_lines.append(line[:split_at].rstrip())
+                    line = line[split_at:].lstrip() + char
+                else:
+                    footer_lines.append(line)
+                    line = char
+            else:
+                line = candidate
+        if line:
+            footer_lines.append(line)
+    cell_box = f_cell.getbbox("Ag")
+    footer_line_h = max(label_h, cell_box[3] - cell_box[1] + 2)
+    grid_bottom = margin + title_h + label_h + rows * (cell_px + pad)
+    footer_gap = max(3, margin // 3)
+    footer_top = grid_bottom + footer_gap
+    page_h = (footer_top + len(footer_lines) * footer_line_h + footer_gap
+              if footer_lines else grid_bottom + margin)
+    page = Image.new("RGB", (page_w, page_h), "white")
+    draw = ImageDraw.Draw(page)
 
     draw.text((margin, margin), normalize_text(f"{plate_name}  —  {rows}x{cols}"),
               fill="black", font=f_title)
@@ -803,8 +983,12 @@ def compose_pdf(
                 draw.text((x + cell_px // 2, y + cell_px // 2 + label_h), state,
                           fill="#b0b0b0", font=f_cell, anchor="mm")
 
-    draw.text((margin, page_h - margin // 2), normalize_text(footer),
-              fill="#808080", font=f_cell, anchor="ls")
+    for line_no, line in enumerate(footer_lines):
+        position = (margin, footer_top + line_no * footer_line_h)
+        bounds = draw.textbbox(position, line, font=f_cell, anchor="lt")
+        if bounds[2] > page_w - margin + 1 or bounds[3] > page_h:
+            raise ValueError("PDF footer の配置検証に失敗しました。")
+        draw.text(position, line, fill="#808080", font=f_cell, anchor="lt")
 
     # Written exactly where asked. Whether replacing something is acceptable was
     # settled before this was called — silently sliding to `_01` produced folders
@@ -875,7 +1059,7 @@ def selftest() -> int:
         with tempfile.TemporaryDirectory() as tmp:
             out = compose_pdf(
                 Path(tmp) / "selftest.pdf", "セルフテスト", 2, 2, frames,
-                {"B03": "disabled"}, PDF_CELL_CHOICES["draft"], "selftest",
+                {"A02": "disabled"}, PDF_CELL_CHOICES["draft"], "selftest",
             )
             head, size = out.read_bytes()[:5], out.stat().st_size
     except Exception as e:
@@ -890,7 +1074,7 @@ def selftest() -> int:
     rc = _selftest_split_guard()
     if rc:
         return rc
-    return 0
+    return _selftest_source_state()
 
 
 class _FakeReader:
@@ -901,11 +1085,20 @@ class _FakeReader:
     tested with no JVM, no Bio-Formats and no 4 GiB of real acquisition.
     """
 
-    def __init__(self, table: dict | None):
+    def __init__(self, table: dict | None, size_z: int = 0,
+                 used_files: list[str] | None = None):
         self._table = table
+        self._size_z = size_z
+        self._used_files = used_files or []
 
     def getSeriesMetadata(self):
         return self._table
+
+    def getSizeZ(self):
+        return self._size_z
+
+    def getUsedFiles(self):
+        return self._used_files
 
 
 def _z_axis(declared: int, *, at: int = 3) -> dict:
@@ -932,6 +1125,38 @@ def _selftest_split_guard() -> int:
     import tempfile
 
     try:
+        class _FakeFormatTools:
+            INT8, UINT8, INT16, UINT16 = 0, 1, 2, 3
+            INT32, UINT32, FLOAT, DOUBLE = 4, 5, 6, 7
+
+        if (_plate_source_dtype(_FakeFormatTools.UINT8, _FakeFormatTools, True,
+                                "u8.oir") != np.dtype("u1")
+                or _plate_source_dtype(_FakeFormatTools.INT16, _FakeFormatTools,
+                                       False, "i16.oir") != np.dtype(">i2")):
+            raise AssertionError("supported plate pixel types changed representation")
+        for unsafe in (_FakeFormatTools.INT8, _FakeFormatTools.INT32,
+                       _FakeFormatTools.UINT32, _FakeFormatTools.FLOAT,
+                       _FakeFormatTools.DOUBLE):
+            try:
+                _plate_source_dtype(unsafe, _FakeFormatTools, True, "unsafe.oir")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"unsafe plate pixel type {unsafe} was accepted")
+
+        consistent_stage = {"B02": (0.0, 0.0), "B03": (100.0, 0.0)}
+        _require_stage_label_match("B02", 1, 1, consistent_stage, 100.0, 100.0)
+        _require_stage_label_match("B03", 1, 2, consistent_stage, 100.0, 100.0)
+        transposed_stage = {"B02": (100.0, 0.0), "B03": (0.0, 0.0)}
+        try:
+            _require_stage_label_match("B02", 1, 1, transposed_stage, 100.0, 100.0)
+        except ValueError as e:
+            message = str(e)
+        else:
+            raise AssertionError("a stage position with the wrong well label was accepted")
+        if "B02" not in message or "B03" not in message or "開けません" not in message:
+            raise AssertionError(f"stage mismatch message was incomplete: {message!r}")
+
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
             partial = d / "Stitch_B02_G001.oir"
@@ -982,9 +1207,120 @@ def _selftest_split_guard() -> int:
             if "B02" not in msg or "続きのファイル 2 個" not in msg:
                 print(f"selftest FAILED: message omits well or chunk count: {msg!r}", flush=True)
                 return 14
+
+            # The ordinary reader must warn even when the first continuation is
+            # present. A partial copy with `_00001` but no later chunks was once
+            # mistaken for a complete stack and could then be projected.
+            from reader import _detect_incomplete_oir
+            warning = _detect_incomplete_oir(
+                _FakeReader(_z_axis(50), size_z=13,
+                            used_files=[str(partial), str(d / "Stitch_B02_G001_00001")]),
+                str(partial),
+            )
+            if "13/50" not in warning:
+                print("selftest FAILED: partial split OIR with one chunk was not warned", flush=True)
+                return 14
     except Exception as e:
         print(f"selftest FAILED: split guard -> {type(e).__name__}: {e}", flush=True)
         return 14
 
     print("selftest: split-chunk guard OK (truncated wells fail the export)", flush=True)
+    return 0
+
+
+def _selftest_source_state() -> int:
+    """Prove logical-source tokens distinguish acquisitions and freeze chunks."""
+    import os
+    import sys
+    import tempfile
+    import unicodedata
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            left_dir, right_dir = Path(tmp, "left"), Path(tmp, "right")
+            left_dir.mkdir()
+            right_dir.mkdir()
+            left = left_dir / "Stitch_B02_G001.oir"
+            right = right_dir / "Stitch_B02_G001.oir"
+            left.write_bytes(b"main")
+            os.link(left, right)
+            chunk = left_dir / "Stitch_B02_G001_00001"
+            chunk.write_bytes(b"chunk-a")
+
+            first = snapshot_source(left)
+            alias = snapshot_source(right)
+            if first.identity == alias.identity:
+                raise AssertionError("hardlink in another acquisition shared source identity")
+
+            chunk.write_bytes(b"chunk-b")
+            changed_chunk = snapshot_source(left)
+            if (changed_chunk.identity != first.identity
+                    or changed_chunk.revision == first.revision):
+                raise AssertionError("split chunk change did not change only the revision")
+
+            extra = left_dir / "Stitch_B02_G001_00002"
+            extra.write_bytes(b"more")
+            added_chunk = snapshot_source(left)
+            if added_chunk.revision == changed_chunk.revision or added_chunk.members != 3:
+                raise AssertionError("added split chunk was absent from the revision")
+
+            bracket = left_dir / "sample[1].oir"
+            bracket.write_bytes(b"main")
+            bracket_chunk = left_dir / "sample[1]_00001"
+            bracket_chunk.write_bytes(b"part-a")
+            bracket_before = snapshot_source(bracket)
+            bracket_chunk.write_bytes(b"part-b")
+            bracket_after = snapshot_source(bracket)
+            if (bracket_before.members != 2
+                    or bracket_before.revision == bracket_after.revision):
+                raise AssertionError("bracketed OIR stem lost its continuation chunk")
+
+            if sys.platform == "darwin":
+                composed = left_dir / "caf\u00e9.oir"
+                composed.write_bytes(b"main")
+                composed_chunk = left_dir / "caf\u00e9_00001"
+                composed_chunk.write_bytes(b"part-a")
+                decomposed = Path(unicodedata.normalize("NFD", str(composed)))
+                unicode_before = snapshot_source(decomposed)
+                composed_chunk.write_bytes(b"part-b")
+                unicode_after = snapshot_source(decomposed)
+                if (unicode_before.members != 2
+                        or unicode_before.revision == unicode_after.revision):
+                    raise AssertionError("Unicode alias lost its continuation chunk")
+
+                mixed = left_dir / "MixedCase.oir"
+                mixed.write_bytes(b"main")
+                mixed_chunk = left_dir / "MixedCase_00001"
+                mixed_chunk.write_bytes(b"part-a")
+                case_before = snapshot_source(left_dir / "mixedcase.oir")
+                mixed_chunk.write_bytes(b"part-b")
+                case_after = snapshot_source(left_dir / "mixedcase.oir")
+                if (case_before.members != 2
+                        or case_before.identity != case_after.identity
+                        or case_before.revision == case_after.revision):
+                    raise AssertionError("macOS case alias lost its continuation chunk")
+
+            if os.name == "nt":
+                mixed = left_dir / "MixedCase.oir"
+                mixed.write_bytes(b"main")
+                mixed_chunk = left_dir / "MixedCase_00001"
+                mixed_chunk.write_bytes(b"part-a")
+                case_before = snapshot_source(left_dir / "mixedcase.oir")
+                mixed_chunk.write_bytes(b"part-b")
+                case_after = snapshot_source(left_dir / "mixedcase.oir")
+                if (case_before.members != 2
+                        or case_before.revision == case_after.revision):
+                    raise AssertionError("Windows path case lost its continuation chunk")
+
+            replacement = left_dir / "replacement.oir"
+            replacement.write_bytes(b"main")
+            os.replace(replacement, left)
+            replaced = snapshot_source(left)
+            if replaced.identity == added_chunk.identity:
+                raise AssertionError("atomic source replacement kept the old identity")
+    except Exception as e:
+        print(f"selftest FAILED: source state -> {type(e).__name__}: {e}", flush=True)
+        return 15
+
+    print("selftest: source state OK (path, inode and split chunks frozen)", flush=True)
     return 0

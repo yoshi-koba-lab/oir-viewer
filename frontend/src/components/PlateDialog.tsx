@@ -1,18 +1,26 @@
 import { useEffect, useMemo, useState, useRef } from 'react';
 import {
   chooseFolder, scanPlate, fetchPlateVolume, composePlatePdf,
-  PLATE_XY_CHOICES, PDF_CELL_CHOICES,
+  checkPlatePdfTarget, PLATE_XY_CHOICES, PDF_CELL_CHOICES,
 } from '../utils/api';
 import { openAndReload } from '../hooks/useImageLoader';
 import { useImageStore } from '../stores/imageStore';
 import { usePlateStore } from '../stores/plateStore';
 import { PlateRenderer, parseVolume } from '../utils/plateRender';
-import { collectOpenWells, snapshotOf } from '../utils/plateWells';
+import { collectOpenWells, mismatchedPlateTabs, snapshotOf } from '../utils/plateWells';
 import { gpuLimits } from '../utils/gpuLimits';
 import { OverwriteConflict } from '../utils/api';
-import { filenameProblem } from '../utils/paths';
+import { basenameOf, filenameProblem } from '../utils/paths';
 import { PlateTable } from './PlateTable';
 import { OverwriteConfirm } from './SaveDialog';
+
+function pdfInputStem(name: string): string {
+  return name.trim().replace(/\.pdf$/i, '');
+}
+
+function pdfInputProblem(name: string): string {
+  return name.trim() ? filenameProblem(pdfInputStem(name)) : '';
+}
 
 /**
  * Reads an Olympus MATL acquisition and shows what it contains, in the plate's
@@ -52,8 +60,27 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
   const abortRef = useRef<AbortController | null>(null);
   /** True from the moment an export starts until it has finished or failed. */
   const [exporting, setExporting] = useState(false);
+  /** The final POST cannot be cancelled once the backend starts publishing. */
+  const [finalizingPdf, setFinalizingPdf] = useState(false);
+  const finalizingPdfRef = useRef(false);
+  /** Synchronous guard: React state alone cannot stop a same-tick double click. */
+  const activePdfRun = useRef(0);
+  /** Invalidates a preflight whose target changed or whose dialog was closed. */
+  const pdfRunSeq = useRef(0);
   /** Name for the PDF. Empty falls back to the plate name plus a timestamp. */
   const [pdfName, setPdfName] = useState('');
+  /** Kept on screen so the name can be checked before any well is rendered. */
+  const [pdfOutputDir, setPdfOutputDir] = useState('');
+  const [pdfBrowsing, setPdfBrowsing] = useState(false);
+  const [checkingPdfName, setCheckingPdfName] = useState(false);
+  const [nameConflict, setNameConflict] = useState<
+    { files: string[]; count: number; more: number } | null
+  >(null);
+  type PdfJob = { outputDir: string; filename: string; expectedRevision?: string };
+  /** The exact path the user approved; confirmation never opens a second picker. */
+  const [pendingJob, setPendingJob] = useState<PdfJob | null>(null);
+  /** Invalidates an older asynchronous name check after the field changes. */
+  const pdfCheckSeq = useRef(0);
   const [conflict, setConflict] = useState<
     { files: string[]; count: number; more: number } | null
   >(null);
@@ -63,6 +90,7 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
   const activeImageId = useImageStore((s) => s.activeImageId);
 
   const pick = async () => {
+    if (activePdfRun.current) return;
     setError('');
     setBusy(true);
     try {
@@ -113,6 +141,54 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
     });
   };
 
+  const invalidatePdfTarget = () => {
+    pdfCheckSeq.current += 1;
+    pdfRunSeq.current += 1;
+    setCheckingPdfName(false);
+    setNameConflict(null);
+    setConflict(null);
+    setPendingJob(null);
+  };
+
+  /** Check a typed name when focus leaves it; the export repeats this check. */
+  const probePdfTarget = async (dir = pdfOutputDir) => {
+    const scan = plate;
+    const name = pdfInputStem(pdfName);
+    if (!scan || !dir.trim() || !pdfName.trim() || pdfInputProblem(pdfName)) return;
+    const seq = ++pdfCheckSeq.current;
+    setCheckingPdfName(true);
+    try {
+      await checkPlatePdfTarget({
+        plate_name: scan.name, output_dir: dir.trim(), filename: name,
+      });
+      if (seq === pdfCheckSeq.current) setNameConflict(null);
+    } catch (e) {
+      if (seq !== pdfCheckSeq.current) return;
+      if (e instanceof OverwriteConflict) {
+        setNameConflict({ files: e.files, count: e.count, more: e.more });
+      } else {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      if (seq === pdfCheckSeq.current) setCheckingPdfName(false);
+    }
+  };
+
+  const browsePdfOutput = async () => {
+    setPdfBrowsing(true);
+    try {
+      const picked = await chooseFolder();
+      if (picked.cancelled || !picked.path) return;
+      invalidatePdfTarget();
+      setPdfOutputDir(picked.path);
+      await probePdfTarget(picked.path);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPdfBrowsing(false);
+    }
+  };
+
   /**
    * Open the selected wells as ordinary image tabs, in plate order.
    *
@@ -151,7 +227,7 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
    * appear in the PDF as an empty cell — indistinguishable from a well nobody
    * imaged — so the first failure aborts and nothing is written.
    */
-  const exportPdf = async (overwrite = false) => {
+  const exportPdf = async (overwrite = false, approvedJob: PdfJob | null = null) => {
     const scan = plate;
     if (!scan) return;
     // Flush the tab being looked at. Its settings live in the live store fields
@@ -160,12 +236,33 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
     // exactly the change the user came here to capture.
     useImageStore.getState().saveViewState();
     const wells = collectOpenWells(scan);
+    const mismatched = mismatchedPlateTabs(scan);
+
+    if (mismatched.length) {
+      setError(
+        `別のプレート、または変更前のファイルから開いた同名ウェルがあります: ${mismatched.join(', ')}\n`
+        + 'そのタブを閉じ、このプレートのウェルを開き直してください。PDF は作成していません。',
+      );
+      return;
+    }
 
     if (wells.length === 0) {
       setError(
         '開いているウェルがありません。\n'
         + 'ウェルを選んで「選択したウェルを開く」で読み込み、3D ビューで各ウェルを'
         + '調整してから書き出してください。',
+      );
+      return;
+    }
+    const wellCounts = new Map<string, number>();
+    for (const w of wells) wellCounts.set(w.wellId, (wellCounts.get(w.wellId) ?? 0) + 1);
+    const duplicateWells = [...wellCounts.entries()]
+      .filter(([, count]) => count > 1)
+      .map(([wellId]) => wellId);
+    if (duplicateWells.length) {
+      setError(
+        `同じウェルが複数のタブで開かれています: ${duplicateWells.join(', ')}\n`
+        + 'どちらを図に使うか曖昧なため、重複するタブを閉じてください。',
       );
       return;
     }
@@ -180,6 +277,35 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
         `表示中のチャンネルがないウェルがあります: ${noCh.map((w) => w.wellId).join(', ')}\n`
         + '各ウェルでチャンネルを 1 つ以上表示してください。',
       );
+      return;
+    }
+    const outsideInteractive3D = wells.filter(
+      (w) => w.channelIdx.some((channel) => channel >= 4),
+    );
+    if (outsideInteractive3D.length) {
+      setError(
+        `3D 画面に読み込まれていない5番目以降のチャンネルが選ばれています: ${
+          outsideInteractive3D.map((w) => w.wellId).join(', ')}\n`
+        + 'PDF と画面が異なる図になるため作成しません。先頭4チャンネル内で表示を調整してください。',
+      );
+      return;
+    }
+
+    // Freeze the conditions at the same instant as the well views. The table
+    // remains useful to inspect while a slow preflight runs, but later edits
+    // must not be mixed into the already-snapshotted images.
+    const tableState = usePlateStore.getState();
+    const columns = tableState.columns.map((column) => ({ ...column }));
+    const cells = Object.fromEntries(
+      Object.entries(tableState.cells).map(([wellId, row]) => [wellId, { ...row }]),
+    );
+    if (columns.length > 64
+      || columns.some((column) => column.label.length > 1000)
+      || wells.some((well) => columns.some((column) => (
+        (cells[well.wellId]?.[column.key] ?? '').length > (column.onFigure ? 1000 : 5000)
+      )))
+      || columns.filter((column) => column.onFigure).length > 20) {
+      setError('条件表または図中キャプションが長すぎます。列数・文字数を減らしてください。');
       return;
     }
 
@@ -198,20 +324,96 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
     const maxXy = wanted === 0 ? max3D : Math.min(wanted, max3D);
     const clamped = maxXy !== wanted;
 
-    setError(''); setResult(''); cancelRef.current = false; setExporting(true);
+    let job = approvedJob;
+    const outputDir = job?.outputDir ?? pdfOutputDir.trim();
+    const typedName = job?.filename ?? pdfInputStem(pdfName);
+    if (!outputDir) {
+      setError('PDF の保存先フォルダを選んでください。');
+      return;
+    }
+    if (!job && pdfInputProblem(pdfName)) {
+      setError(pdfInputProblem(pdfName));
+      return;
+    }
+
+    // Claim the run synchronously before the first await. Otherwise a slow
+    // external drive leaves a window where a second click can start another
+    // eight-well render, or closing the dialog can orphan the first one.
+    if (activePdfRun.current) return;
+    const runId = ++pdfRunSeq.current;
+    activePdfRun.current = runId;
+    cancelRef.current = false;
+    setError('');
+    setResult('');
+    setExporting(true);
+
+    const releaseRun = () => {
+      if (activePdfRun.current !== runId) return;
+      activePdfRun.current = 0;
+      setProgress('');
+      setExporting(false);
+    };
+
+    if (!job) {
+      setProgress('PDF 名を確認中…');
+      try {
+        const checked = await checkPlatePdfTarget({
+          plate_name: scan.name, output_dir: outputDir, filename: typedName,
+        });
+        if (pdfRunSeq.current !== runId || cancelRef.current) {
+          releaseRun();
+          return;
+        }
+        job = {
+          outputDir, filename: checked.filename, expectedRevision: checked.revision,
+        };
+        setNameConflict(null);
+      } catch (e) {
+        if (pdfRunSeq.current === runId && !cancelRef.current) {
+          if (e instanceof OverwriteConflict) {
+            const resolved = typedName
+              || (basenameOf(e.files[0] ?? '').replace(/\.pdf$/i, '') || 'plate');
+            const blockedJob = {
+              outputDir, filename: resolved,
+              expectedRevision: Object.values(e.revisions)[0],
+            };
+            setPendingJob(blockedJob);
+            setNameConflict({ files: e.files, count: e.count, more: e.more });
+            setConflict({ files: e.files, count: e.count, more: e.more });
+          } else {
+            setError(e instanceof Error ? e.message : String(e));
+          }
+        }
+        releaseRun();
+        return;
+      }
+    }
+
+    // A confirmed preflight starts the long render with the progress UI visible,
+    // not hidden behind the confirmation dialog for the next several minutes.
+    if (approvedJob) {
+      setConflict(null);
+      setPendingJob(null);
+      setNameConflict(null);
+    }
+
+    setProgress('');
     const cellPx = PDF_CELL_CHOICES.find((c) => c.key === cellKey)!.px;
+    if (scan.rows * scan.cols * cellPx * cellPx > 250_000_000) {
+      setError('このプレートサイズではセル解像度が大きすぎます。1段階下げてください。');
+      releaseRun();
+      return;
+    }
     const frames: {
       well_id: string; row: number; col: number; png_b64: string; caption: string[];
+      source_path: string; source_identity: string; source_revision: string;
     }[] = [];
     let renderer: PlateRenderer | null = null;
 
-    const { columns, cells } = usePlateStore.getState();
     const figureCols = columns.filter((c) => c.onFigure);
+    const runCancelled = () => cancelRef.current || pdfRunSeq.current !== runId;
 
     try {
-      const dir = await chooseFolder();
-      if (dir.cancelled || !dir.path) return;
-
       // Rendered at the cell's own size. Capping it below cell_px would make the
       // larger choices produce a bigger page holding the same image, i.e. Max
       // would letterbox less detail than High — the opposite of what it says.
@@ -220,7 +422,7 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
       renderer = new PlateRenderer(cellPx);
 
       for (const [i, w] of wells.entries()) {
-        if (cancelRef.current) { setResult('中止しました。PDF は作成していません。'); return; }
+        if (runCancelled()) { setResult('中止しました。PDF は作成していません。'); return; }
         setProgress(`${w.wellId} (${i + 1}/${wells.length}) 読み込み中…`);
         abortRef.current = new AbortController();
         // Each well carries its own contrast and channel choice — that is the
@@ -228,29 +430,41 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
         // this well's, not a global one.
         const buf = await fetchPlateVolume({
           path: w.path!,
+          source_identity: w.sourceIdentity,
+          source_revision: w.sourceRevision,
           channels: w.channelIdx,
           levels: w.levels,
+          t: w.t,
           max_xy: maxXy,
         }, abortRef.current.signal);
+        if (runCancelled()) { setResult('中止しました。PDF は作成していません。'); return; }
         setProgress(`${w.wellId} (${i + 1}/${wells.length}) 描画中…`);
-        const vol = parseVolume(buf.data, buf.info ?? undefined);
+        const vol = parseVolume(buf.data, buf.info);
         const shot = await renderer.render(
           w.wellId, vol, w.colors, w.channelIdx.map(() => true),
           w.view.az, w.view.el, w.view.radius, w.zFrac,
         );
+        if (runCancelled()) { setResult('中止しました。PDF は作成していません。'); return; }
         let bin = '';
         for (let k = 0; k < shot.png.length; k += 0x8000) {
           bin += String.fromCharCode(...shot.png.subarray(k, k + 0x8000));
         }
         frames.push({
           well_id: w.wellId, row: w.row, col: w.col, png_b64: btoa(bin),
+          source_path: w.path!,
+          source_identity: buf.info.source_identity,
+          source_revision: buf.info.source_revision,
           caption: figureCols
             .map((c) => (cells[w.wellId]?.[c.key] ?? '').trim())
-            .filter(Boolean),
+            .filter(Boolean)
+            .concat(w.numT > 1 ? [`T${w.t + 1}`] : []),
         });
       }
 
-      setProgress('PDF を作成中…');
+      if (runCancelled()) { setResult('中止しました。PDF は作成していません。'); return; }
+      finalizingPdfRef.current = true;
+      setFinalizingPdf(true);
+      setProgress('PDF を作成中…（この段階は中止できません）');
       // Why each empty cell is empty. Marking them all "not acquired" would print
       // a false statement over a well the microscope did image — a reader of the
       // figure has no way to tell that apart from a genuinely empty position.
@@ -264,15 +478,20 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
       }
       const res = await composePlatePdf({
         plate_name: scan.name, rows: scan.rows, cols: scan.cols,
-        frames, well_states: states, cell_px: cellPx, output_dir: dir.path,
-        filename: pdfName.trim(),
+        frames, well_states: states, cell_px: cellPx, output_dir: job.outputDir,
+        filename: job.filename,
         overwrite,
+        expected_revision: job.expectedRevision,
         table_headers: columns.map((c) => c.label),
-        table_rows: wells.map((w) => columns.map((c) => cells[w.wellId]?.[c.key] ?? '')),
+        table_rows: columns.length
+          ? wells.map((w) => columns.map((c) => cells[w.wellId]?.[c.key] ?? ''))
+          : [],
         // The resolution actually applied, never the one requested. Recording the
         // request is how the footer came to state a resolution that was not used.
         footer: `matl ${scan.matl_sha256.slice(0, 8)} | vol ${volKey}(${maxXy})`
               + `${clamped ? ` GPU上限${max3D}に制限` : ''}`
+              + `${wells.some((w) => w.numT > 1)
+                ? ` | T ${wells.map((w) => `${w.wellId}:${w.t + 1}`).join(',')}` : ''}`
               + ` | cell ${cellPx}px | ${wells.length} wells | ${new Date().toISOString()}`,
       });
       setResult(
@@ -284,25 +503,30 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
     } catch (e) {
       // A cancel aborts the fetch, which surfaces here as an AbortError. That is
       // the user's own action, not a failure to report as one.
-      if (cancelRef.current) setResult('中止しました。PDF は作成していません。');
+      if (runCancelled()) setResult('中止しました。PDF は作成していません。');
       // Nothing was written; ask before replacing. The wells are already
       // rendered, so confirming does not repeat the expensive part... it does,
       // in fact, and that is the honest trade: keeping every frame in memory to
       // avoid it is what makes a 24-well export run out of room.
       else if (e instanceof OverwriteConflict) {
+        setPendingJob({ ...job, expectedRevision: Object.values(e.revisions)[0] });
+        setNameConflict({ files: e.files, count: e.count, more: e.more });
         setConflict({ files: e.files, count: e.count, more: e.more });
       } else setError(e instanceof Error ? e.message : String(e));
     } finally {
       abortRef.current = null;
       renderer?.dispose();
-      setProgress('');
-      setExporting(false);
+      finalizingPdfRef.current = false;
+      setFinalizingPdf(false);
+      releaseRun();
     }
   };
 
   /** Stop the run: the flag ends the loop, the abort ends the current well. */
   const cancelExport = () => {
+    if (finalizingPdfRef.current) return;
     cancelRef.current = true;
+    pdfRunSeq.current += 1;
     abortRef.current?.abort();
     setProgress('中止しています…');
   };
@@ -312,7 +536,8 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
    * writing a PDF nothing on screen is waiting for. Stop the run instead.
    */
   const requestClose = () => {
-    if (!exporting) { onClose(); return; }
+    if (!activePdfRun.current) { onClose(); return; }
+    if (finalizingPdfRef.current) return;
     cancelExport();
   };
 
@@ -343,7 +568,7 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
 
         <button
           onClick={pick}
-          disabled={busy}
+          disabled={busy || exporting}
           className="px-4 py-2 rounded-lg bg-[var(--accent)] text-white text-xs font-medium
                      hover:opacity-90 disabled:opacity-50 transition"
         >
@@ -525,12 +750,44 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
                       ))}
                     </select>
                   </label>
+                  <label className="text-[10px] text-[var(--text-secondary)] flex-1 min-w-[15rem]">
+                    PDF の保存先
+                    <div className="flex gap-1 mt-1">
+                      <input
+                        type="text"
+                        value={pdfOutputDir}
+                        onChange={(e) => {
+                          setPdfOutputDir(e.target.value);
+                          invalidatePdfTarget();
+                        }}
+                        onBlur={() => { void probePdfTarget(); }}
+                        disabled={exporting}
+                        placeholder="保存先フォルダ"
+                        className="min-w-0 flex-1 bg-[var(--bg-primary)] border border-[var(--border)]
+                                   rounded px-2 py-1 text-xs text-[var(--text-primary)]
+                                   placeholder:text-[var(--text-secondary)]"
+                      />
+                      <button
+                        type="button"
+                        onClick={browsePdfOutput}
+                        disabled={exporting || pdfBrowsing}
+                        className="px-2 py-1 rounded bg-[var(--border)] text-[10px]
+                                   text-[var(--text-secondary)] hover:text-white disabled:opacity-40"
+                      >
+                        {pdfBrowsing ? '…' : '選択'}
+                      </button>
+                    </div>
+                  </label>
                   <label className="text-[10px] text-[var(--text-secondary)] flex-1 min-w-[12rem]">
                     ファイル名（省略時はプレート名＋日時）
                     <input
                       type="text"
                       value={pdfName}
-                      onChange={(e) => { setPdfName(e.target.value); setConflict(null); }}
+                      onChange={(e) => {
+                        setPdfName(e.target.value);
+                        invalidatePdfTarget();
+                      }}
+                      onBlur={() => { void probePdfTarget(); }}
                       disabled={exporting}
                       placeholder={plate.name}
                       className="block w-full mt-1 bg-[var(--bg-primary)] border border-[var(--border)]
@@ -541,7 +798,8 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
                   <button
                     onClick={() => exportPdf(false)}
                     disabled={exporting || !!loading || openWells.length === 0 || !!conflict
-                              || !!(pdfName.trim() && filenameProblem(pdfName))}
+                              || !pdfOutputDir.trim()
+                              || !!pdfInputProblem(pdfName)}
                     className="px-4 py-2 rounded-lg bg-emerald-600 text-white text-xs font-medium
                                hover:opacity-90 disabled:opacity-40 transition"
                   >
@@ -550,14 +808,23 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
                   {exporting && (
                     <button
                       onClick={cancelExport}
-                      disabled={cancelRef.current}
+                      disabled={cancelRef.current || finalizingPdf}
                       className="text-[11px] underline text-[var(--text-secondary)]
                                  hover:text-white disabled:opacity-40"
                     >
-                      中止
+                      {finalizingPdf ? 'PDF 保存中' : '中止'}
                     </button>
                   )}
                 </div>
+                {pdfInputProblem(pdfName) ? (
+                  <p className="text-[10px] text-red-400 mt-1">{pdfInputProblem(pdfName)}</p>
+                ) : checkingPdfName ? (
+                  <p className="text-[10px] text-[var(--text-secondary)] mt-1">同名ファイルを確認中…</p>
+                ) : nameConflict ? (
+                  <p className="text-[10px] text-amber-400 mt-1">
+                    {nameConflict.files[0]} は既にあります。作成前に上書きを確認します。
+                  </p>
+                ) : null}
                 <p className="text-[10px] text-[var(--text-secondary)] mt-2 leading-relaxed">
                   コントラストは<strong>いま画面で設定されている Min/Max と色</strong>をそのまま
                   焼き込みます（ウェルごとの自動調整はしません）。表示中のチャンネルのみ、最大 4 つ。<br />
@@ -580,8 +847,8 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
         <OverwriteConfirm
           conflict={conflict}
           busy={exporting}
-          onCancel={() => setConflict(null)}
-          onConfirm={() => exportPdf(true)}
+          onCancel={() => { setConflict(null); setPendingJob(null); }}
+          onConfirm={() => pendingJob && exportPdf(true, pendingJob)}
         />
       )}
     </>

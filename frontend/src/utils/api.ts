@@ -82,6 +82,8 @@ export interface ImageMetadata {
   id?: string;
   filename: string;
   source_path: string;
+  source_identity: string;
+  source_revision: string;
   num_channels: number;
   num_z: number;
   num_t: number;
@@ -104,6 +106,9 @@ export interface ImageMetadata {
 export interface ImageListItem {
   id: string;
   filename: string;
+  source_path: string;
+  source_identity: string;
+  source_revision: string;
   num_channels: number;
   num_z: number;
   num_t: number;
@@ -393,26 +398,41 @@ export class OverwriteConflict extends Error {
   count: number;
   more: number;
   outputDir: string;
+  revisions: Record<string, string>;
 
-  constructor(files: string[], count: number, more: number, outputDir: string) {
+  constructor(
+    files: string[], count: number, more: number, outputDir: string,
+    revisions: Record<string, string>,
+  ) {
     super(`${count} 個のファイルが既にあります`);
     this.name = 'OverwriteConflict';
     this.files = files;
     this.count = count;
     this.more = more;
     this.outputDir = outputDir;
+    this.revisions = revisions;
   }
 }
 
 /** Recognise the backend's "these already exist" refusal. Nothing was written. */
 async function throwIfConflict(res: Response): Promise<void> {
   if (res.status !== 409) return;
-  let body: { files?: string[]; count?: number; more?: number; output_dir?: string } = {};
-  try { body = JSON.parse(await res.text()); } catch { /* fall through to a plain error */ }
-  if (!body.count) return;
-  throw new OverwriteConflict(
-    body.files ?? [], body.count, body.more ?? 0, body.output_dir ?? '',
-  );
+  let body: {
+    files?: string[]; count?: number; more?: number; output_dir?: string;
+    revisions?: Record<string, string>;
+  } = {};
+  // Read a clone so a non-overwrite 409 can still be described by the normal
+  // error path. Consuming `res` here used to erase the useful backend message.
+  try { body = JSON.parse(await res.clone().text()); } catch { /* plain fallback below */ }
+  if (body.count) {
+    throw new OverwriteConflict(
+      body.files ?? [], body.count, body.more ?? 0, body.output_dir ?? '',
+      body.revisions ?? {},
+    );
+  }
+  if ((body as { error?: string }).error) {
+    throw new Error((body as { error: string }).error);
+  }
 }
 
 export async function saveImages(req: SaveRequest): Promise<SaveResponse> {
@@ -432,17 +452,29 @@ export interface ProjectionRequest {
   z_to: number;
   t: number;
   output_dir: string;
+  /** Exact stem to save under for one image. A batch keeps each source name. */
+  filename?: string;
+  /** Replace an existing projection after explicit confirmation. */
+  overwrite?: boolean;
+  expected_revisions?: Record<string, string>;
 }
 
 export interface ProjectionResultItem {
   id: string;
+  source_image_id: string;
   path: string;
   filename: string;
   metadata: ImageMetadata;
 }
 
 export async function applyProjection(req: ProjectionRequest): Promise<{ results: ProjectionResultItem[] }> {
-  return postJson<{ results: ProjectionResultItem[] }>('/api/projection', req, '投影の作成に失敗');
+  const res = await fetch('/api/projection', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  });
+  await throwIfConflict(res);
+  return readJson<{ results: ProjectionResultItem[] }>(res, '投影の作成に失敗');
 }
 
 export function decodeUint16(b64: string, width: number, height: number): Uint16Array {
@@ -607,6 +639,9 @@ export interface PlateWell {
   tile_grid: string;
   /** null when the microscope's stitched file for this well is not on disk. */
   stitch_path: string | null;
+  /** Opaque backend tokens for matching the exact file and split OIR chunks. */
+  stitch_identity: string;
+  stitch_revision: string;
   stitch_bytes: number;
   chunk_count: number;
   /** Set when the well label and the stage coordinates disagree. */
@@ -650,6 +685,8 @@ export async function scanPlate(path: string): Promise<PlateScan> {
 
 export interface PlateVolumeRequest {
   path: string;
+  source_identity: string;
+  source_revision: string;
   channels: number[];
   /** [[min, max], ...] aligned with `channels`. Required: never auto-stretched. */
   levels: [number, number][];
@@ -671,11 +708,16 @@ export interface PlateVolumeInfo {
   bytes: number;
   /** µm per voxel [x, y, z]; a zero means the file did not record it. */
   voxel: [number, number, number];
+  source_identity: string;
+  source_revision: string;
+  /** 0-based time point actually read. */
+  t: number;
+  levels: [number, number][];
 }
 
 export interface PlateVolume {
   data: ArrayBuffer;
-  info: PlateVolumeInfo | null;
+  info: PlateVolumeInfo;
 }
 
 export async function fetchPlateVolume(
@@ -702,15 +744,69 @@ export async function fetchPlateVolume(
     );
   }
   if (!res.ok) throw new Error(await describeHttpError(res, 'ウェルの読み込みに失敗'));
-  let info: PlateVolumeInfo | null = null;
+  let info: PlateVolumeInfo;
   try {
     const raw = res.headers.get('X-Plate-Volume');
-    if (raw) info = JSON.parse(raw) as PlateVolumeInfo;
-  } catch {
-    // Only carries voxel size and provenance; the volume itself is still usable.
-    info = null;
+    if (!raw) throw new Error('missing header');
+    info = JSON.parse(raw) as PlateVolumeInfo;
+  } catch (e) {
+    throw new Error(
+      `ウェルの検証情報を読めません。形状を推測した PDF は作成しません（${
+        e instanceof Error ? e.message : String(e)}）。`,
+    );
   }
-  return { data: await res.arrayBuffer(), info };
+  const data = await res.arrayBuffer();
+  if (data.byteLength < 32) {
+    throw new Error('ウェルのバイナリが短すぎます。PDF は作成しません。');
+  }
+  const view = new DataView(data);
+  const head = Array.from({ length: 8 }, (_, i) => view.getUint32(i * 4, true));
+  const [nc, nz, h, w, srcC, srcZ, srcH, srcW] = head;
+  const expectedBytes = 32 + nc * 8 + nc * nz * h * w;
+  const requestedMax = (req.max_xy ?? 128) <= 0 ? 0 : Math.max(32, req.max_xy ?? 128);
+  const sameNumbers = (a: unknown, b: number[]) => (
+    Array.isArray(a) && a.length === b.length && a.every((v, i) => v === b[i])
+  );
+  const requestedLevels = req.levels.map(([lo, hi]) => [lo, hi]);
+  // Validate untrusted dimensions before using `nc` as an allocation length.
+  // A corrupt header containing 0xffffffff must fail here, not ask JS for a
+  // multi-billion-entry array and crash the renderer before the error appears.
+  const basicHeaderValid = req.channels.length > 0 && req.channels.length <= 4
+    && nc === req.channels.length
+    && nc > 0 && nz > 0 && h > 0 && w > 0
+    && srcC > 0 && srcZ > 0 && srcH > 0 && srcW > 0
+    && Number.isSafeInteger(expectedBytes)
+    && data.byteLength >= 32 + nc * 8
+    && expectedBytes === data.byteLength;
+  if (!basicHeaderValid) {
+    throw new Error('ウェルのバイナリ寸法が不正です。PDF は作成しません。');
+  }
+  const binaryLevels = Array.from({ length: nc }, (_, i) => [
+    view.getInt32(32 + i * 8, true), view.getInt32(36 + i * 8, true),
+  ]);
+  const sameLevels = (a: unknown, b: number[][]) => (
+    Array.isArray(a) && a.length === b.length
+    && a.every((pair, i) => sameNumbers(pair, b[i]))
+  );
+  const valid = info.bytes === data.byteLength
+    && sameNumbers(info.out, [nz, h, w])
+    && sameNumbers(info.source, [srcC, srcZ, srcH, srcW])
+    && sameNumbers(info.channels, req.channels)
+    && req.channels.every((c) => Number.isInteger(c) && c >= 0 && c < srcC)
+    && info.max_xy === requestedMax
+    && info.source_identity === req.source_identity
+    && info.source_revision === req.source_revision
+    && info.t === (req.t ?? 0)
+    && sameLevels(info.levels, requestedLevels)
+    && sameLevels(binaryLevels, requestedLevels.map(
+      ([lo, hi]) => [Math.trunc(lo), Math.trunc(hi)],
+    ))
+    && Array.isArray(info.voxel) && info.voxel.length === 3
+    && info.voxel.every((v) => Number.isFinite(v) && v > 0);
+  if (!valid) {
+    throw new Error('ウェルの画素・チャンネル・解像度・voxel size の検証が一致しません。PDF は作成しません。');
+  }
+  return { data, info };
 }
 
 export interface PlatePdfResult {
@@ -719,12 +815,35 @@ export interface PlatePdfResult {
   bytes: number;
 }
 
+export interface PlatePdfTargetResult {
+  path: string;
+  /** Resolved stem. Empty input is replaced with the timestamped name once. */
+  filename: string;
+  /** Existing file revision, or the identity of its currently empty directory. */
+  revision: string;
+}
+
+export async function checkPlatePdfTarget(body: {
+  plate_name: string;
+  output_dir: string;
+  filename?: string;
+}): Promise<PlatePdfTargetResult> {
+  const res = await fetch('/api/plate/pdf/check', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  await throwIfConflict(res);
+  return readJson<PlatePdfTargetResult>(res, 'PDF ファイル名の確認に失敗');
+}
+
 export async function composePlatePdf(body: {
   plate_name: string;
   rows: number;
   cols: number;
   frames: {
     well_id: string; row: number; col: number; png_b64: string;
+    source_path: string; source_identity: string; source_revision: string;
     /** Lines printed over the top-left of this well's image. */
     caption?: string[];
   }[];
@@ -741,6 +860,8 @@ export async function composePlatePdf(body: {
   filename?: string;
   /** Replace an existing PDF instead of refusing. */
   overwrite?: boolean;
+  /** Identity of the exact PDF version whose replacement was approved. */
+  expected_revision?: string;
   /** Conditions table, written as a second page of the same PDF. */
   table_headers?: string[];
   table_rows?: string[][];

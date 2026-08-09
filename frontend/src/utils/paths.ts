@@ -12,7 +12,14 @@ const SEP = /[\\/]/;
 /** Everything before the last separator, or '' when there is none. */
 export function dirnameOf(path: string): string {
   const i = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
-  return i > 0 ? path.slice(0, i) : '';
+  if (i < 0) return '';
+  const dir = path.slice(0, i);
+  // `E:` means the current directory on drive E, not its root. Preserve the
+  // separator for a file directly under a Windows drive root. The analogous
+  // POSIX `/file` case must likewise return `/`, not an empty destination.
+  if (/^[A-Za-z]:$/.test(dir)) return dir + path[i];
+  if (!dir && (path[i] === '/' || path[i] === '\\')) return path[i];
+  return dir;
 }
 
 /** The last path segment. */
@@ -55,6 +62,9 @@ export function filenameProblem(name: string): string {
   if (!n) return 'ファイル名を入力してください';
   if (ILLEGAL.test(n)) return '使えない文字が含まれています（ \\ / : * ? " < > | ）';
   if (n.endsWith('.') || n.endsWith(' ')) return '末尾に「.」や空白は使えません';
+  if (n.length > 180 || new TextEncoder().encode(n).length > 200) {
+    return 'ファイル名が長すぎます（180文字・UTF-8で200バイト以内）';
+  }
   // Reserved device names on Windows, with or without an extension.
   const stem = n.split('.')[0].toUpperCase();
   if (/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/.test(stem)) {

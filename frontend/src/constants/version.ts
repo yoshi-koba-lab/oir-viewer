@@ -5,6 +5,58 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.5.4 — 2026-08-09 — Plate PDF and Z projection exports now behave as
+//     transactions: the source shown, the target confirmed, and the bytes
+//     published must all still be the same things when a long export finishes.
+//     Plate checks the chosen name before it reads a well, so an existing PDF is
+//     reported in milliseconds instead of after an eight-well render. Cancelling
+//     leaves the original checksum, mtime and inode unchanged; confirming writes
+//     the exact named file and never creates `_01`. The output directory, resolved
+//     filename and target revision are frozen across that confirmation.
+//     A well is no longer identified by `B02` or a case-folded path. The main OIR
+//     and every split companion are captured as one source identity and revision,
+//     checked before and after each read and again before PDF publication. The
+//     binary volume contract now proves channels, T, levels, dimensions, voxel
+//     size and source provenance before WebGL sees a byte. Missing metadata,
+//     dropped channels, incomplete split files, changed sources, label/stage
+//     disagreement and a view that asks for channels outside the interactive 3D
+//     texture all stop explicitly rather than making a plausible wrong figure.
+//     Targets are written to same-directory staging files, reopened and validated,
+//     then published under canonical-path thread and process locks. Revision and
+//     destination-volume checks protect the confirmation window; batch rollback
+//     preserves old results if a later publish fails, and keeps a recovery backup
+//     if rollback itself fails. The same machinery covers projection OME-TIFFs.
+//     Z projection now has the 1.5.0 save-as contract: an exact editable name,
+//     pre-computation conflict confirmation, no suffixing, duplicate/self-source
+//     rejection, and fresh decoded metadata at the moment each image is processed.
+//     Its OME records channel names, physical XY calibration, projection method,
+//     Z range and T. On the real B02 C5/Z50 stack, Max Z1-50/T1 produced an
+//     85,206,458-byte OME-TIFF in 12.689 s at 5.012 GiB peak RSS; all five channels
+//     and all pixels exactly matched an independent NumPy maximum, with C5/Z1/T1
+//     and 1.242961 µm XY calibration on reopen. Conflict cancellation invoked zero
+//     projections and preserved the sentinel; confirmed overwrite changed only
+//     the exact target.
+//     The Plate path was finally run end to end on the real 73.9 GB acquisition:
+//     eight C5/Z50 wells, High (512) volumes and 600 px PDF cells, in both source
+//     and an arm64 Electron RC containing the same functional code (its bundle
+//     metadata still said 1.5.3). All eight packaged volume requests,
+//     headers and complete response hashes exactly matched the source-build run.
+//     Each packaged PDF cell was pixel-identical to its source-build counterpart
+//     (MAE/RMSE 0, correlation 1); the 587,051-byte,
+//     two-page PDF was reopened at 300 dpi and visually checked for all eight
+//     distinct wells, labels, conditions, footer and table, with no black, missing,
+//     duplicate or clipped output. The acquisition's 105 files and all eight
+//     source identities/revisions were unchanged afterwards.
+//     After that run only version and documentation metadata changed. The exact
+//     1.5.4-labelled app was rebuilt from the same backend/frontend, passed the
+//     frozen packaged selftest, and was byte-compared with both source builds;
+//     the 73.9 GB UI run was not repeated merely for the label change.
+//     Finally, a fresh 3D image now starts with its real full Z range while retaining
+//     the useful camera angle from the previous well. Session placeholders upgrade
+//     to authoritative channel names, physical sizes and bit depth one image at a
+//     time before display; pixel-budget eviction does not discard that metadata or
+//     reload pixels merely to answer metadata. Eight store-level regression tests
+//     cover fresh, saved and legacy placeholder state.
 //   1.5.3 — 2026-08-08 — Why 3D was darker than 2D: found, measured, fixed. The
 //     texture fed to the 3D view was packed over an auto-contrast window that
 //     clips the top 0.1 percent of values — and a maximum-intensity projection
@@ -417,4 +469,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.5.3';
+export const VERSION = '1.5.4';

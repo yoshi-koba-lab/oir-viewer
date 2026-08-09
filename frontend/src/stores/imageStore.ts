@@ -2,6 +2,15 @@ import { create } from 'zustand';
 import type { ImageMetadata, ImageListItem } from '../utils/api';
 import { getLutColor, TRANSMITTED_COLOR } from '../utils/colormap';
 import { displayScaleFor, effectiveScale, planeMax } from '../utils/intensity';
+import {
+  DEFAULT_VOLUME_3D,
+  volume3DForFreshImage,
+  volume3DForRestoredImage,
+  type Volume3DState,
+} from '../utils/volume3DState';
+
+export { DEFAULT_VOLUME_3D } from '../utils/volume3DState';
+export type { Volume3DState } from '../utils/volume3DState';
 
 export interface ChannelState {
   visible: boolean;
@@ -44,35 +53,6 @@ export interface ProjectionState {
   zFrom: number; // 0-based
   zTo: number;   // 0-based
 }
-
-/**
- * How the 3D volume is being looked at.
- *
- * Lives here rather than inside Volume3DViewer because it has to survive
- * switching images. Setting up eight wells one at a time is the plate workflow,
- * and an angle that resets the moment you look at the next well makes that
- * impossible — you can never go back and check one. It is also what the plate
- * export reads, so the figure shows the view that was actually set up.
- */
-export interface Volume3DState {
-  az: number;
-  el: number;
-  radius: number;
-  /** 1-based inclusive slice range, matching the control in the 3D panel. */
-  zStart: number;
-  zEnd: number;
-  /**
-   * Slices the range is relative to. The interactive volume may be decimated in
-   * Z, and the export re-reads at its own resolution, so a slab recorded as
-   * "10..30" means nothing without the total it was chosen against — the export
-   * converts through this rather than assuming the two volumes match.
-   */
-  zTotal: number;
-}
-
-export const DEFAULT_VOLUME_3D: Volume3DState = {
-  az: 0, el: 20, radius: 2.5, zStart: 1, zEnd: 1, zTotal: 1,
-};
 
 /** Per-image view state saved when switching images. */
 export interface ImageViewState {
@@ -181,15 +161,28 @@ export const useImageStore = create<ImageStore>((set, get) => ({
       const meta = get().metadata;
       const maxZ = (meta?.num_z ?? 1) - 1;
       const maxT = (meta?.num_t ?? 1) - 1;
+      const volume3D = volume3DForRestoredImage(
+        get().volume3D,
+        saved.volume3D,
+        meta?.num_z ?? 1,
+      );
+      // Keep the stored copy in step with a migrated placeholder. The 3D
+      // loader deliberately reads imageViewStates to distinguish a returning
+      // image, so updating only the live field would let it reapply 1/1/1.
+      const imageViewStates = {
+        ...get().imageViewStates,
+        [id]: { ...saved, volume3D: { ...volume3D } },
+      };
       set({
+        imageViewStates,
         channels: saved.channels.map(ch => ({ ...ch })),
         currentZ: Math.max(0, Math.min(saved.currentZ, maxZ)),
         currentT: Math.max(0, Math.min(saved.currentT, maxT)),
         showMIP: saved.showMIP,
         projection: saved.projection ? { ...saved.projection } : { active: false, method: 'max', zFrom: 0, zTo: 0 },
-        // Older persisted states predate this field; fall back rather than
-        // restoring `undefined` over a valid view.
-        volume3D: saved.volume3D ? { ...saved.volume3D } : { ...DEFAULT_VOLUME_3D },
+        // Older states predate this field, and the old placeholder could also
+        // be saved before 3D opened; both restore as an honest full stack.
+        volume3D,
       });
     }
   },
@@ -200,7 +193,15 @@ export const useImageStore = create<ImageStore>((set, get) => ({
     set({ imageViewStates: states });
   },
 
-  setMetadata: (m) => set({ metadata: m }),
+  // Metadata is the first trustworthy point at which a fresh image's Z range
+  // can be initialised. Preserve the current camera (useful across plate wells),
+  // but never let the previous or process-default slab become this image's
+  // saved state merely because the user switched tabs before opening 3D.
+  // A saved image state, when present, is restored immediately after this.
+  setMetadata: (m) => set((s) => ({
+    metadata: m,
+    ...(m ? { volume3D: volume3DForFreshImage(s.volume3D, m.num_z) } : {}),
+  })),
 
   initChannels: (n) => {
     const meta = get().metadata;

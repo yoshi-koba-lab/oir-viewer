@@ -7,6 +7,9 @@
  * that does not match the inspection it came from.
  */
 
+/** Shared perspective: a different FOV crops a Plate PDF unlike the tuned view. */
+export const VOLUME_CAMERA_FOV_DEG = 50;
+
 export const vertexShader = `
   out vec3 vOrigin;
   out vec3 vDirection;

@@ -1,16 +1,29 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useImageStore, type ProjectionMethod } from '../stores/imageStore';
-import { applyProjection, chooseFolder } from '../utils/api';
+import { applyProjection, chooseFolder, OverwriteConflict } from '../utils/api';
 import { switchToImage, refreshImageList } from '../hooks/useImageLoader';
+import { dirnameOf, filenameProblem, stemOf } from '../utils/paths';
+import { OverwriteConfirm } from './SaveDialog';
 
 interface Props {
   open: boolean;
   onClose: () => void;
 }
 
+const PROJECTION_LABEL: Record<ProjectionMethod, string> = {
+  max: 'MaxProj', min: 'MinProj', avg: 'AvgProj',
+};
+
+function defaultProjectionName(filename: string, method: ProjectionMethod): string {
+  return `${stemOf(filename)}_${PROJECTION_LABEL[method]}`;
+}
+
+function projectionInputStem(name: string): string {
+  return name.trim().replace(/\.ome\.tiff?$/i, '');
+}
+
 export function ProjectionDialog({ open, onClose }: Props) {
   const metadata = useImageStore((s) => s.metadata);
-  const channels = useImageStore((s) => s.channels);
   const imageList = useImageStore((s) => s.imageList);
   const activeImageId = useImageStore((s) => s.activeImageId);
   const currentT = useImageStore((s) => s.currentT);
@@ -18,10 +31,17 @@ export function ProjectionDialog({ open, onClose }: Props) {
   const [method, setMethod] = useState<ProjectionMethod>('max');
   const [zFrom, setZFrom] = useState(1);
   const [zTo, setZTo] = useState(1);
+  const [tPoint, setTPoint] = useState(1);
   const [selectedImages, setSelectedImages] = useState<Set<string>>(new Set());
   const [outputDir, setOutputDir] = useState('~/Desktop');
+  const [baseName, setBaseName] = useState('');
+  const [nameEdited, setNameEdited] = useState(false);
+  const [conflict, setConflict] = useState<
+    { files: string[]; count: number; more: number; revisions: Record<string, string> } | null
+  >(null);
   const [browsing, setBrowsing] = useState(false);
   const [processing, setProcessing] = useState(false);
+  const projectionRun = useRef(0);
   const [error, setError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
 
@@ -31,25 +51,40 @@ export function ProjectionDialog({ open, onClose }: Props) {
     setMethod('max');
     setZFrom(1);
     setZTo(metadata.num_z);
-    const id = activeImageId || imageList.find((img) => img.active)?.id;
-    setSelectedImages(new Set(id ? [id] : []));
-    // Default output dir to the source file's directory
-    if (metadata.source_path) {
-      const dir = metadata.source_path.replace(/\/[^/]+$/, '');
+    const preferredId = activeImageId || imageList.find((img) => img.active)?.id;
+    const selected = imageList.find((img) => img.id === preferredId && img.num_z > 1)
+      ?? imageList.find((img) => img.num_z > 1);
+    setSelectedImages(new Set(selected ? [selected.id] : []));
+    setZTo(selected?.num_z ?? 1);
+    setTPoint(Math.min(
+      selected?.num_t ?? 1,
+      selected?.id === activeImageId ? currentT + 1 : 1,
+    ));
+    // Default to the selected source, which may differ from the active Z=1 tab.
+    const selectedSource = selected?.source_path ?? metadata.source_path;
+    if (selectedSource) {
+      const dir = dirnameOf(selectedSource);
       if (dir && !dir.startsWith('/tmp') && !dir.startsWith('/private/var') && !dir.startsWith('/private/tmp')) {
         setOutputDir(dir);
       }
     }
+    setBaseName(defaultProjectionName(selected?.filename ?? metadata.filename, 'max'));
+    setNameEdited(false);
+    setConflict(null);
     setError('');
     setSuccessMsg('');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
   const handleBrowse = async () => {
+    if (processing) return;
     setBrowsing(true);
     try {
       const result = await chooseFolder();
-      if (result.path && !result.cancelled) setOutputDir(result.path);
+      if (result.path && !result.cancelled) {
+        setOutputDir(result.path);
+        setConflict(null);
+      }
     } catch { /* cancelled */ } finally {
       setBrowsing(false);
     }
@@ -78,7 +113,16 @@ export function ProjectionDialog({ open, onClose }: Props) {
     );
   }
 
-  const maxZ = metadata.num_z;
+  const selectedEligible = eligibleImages.filter((img) => selectedImages.has(img.id));
+  // One visible range is applied to every selected image. Limit it to the
+  // common Z/T extent so the summary cannot promise slices the backend then
+  // silently clamps away for a shorter image.
+  const maxZ = selectedEligible.length
+    ? Math.min(...selectedEligible.map((img) => img.num_z))
+    : 1;
+  const maxT = selectedEligible.length
+    ? Math.min(...selectedEligible.map((img) => img.num_t))
+    : 1;
   const sliceCount = Math.max(0, zTo - zFrom + 1);
 
   const toggleImage = (id: string) => {
@@ -86,50 +130,101 @@ export function ProjectionDialog({ open, onClose }: Props) {
     if (next.has(id)) next.delete(id);
     else next.add(id);
     setSelectedImages(next);
+    const nextItems = eligibleImages.filter((img) => next.has(img.id));
+    const nextMaxZ = nextItems.length ? Math.min(...nextItems.map((img) => img.num_z)) : 1;
+    const nextMaxT = nextItems.length ? Math.min(...nextItems.map((img) => img.num_t)) : 1;
+    if (next.size === 1) {
+      const only = nextItems[0];
+      setZFrom(1);
+      setZTo(only?.num_z ?? 1);
+      setTPoint(Math.min(only?.num_t ?? 1, only?.id === activeImageId ? currentT + 1 : 1));
+      if (!nameEdited && only) setBaseName(defaultProjectionName(only.filename, method));
+    } else {
+      setZFrom((v) => Math.min(v, nextMaxZ));
+      setZTo((v) => Math.min(v, nextMaxZ));
+      setTPoint((v) => Math.min(v, nextMaxT));
+    }
+    setConflict(null);
   };
 
-  const selectAll = () => setSelectedImages(new Set(eligibleImages.map((img) => img.id)));
+  const selectAll = () => {
+    const next = new Set(eligibleImages.map((img) => img.id));
+    setSelectedImages(next);
+    const commonZ = eligibleImages.length ? Math.min(...eligibleImages.map((img) => img.num_z)) : 1;
+    const commonT = eligibleImages.length ? Math.min(...eligibleImages.map((img) => img.num_t)) : 1;
+    setZFrom(1);
+    setZTo(commonZ);
+    setTPoint((v) => Math.min(v, commonT));
+    setConflict(null);
+  };
 
-  const handleApply = async () => {
+  const handleApply = async (overwrite = false) => {
+    if (projectionRun.current) return;
     if (selectedImages.size === 0) {
       setError('画像を1つ以上選択してください');
       return;
     }
+    if (!outputDir.trim()) {
+      setError('保存先フォルダを入力してください');
+      return;
+    }
+    if (selectedImages.size === 1) {
+      const bad = filenameProblem(projectionInputStem(baseName));
+      if (bad) {
+        setError(bad);
+        return;
+      }
+    }
+    const expectedRevisions = overwrite ? (conflict?.revisions ?? {}) : {};
+    const runId = Date.now() || 1;
+    projectionRun.current = runId;
     setError('');
     setSuccessMsg('');
+    // A confirmed overwrite should expose the progress/result state, not leave
+    // the stale confirmation sheet covering a save that is already running.
+    setConflict(null);
     setProcessing(true);
 
-    // Save current channel colors/visibility to apply to all projected files
-    const savedColors = channels.map((ch) => [...ch.color] as [number, number, number]);
-    const savedVisible = channels.map((ch) => ch.visible);
-    const savedMins = channels.map((ch) => ch.min);
-    const savedMaxs = channels.map((ch) => ch.max);
-
     try {
+      // Freeze each source tab's own view. Reusing the active tab's LUT for a
+      // different image can make a numerically correct projection look wrong and
+      // then persist that wrong view state into later figure exports.
+      useImageStore.getState().saveViewState();
+      const sourceViews = { ...useImageStore.getState().imageViewStates };
       const result = await applyProjection({
         image_ids: Array.from(selectedImages),
         method,
         z_from: zFrom - 1,
         z_to: zTo - 1,
-        t: currentT,
+        t: tPoint - 1,
         output_dir: outputDir.trim(),
+        filename: selectedImages.size === 1 ? projectionInputStem(baseName) : '',
+        overwrite,
+        expected_revisions: expectedRevisions,
       });
 
       // Refresh image list
       await refreshImageList();
 
-      // Apply saved colors to ALL projected files, then switch to the last one
+      // Restore only the matching source's view, then switch to the last output.
       for (const r of result.results) {
         // Switch to each projected image to initialize its channels
         await switchToImage(r.id);
 
-        // Restore channel colors, visibility, and contrast from the source image
+        // Restore channel colors, visibility, and contrast from this source.
         const store = useImageStore.getState();
         const newChannels = [...store.channels];
-        for (let i = 0; i < newChannels.length && i < savedColors.length; i++) {
-          newChannels[i] = { ...newChannels[i], color: savedColors[i], visible: savedVisible[i], min: savedMins[i], max: savedMaxs[i] };
+        const sourceChannels = sourceViews[r.source_image_id]?.channels;
+        if (sourceChannels?.length === newChannels.length) {
+          for (let i = 0; i < newChannels.length; i++) {
+            const source = sourceChannels[i];
+            newChannels[i] = {
+              ...newChannels[i], color: [...source.color], visible: source.visible,
+              min: source.min, max: source.max,
+            };
+          }
+          useImageStore.setState({ channels: newChannels });
         }
-        useImageStore.setState({ channels: newChannels });
 
         // Save this view state so it persists when switching tabs
         useImageStore.getState().saveViewState();
@@ -139,9 +234,18 @@ export function ProjectionDialog({ open, onClose }: Props) {
       setSuccessMsg(`保存完了: ${names}`);
       setTimeout(() => onClose(), 1500);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Projection failed');
+      if (e instanceof OverwriteConflict) {
+        setConflict({
+          files: e.files, count: e.count, more: e.more, revisions: e.revisions,
+        });
+      } else {
+        setError(e instanceof Error ? e.message : 'Projection failed');
+      }
     } finally {
-      setProcessing(false);
+      if (projectionRun.current === runId) {
+        projectionRun.current = 0;
+        setProcessing(false);
+      }
     }
   };
 
@@ -163,7 +267,11 @@ export function ProjectionDialog({ open, onClose }: Props) {
               Target Images
             </h4>
             {eligibleImages.length > 1 && (
-              <button onClick={selectAll} className="text-[10px] text-[var(--accent)] hover:underline">
+              <button
+                onClick={selectAll}
+                disabled={processing}
+                className="text-[10px] text-[var(--accent)] hover:underline disabled:opacity-40"
+              >
                 Select All
               </button>
             )}
@@ -177,6 +285,7 @@ export function ProjectionDialog({ open, onClose }: Props) {
                 <input
                   type="checkbox"
                   checked={selectedImages.has(img.id)}
+                  disabled={processing}
                   onChange={() => toggleImage(img.id)}
                   className="accent-[var(--accent)]"
                 />
@@ -208,7 +317,15 @@ export function ProjectionDialog({ open, onClose }: Props) {
                   type="radio"
                   name="projMethod"
                   checked={method === m.id}
-                  onChange={() => setMethod(m.id)}
+                  disabled={processing}
+                  onChange={() => {
+                    setMethod(m.id);
+                    if (!nameEdited && selectedImages.size === 1) {
+                      const only = imageList.find((img) => selectedImages.has(img.id));
+                      if (only) setBaseName(defaultProjectionName(only.filename, m.id));
+                    }
+                    setConflict(null);
+                  }}
                   className="accent-[var(--accent)]"
                 />
                 <div>
@@ -218,6 +335,43 @@ export function ProjectionDialog({ open, onClose }: Props) {
               </label>
             ))}
           </div>
+        </div>
+
+        {/* Filename */}
+        <div className="mb-4">
+          <h4 className="text-[11px] font-semibold text-[var(--text-secondary)] uppercase tracking-wider mb-2">
+            ファイル名
+          </h4>
+          {selectedImages.size > 1 ? (
+            <p className="text-[11px] text-[var(--text-secondary)] leading-relaxed">
+              {selectedImages.size} 枚を選択中のため、各画像は元のファイル名に
+              投影方法を付けて保存します。
+            </p>
+          ) : (
+            <>
+              <input
+                type="text"
+                value={baseName}
+                disabled={processing}
+                onChange={(e) => {
+                  setBaseName(e.target.value);
+                  setNameEdited(true);
+                  setConflict(null);
+                }}
+                placeholder="ファイル名（拡張子なし）"
+                className="w-full px-3 py-2 rounded bg-[var(--bg-primary)] border border-[var(--border)] text-sm text-[var(--text-primary)] placeholder:text-[var(--text-secondary)] focus:outline-none focus:border-[var(--accent)]"
+              />
+              {filenameProblem(projectionInputStem(baseName)) ? (
+                <p className="text-[11px] text-red-400 mt-1">
+                  {filenameProblem(projectionInputStem(baseName))}
+                </p>
+              ) : (
+                <p className="text-[10px] text-[var(--text-secondary)] mt-1">
+                  保存名: <code>{projectionInputStem(baseName)}.ome.tif</code>
+                </p>
+              )}
+            </>
+          )}
         </div>
 
         {/* Z Range */}
@@ -232,6 +386,7 @@ export function ProjectionDialog({ open, onClose }: Props) {
               min={1}
               max={maxZ}
               value={zFrom}
+              disabled={processing}
               onChange={(e) => setZFrom(Math.max(1, Math.min(maxZ, Number(e.target.value))))}
               className="w-16 px-2 py-1.5 rounded bg-[var(--bg-primary)] border border-[var(--border)] text-[var(--text-primary)] text-center text-xs focus:outline-none focus:border-[var(--accent)]"
             />
@@ -241,6 +396,7 @@ export function ProjectionDialog({ open, onClose }: Props) {
               min={1}
               max={maxZ}
               value={zTo}
+              disabled={processing}
               onChange={(e) => setZTo(Math.max(1, Math.min(maxZ, Number(e.target.value))))}
               className="w-16 px-2 py-1.5 rounded bg-[var(--bg-primary)] border border-[var(--border)] text-[var(--text-primary)] text-center text-xs focus:outline-none focus:border-[var(--accent)]"
             />
@@ -249,6 +405,7 @@ export function ProjectionDialog({ open, onClose }: Props) {
           <div className="flex gap-2 mt-2">
             <button
               onClick={() => { setZFrom(1); setZTo(maxZ); }}
+              disabled={processing}
               className="text-[10px] px-2 py-1 rounded bg-[var(--border)] text-[var(--text-secondary)] hover:text-white transition"
             >
               All
@@ -260,11 +417,31 @@ export function ProjectionDialog({ open, onClose }: Props) {
                 setZFrom(Math.max(1, mid - half));
                 setZTo(Math.min(maxZ, mid + half));
               }}
+              disabled={processing}
               className="text-[10px] px-2 py-1 rounded bg-[var(--border)] text-[var(--text-secondary)] hover:text-white transition"
             >
               Center 50%
             </button>
           </div>
+        </div>
+
+        {/* Time point */}
+        <div className="mb-4">
+          <h4 className="text-[11px] font-semibold text-[var(--text-secondary)] uppercase tracking-wider mb-2">
+            Time point (1–{maxT})
+          </h4>
+          <input
+            type="number"
+            min={1}
+            max={maxT}
+            value={tPoint}
+            disabled={processing}
+            onChange={(e) => setTPoint(Math.max(1, Math.min(maxT, Number(e.target.value))))}
+            className="w-16 px-2 py-1.5 rounded bg-[var(--bg-primary)] border border-[var(--border)] text-[var(--text-primary)] text-center text-xs focus:outline-none focus:border-[var(--accent)]"
+          />
+          <p className="text-[10px] text-[var(--text-secondary)] mt-1">
+            選択した全画像に同じ T を使います。
+          </p>
         </div>
 
         {/* Save to */}
@@ -276,13 +453,14 @@ export function ProjectionDialog({ open, onClose }: Props) {
             <input
               type="text"
               value={outputDir}
-              onChange={(e) => setOutputDir(e.target.value)}
+              disabled={processing}
+              onChange={(e) => { setOutputDir(e.target.value); setConflict(null); }}
               placeholder="/path/to/output/folder"
               className="flex-1 px-3 py-2 rounded bg-[var(--bg-primary)] border border-[var(--border)] text-sm text-[var(--text-primary)] placeholder:text-[var(--text-secondary)] focus:outline-none focus:border-[var(--accent)]"
             />
             <button
               onClick={handleBrowse}
-              disabled={browsing}
+              disabled={browsing || processing}
               className="px-3 py-2 rounded text-xs bg-[var(--border)] text-[var(--text-secondary)] hover:text-white transition shrink-0 disabled:opacity-50"
             >
               {browsing ? '...' : 'Browse'}
@@ -292,7 +470,8 @@ export function ProjectionDialog({ open, onClose }: Props) {
 
         {/* Summary */}
         <div className="mb-4 p-3 rounded bg-[var(--bg-primary)] text-xs text-[var(--text-secondary)]">
-          {selectedImages.size}枚の画像に対し、{sliceCount} slices (Z{zFrom}–Z{zTo}) を
+          {selectedImages.size}枚の画像に対し、T{tPoint} の {sliceCount} slices
+          {' '}(Z{zFrom}–Z{zTo}) を
           <strong className="text-[var(--text-primary)]">
             {method === 'max' ? ' Maximum' : method === 'min' ? ' Minimum' : ' Average'}
           </strong>
@@ -307,18 +486,30 @@ export function ProjectionDialog({ open, onClose }: Props) {
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
+            disabled={processing}
             className="px-4 py-2 rounded text-xs bg-[var(--border)] text-[var(--text-secondary)] hover:text-white transition"
           >
-            Cancel
+            {processing ? 'Processing…' : 'Cancel'}
           </button>
           <button
-            onClick={handleApply}
-            disabled={processing || sliceCount < 1 || selectedImages.size === 0}
+            onClick={() => handleApply(false)}
+            disabled={processing || !!conflict || sliceCount < 1 || selectedImages.size === 0
+                      || (selectedImages.size === 1
+                        && !!filenameProblem(projectionInputStem(baseName)))}
             className="px-4 py-2 rounded text-xs bg-[var(--accent)] text-white hover:opacity-90 transition disabled:opacity-50"
           >
             {processing ? 'Processing...' : 'Apply & Save'}
           </button>
         </div>
+
+        {conflict && (
+          <OverwriteConfirm
+            conflict={conflict}
+            busy={processing}
+            onCancel={() => setConflict(null)}
+            onConfirm={() => handleApply(true)}
+          />
+        )}
       </div>
     </div>
   );
