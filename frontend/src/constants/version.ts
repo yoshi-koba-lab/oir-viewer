@@ -26,6 +26,9 @@
 //     destination-volume checks protect the confirmation window; batch rollback
 //     preserves old results if a later publish fails, and keeps a recovery backup
 //     if rollback itself fails. The same machinery covers projection OME-TIFFs.
+//     The Windows packaged selftest caught one final portability boundary: CRT
+//     `_commit` rejects a read-only descriptor, so completed staged files are
+//     reopened writable without truncation before `fsync`.
 //     Z projection now has the 1.5.0 save-as contract: an exact editable name,
 //     pre-computation conflict confirmation, no suffixing, duplicate/self-source
 //     rejection, and fresh decoded metadata at the moment each image is processed.

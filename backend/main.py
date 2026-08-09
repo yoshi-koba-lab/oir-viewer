@@ -1557,7 +1557,9 @@ def _unload_other_projection_sources(keep_id: str) -> None:
 
 def _fsync_file(path: str | Path) -> None:
     """Flush a completed staged file before publishing its directory entry."""
-    with open(path, "rb") as f:
+    # Windows' CRT rejects _commit() on a read-only descriptor with EBADF.
+    # Reopen without truncating, but keep the descriptor writable on every OS.
+    with open(path, "r+b") as f:
         os.fsync(f.fileno())
 
 
