@@ -1319,7 +1319,15 @@ def _selftest_source_state() -> int:
             if replaced.identity == added_chunk.identity:
                 raise AssertionError("atomic source replacement kept the old identity")
     except Exception as e:
-        print(f"selftest FAILED: source state -> {type(e).__name__}: {e}", flush=True)
+        detail = f"{type(e).__name__}: {e}"
+        print(f"selftest FAILED: source state -> {detail}", flush=True)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            # GitHub's public job annotation normally exposes only the process
+            # exit code.  Preserve the exact Windows-only failure without
+            # requiring authenticated access to the full Actions log.
+            escaped = (detail.replace("%", "%25")
+                       .replace("\r", "%0D").replace("\n", "%0A"))
+            print(f"::error title=source-state selftest::{escaped}", flush=True)
         return 15
 
     print("selftest: source state OK (path, inode and split chunks frozen)", flush=True)
