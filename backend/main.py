@@ -3291,6 +3291,8 @@ class PlatePdfRequest(PlatePdfTargetRequest):
     #: selected) or "missing" (imaged but no stitched file). A well_id that is
     #: absent was never imaged. Only cells with no frame consult this.
     well_states: dict[str, str] = {}
+    #: Pack rendered wells in plate order without drawing empty grid positions.
+    hide_empty_wells: bool = False
     cell_px: int = 600
     footer: str = ""
     #: Conditions table, written as a second page in the same PDF. Empty omits
@@ -3408,6 +3410,7 @@ def plate_pdf(req: PlatePdfRequest):
             int(req.rows), int(req.cols), list(req.frames), dict(req.well_states),
             int(req.cell_px), list(req.table_headers),
             [list(row) for row in req.table_rows],
+            bool(req.hide_empty_wells),
         )
         _assert_plate_sources_unchanged(list(req.frames))
         frames = [
@@ -3426,6 +3429,7 @@ def plate_pdf(req: PlatePdfRequest):
             frames, dict(req.well_states), int(req.cell_px), req.footer,
             table_headers=list(req.table_headers),
             table_rows=[list(r) for r in req.table_rows],
+            hide_empty_wells=bool(req.hide_empty_wells),
         )
         _fsync_file(out)
         size = out.stat().st_size

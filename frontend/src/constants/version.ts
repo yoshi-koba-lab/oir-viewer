@@ -5,6 +5,16 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.5.7 — 2026-08-10 — A fresh 3D view now starts at 0 degrees elevation
+//     instead of 20 degrees. Previously saved per-file camera angles are kept.
+//     Plate Save now defaults both volume and PDF image resolution to Max, and
+//     a new conditions table starts with only Well number, Condition and Memo.
+//     After a successful PDF save, the settings window closes automatically and
+//     a separate completion dialog reports the saved result.
+//     "Hide empty wells" is shown and enabled by default. When enabled, only
+//     rendered wells are packed in plate order; each image keeps its original
+//     well label, while disabling it restores the complete physical plate grid.
+//     Released without an additional validation run at the user's request.
 //   1.5.6 — 2026-08-09 — Opening a Z stack no longer performs or displays any
 //     local-RAM admission warning, including the low-memory Continue/2D choice
 //     introduced in the 1.5.5 candidate. `/api/volume-plan` deliberately remains:
@@ -665,4 +675,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.5.6';
+export const VERSION = '1.5.7';

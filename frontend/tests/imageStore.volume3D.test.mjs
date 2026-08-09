@@ -78,7 +78,7 @@ test('pre-3D tab switches save and restore the full metadata Z range', () => {
 
   assert.deepEqual(useImageStore.getState().volume3D, {
     az: 0,
-    el: 20,
+    el: 0,
     radius: 2.5,
     zoomPercent: 100,
     zStart: 1,
@@ -91,7 +91,7 @@ test('pre-3D tab switches save and restore the full metadata Z range', () => {
   useImageStore.getState().saveViewState();
   assert.deepEqual(useImageStore.getState().imageViewStates.B02.volume3D, {
     az: 0,
-    el: 20,
+    el: 0,
     radius: 2.5,
     zoomPercent: 100,
     zStart: 1,

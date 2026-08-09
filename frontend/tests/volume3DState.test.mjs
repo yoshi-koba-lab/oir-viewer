@@ -12,7 +12,7 @@ import {
 test('the first mounted camera uses the store default rather than a local placeholder', () => {
   assert.deepEqual(volume3DCameraForMount(DEFAULT_VOLUME_3D), {
     az: 0,
-    el: 20,
+    el: 0,
     radius: 2.5,
     zoomPercent: 100,
   });

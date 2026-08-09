@@ -17,7 +17,7 @@ export interface Volume3DState {
 }
 
 export const DEFAULT_VOLUME_3D: Volume3DState = {
-  az: 0, el: 20, radius: 2.5, zoomPercent: 100, zStart: 1, zEnd: 1, zTotal: 1,
+  az: 0, el: 0, radius: 2.5, zoomPercent: 100, zStart: 1, zEnd: 1, zTotal: 1,
 };
 
 export type Volume3DCameraState = Pick<

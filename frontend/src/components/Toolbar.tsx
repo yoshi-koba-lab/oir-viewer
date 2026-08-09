@@ -36,7 +36,8 @@ export function Toolbar() {
   const plate = usePlateStore((s) => s.scan);
   const threeDSaveBusy = useOperationStore((s) => !!s.threeDSave);
   const [showOpenDialog, setShowOpenDialog] = useState(false);
-  const [plateModal, setPlateModal] = useState<'plate' | 'save' | null>(null);
+  const [plateModal, setPlateModal] = useState<'plate' | 'save' | 'saved' | null>(null);
+  const [plateSaveCompleted, setPlateSaveCompleted] = useState('');
   const [showSaveDialog, setShowSaveDialog] = useState(false);
   const [showProjection, setShowProjection] = useState(false);
   const [filePath, setFilePath] = useState('');
@@ -196,7 +197,54 @@ export function Toolbar() {
         </button>
       </div>
       {plateModal === 'plate' && <PlateDialog onClose={() => setPlateModal(null)} />}
-      {plateModal === 'save' && <PlateSaveDialog onClose={() => setPlateModal(null)} />}
+      {plateModal === 'save' && (
+        <PlateSaveDialog
+          onClose={() => setPlateModal(null)}
+          onSaved={(details) => {
+            setPlateSaveCompleted(details);
+            setPlateModal('saved');
+          }}
+        />
+      )}
+      {plateModal === 'saved' && plateSaveCompleted && (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-6"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="plate-save-complete-title"
+          onClick={() => {
+            setPlateSaveCompleted('');
+            setPlateModal(null);
+          }}
+        >
+          <div
+            className="w-full max-w-md rounded-xl border border-[var(--border)]
+                       bg-[var(--bg-panel)] p-5 shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h2 id="plate-save-complete-title" className="text-base font-semibold text-emerald-400">
+              セーブが完了しました！
+            </h2>
+            <p className="mt-3 whitespace-pre-wrap break-all text-xs text-[var(--text-secondary)]">
+              {plateSaveCompleted}
+            </p>
+            <div className="mt-5 flex justify-end">
+              <button
+                type="button"
+                autoFocus
+                onClick={() => {
+                  setPlateSaveCompleted('');
+                  setPlateModal(null);
+                }}
+                className="rounded bg-emerald-600 px-4 py-2 text-xs font-medium text-white
+                           hover:opacity-90"
+              >
+                OK
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Open file dialog */}
       {showOpenDialog && (

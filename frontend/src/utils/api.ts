@@ -1104,6 +1104,8 @@ export async function composePlatePdf(body: {
    * absent was never imaged. Consulted only for cells with no frame.
    */
   well_states: Record<string, string>;
+  /** Pack only rendered wells, omitting every empty plate position. */
+  hide_empty_wells?: boolean;
   cell_px: number;
   output_dir: string;
   footer: string;

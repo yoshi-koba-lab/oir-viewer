@@ -32,26 +32,42 @@ const displayPercent = (value: number) => (
   Number.isInteger(value) ? String(value) : value.toFixed(1)
 );
 
+const compactPlateCellCount = (rows: number, cols: number, frameCount: number) => {
+  const compactCols = Math.min(
+    frameCount,
+    Math.max(1, Math.ceil(Math.sqrt(frameCount * cols / Math.max(1, rows)))),
+  );
+  return Math.ceil(frameCount / compactCols) * compactCols;
+};
+
 interface PdfProgress {
   percent: number;
   label: string;
 }
 
 /** Edit the conditions table and export every matching open well to one PDF. */
-export function PlateSaveDialog({ onClose }: { onClose: () => void }) {
+export function PlateSaveDialog({
+  onClose,
+  onSaved,
+}: {
+  onClose: () => void;
+  onSaved: (details: string) => void;
+}) {
   const [error, setError] = useState('');
   // The scan and table outlive both Plate dialogs. Export controls and run
   // ownership stay local so closing this dialog cannot leave a resumable job.
   const plate = usePlateStore((s) => s.scan);
   const seed = usePlateStore((s) => s.seed);
-  const [volKey, setVolKey] = useState('low');
-  const [cellKey, setCellKey] = useState('normal');
+  const [volKey, setVolKey] = useState('max');
+  const [cellKey, setCellKey] = useState('max');
   /** Fit-relative zoom is uniform by default; its percentage is editable when enabled. */
   const [unifyZoom, setUnifyZoom] = useState(true);
   const [zoomPercent, setZoomPercent] = useState(100);
   const [zoomPercentInput, setZoomPercentInput] = useState('100');
   /** Plate figures carry calibrated scale bars unless explicitly opted out. */
   const [includeScalebar, setIncludeScalebar] = useState(true);
+  /** Compact output is the useful default; the full physical grid remains optional. */
+  const [hideEmptyWells, setHideEmptyWells] = useState(true);
   const [progress, setProgress] = useState<PdfProgress | null>(null);
   const [result, setResult] = useState('');
   /** Set while a run is going, so it can be stopped between wells. */
@@ -269,6 +285,15 @@ export function PlateSaveDialog({ onClose }: { onClose: () => void }) {
     const cells = Object.fromEntries(
       Object.entries(tableState.cells).map(([wellId, row]) => [wellId, { ...row }]),
     );
+    const requestedHideEmptyWells = hideEmptyWells;
+    const figureColumns = columns.filter((column) => column.onFigure);
+    const figureLineCount = (well: (typeof wells)[number]) => {
+      const lines = figureColumns
+        .map((column) => (cells[well.wellId]?.[column.key] ?? '').trim())
+        .filter(Boolean);
+      const forcedWellLabel = requestedHideEmptyWells && !lines.includes(well.wellId) ? 1 : 0;
+      return lines.length + forcedWellLabel + (well.numT > 1 ? 1 : 0);
+    };
     // Two verified output columns (zoom and scale bar) are appended below; the
     // backend's hard table limit is 64 including them.
     if (columns.length > 62
@@ -276,7 +301,7 @@ export function PlateSaveDialog({ onClose }: { onClose: () => void }) {
       || wells.some((well) => columns.some((column) => (
         (cells[well.wellId]?.[column.key] ?? '').length > (column.onFigure ? 1000 : 5000)
       )))
-      || columns.filter((column) => column.onFigure).length > 20) {
+      || wells.some((well) => figureLineCount(well) > 20)) {
       setError('条件表または図中キャプションが長すぎます。列数・文字数を減らしてください。');
       return;
     }
@@ -286,12 +311,7 @@ export function PlateSaveDialog({ onClose }: { onClose: () => void }) {
       // bottom-left. Ten lines leave a verified gap at every supported cell
       // size; allowing the former 20-line maximum could cover the bar without
       // either stage knowing it had changed a number-bearing annotation.
-      const figureColumns = columns.filter((column) => column.onFigure);
-      const overlapping = wells.filter((well) => (
-        figureColumns.filter((column) => (
-          (cells[well.wellId]?.[column.key] ?? '').trim()
-        )).length + (well.numT > 1 ? 1 : 0) > 10
-      ));
+      const overlapping = wells.filter((well) => figureLineCount(well) > 10);
       if (overlapping.length) {
         setError(
           `スケールバーと図中キャプションが重なるウェルがあります: ${
@@ -355,6 +375,7 @@ export function PlateSaveDialog({ onClose }: { onClose: () => void }) {
       ? Math.round(Number(zoomPercentInput) * 10) / 10
       : 100;
     const runIncludeScalebar = includeScalebar;
+    const runHideEmptyWells = requestedHideEmptyWells;
     const viewSettings = useViewStore.getState();
     const runScalebar = {
       enabled: runIncludeScalebar,
@@ -364,6 +385,7 @@ export function PlateSaveDialog({ onClose }: { onClose: () => void }) {
     let completedUnits = 0;
     const completedPercent = () => plateExportPercent(completedUnits, wells.length);
     let publishCompleted = false;
+    let completionMessage = '';
 
     const releaseRun = (keepCompletedProgress = false) => {
       if (activePdfRun.current !== runId) return;
@@ -416,7 +438,10 @@ export function PlateSaveDialog({ onClose }: { onClose: () => void }) {
     }
 
     const cellPx = PDF_CELL_CHOICES.find((c) => c.key === cellKey)!.px;
-    if (scan.rows * scan.cols * cellPx * cellPx > 250_000_000) {
+    const layoutCells = runHideEmptyWells
+      ? compactPlateCellCount(scan.rows, scan.cols, wells.length)
+      : scan.rows * scan.cols;
+    if (layoutCells * cellPx * cellPx > 250_000_000) {
       setError('このプレートサイズではセル解像度が大きすぎます。1段階下げてください。');
       releaseRun();
       return;
@@ -530,15 +555,18 @@ export function PlateSaveDialog({ onClose }: { onClose: () => void }) {
       // figure has no way to tell that apart from a genuinely empty position.
       const states: Record<string, string> = {};
       const rendered = new Set(wells.map((w) => w.wellId));
-      for (const w of scan.wells) {
-        if (rendered.has(w.well_id)) continue;      // has a frame; state unused
-        states[w.well_id] = !w.enabled ? 'disabled'
-          : !w.stitch_path ? 'missing'
-          : 'excluded';
+      if (!runHideEmptyWells) {
+        for (const w of scan.wells) {
+          if (rendered.has(w.well_id)) continue;      // has a frame; state unused
+          states[w.well_id] = !w.enabled ? 'disabled'
+            : !w.stitch_path ? 'missing'
+            : 'excluded';
+        }
       }
       const res = await composePlatePdf({
         plate_name: scan.name, rows: scan.rows, cols: scan.cols,
         frames, well_states: states, cell_px: cellPx, output_dir: job.outputDir,
+        hide_empty_wells: runHideEmptyWells,
         filename: job.filename,
         overwrite,
         expected_revision: job.expectedRevision,
@@ -565,6 +593,7 @@ export function PlateSaveDialog({ onClose }: { onClose: () => void }) {
                 ? ` | T ${wells.map((w) => `${w.wellId}:${w.t + 1}`).join(',')}` : ''}`
               + ` | zoom ${runUnifyZoom ? `${displayPercent(runZoomPercent)}% unified` : 'per-well'}`
               + ` | scalebar ${runIncludeScalebar ? 'on(center-depth)' : 'off'}`
+              + ` | layout ${runHideEmptyWells ? 'compact(empty hidden)' : 'full plate'}`
               + ` | cell ${cellPx}px | ${wells.length} wells | ${new Date().toISOString()}`,
       });
       if (res.wells !== wells.length || !(res.bytes > 0) || !res.path) {
@@ -573,11 +602,11 @@ export function PlateSaveDialog({ onClose }: { onClose: () => void }) {
       completedUnits += 1;
       publishCompleted = true;
       setProgress({ percent: completedPercent(), label: 'PDF保存完了' });
-      setResult(
+      completionMessage = (
         `${res.wells} ウェルを書き出しました（${Math.round(res.bytes / 1024)} KB）\n${res.path}`
         + (clamped
           ? `\n※ 解像度は この GPU の上限 ${max3D} px に制限しました（${vendor}）。`
-          : ''),
+          : '')
       );
     } catch (e) {
       // A cancel aborts the fetch, which surfaces here as an AbortError. That is
@@ -598,6 +627,7 @@ export function PlateSaveDialog({ onClose }: { onClose: () => void }) {
       finalizingPdfRef.current = false;
       setFinalizingPdf(false);
       releaseRun(publishCompleted);
+      if (publishCompleted && completionMessage) onSaved(completionMessage);
     }
   };
 
@@ -778,6 +808,19 @@ export function PlateSaveDialog({ onClose }: { onClose: () => void }) {
                       />
                       <span>スケールバーを保存画像に入れる（中心深度換算・画像内左下）</span>
                     </label>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={hideEmptyWells}
+                        onChange={(event) => setHideEmptyWells(event.target.checked)}
+                        disabled={exporting}
+                        className="accent-emerald-500"
+                      />
+                      <span>空きウェルは表示しない</span>
+                    </label>
+                    <span className="pl-6 text-[9px] leading-relaxed opacity-80">
+                      開いているウェルをプレート順に詰めて並べます（元の空位置は保持しません）
+                    </span>
                   </div>
                   <label className="text-[10px] text-[var(--text-secondary)] flex-1 min-w-[15rem]">
                     PDF の保存先

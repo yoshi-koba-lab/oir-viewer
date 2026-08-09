@@ -17,6 +17,7 @@ with the wrong labels — a mistake nothing downstream could catch.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import threading
 import xml.etree.ElementTree as ET
@@ -705,6 +706,17 @@ class WellFrame:
     caption: list[str] = field(default_factory=list)
 
 
+def _compact_grid_shape(rows: int, cols: int, frame_count: int) -> tuple[int, int]:
+    """Pack frames in a grid that follows the source plate's broad aspect."""
+    compact_aspect = cols / max(1, rows)
+    compact_cols = min(
+        frame_count,
+        max(1, math.ceil(math.sqrt(frame_count * compact_aspect))),
+    )
+    compact_rows = (frame_count + compact_cols - 1) // compact_cols
+    return compact_rows, compact_cols
+
+
 def validate_pdf_layout(
     rows: int,
     cols: int,
@@ -713,21 +725,29 @@ def validate_pdf_layout(
     cell_px: int,
     table_headers: list[str] | None,
     table_rows: list[list[str]] | None,
+    hide_empty_wells: bool = False,
 ) -> None:
     """Reject anything Pillow's grid would otherwise crop or silently replace."""
     if not (1 <= rows <= 26 and 1 <= cols <= 99):
         raise ValueError("プレートの行列数が不正です")
     if cell_px not in PDF_CELL_CHOICES.values():
         raise ValueError("PDF セル解像度が不正です")
-    if rows * cols * cell_px * cell_px > 250_000_000:
+    if hide_empty_wells and frames:
+        compact_rows, compact_cols = _compact_grid_shape(rows, cols, len(frames))
+        rendered_cells = compact_rows * compact_cols
+    else:
+        rendered_cells = rows * cols
+    if rendered_cells * cell_px * cell_px > 250_000_000:
         raise ValueError("選択したプレートサイズとセル解像度では PDF が大きすぎます")
     if not frames or len(frames) > rows * cols:
         raise ValueError("描画されたウェル数が不正です")
 
     seen_ids: set[str] = set()
     seen_positions: set[tuple[int, int]] = set()
+    frame_positions: list[tuple[int, int]] = []
     for frame in frames:
         row, col = int(frame.row), int(frame.col)
+        frame_positions.append((row, col))
         if not (0 <= row < rows and 0 <= col < cols):
             raise ValueError(f"{frame.well_id}: PDF グリッドの範囲外です")
         expected_id = f"{chr(65 + row)}{col + 1:02d}"
@@ -737,10 +757,14 @@ def validate_pdf_layout(
             )
         if frame.well_id in seen_ids or (row, col) in seen_positions:
             raise ValueError(f"同じウェルが複数のフレームにあります: {frame.well_id}")
-        if len(frame.caption) > 20 or any(len(line) > 1000 for line in frame.caption):
+        caption_lines = (1 + sum(line != frame.well_id for line in frame.caption)
+                         if hide_empty_wells else len(frame.caption))
+        if caption_lines > 20 or any(len(line) > 1000 for line in frame.caption):
             raise ValueError(f"{frame.well_id}: キャプションが長すぎます")
         seen_ids.add(frame.well_id)
         seen_positions.add((row, col))
+    if hide_empty_wells and frame_positions != sorted(frame_positions):
+        raise ValueError("空きウェルを隠すフレームがプレート順ではありません")
 
     for well_id, state in well_states.items():
         rc = _well_id_to_rc(well_id)
@@ -863,12 +887,14 @@ def compose_pdf(
     footer: str,
     table_headers: list[str] | None = None,
     table_rows: list[list[str]] | None = None,
+    hide_empty_wells: bool = False,
 ) -> Path:
-    """Lay rendered wells out in the plate's own grid and write one PDF.
+    """Lay rendered wells out and write one PDF.
 
-    Every position in the plate appears, whether or not it was acquired: a packed
-    grid of only the acquired wells would be unreadable as a plate, and a reader
-    could not tell B02 from B04.
+    Normally every position appears in the plate's own grid. When
+    ``hide_empty_wells`` is true, only rendered frames are packed in plate order;
+    every compact cell is labelled with its original well ID so its provenance is
+    not replaced by the compact row/column position.
 
     `well_states` says why each empty cell is empty, keyed by well_id — a key that
     is absent means the plate never imaged it. The distinction is the whole point:
@@ -880,6 +906,7 @@ def compose_pdf(
     """
     validate_pdf_layout(
         rows, cols, frames, well_states, cell_px, table_headers, table_rows,
+        hide_empty_wells,
     )
     from PIL import Image, ImageDraw, ImageFont
 
@@ -887,9 +914,16 @@ def compose_pdf(
     label_h = max(10, int(cell_px * _LABEL_F))
     title_h = max(16, int(cell_px * _TITLE_F))
     margin = max(8, int(cell_px * _MARGIN_F))
-    gutter = label_h * 2
+    # Compact mode has already required plate order. Keeping that exact order
+    # also keeps the conditions-table rows paired with the displayed figures.
+    ordered_frames = list(frames)
+    if hide_empty_wells:
+        layout_rows, layout_cols = _compact_grid_shape(rows, cols, len(ordered_frames))
+    else:
+        layout_rows, layout_cols = rows, cols
+    gutter = 0 if hide_empty_wells else label_h * 2
 
-    page_w = margin * 2 + gutter + cols * (cell_px + pad)
+    page_w = margin * 2 + gutter + layout_cols * (cell_px + pad)
 
     chosen, _ = resolve_font_name()
 
@@ -904,6 +938,10 @@ def compose_pdf(
         return ImageFont.load_default(px)
 
     f_title, f_label, f_cell = font(max(12, title_h // 2)), font(max(9, label_h * 2 // 3)), font(max(8, label_h // 2))
+
+    layout_title = (f"{plate_name}  —  compact {len(ordered_frames)} wells "
+                    f"(source {rows}x{cols})"
+                    if hide_empty_wells else f"{plate_name}  —  {rows}x{cols}")
 
     # Provenance must not be ellipsized or clipped. Prefer a separator before
     # falling back to a character boundary, so a long T list remains complete
@@ -933,7 +971,8 @@ def compose_pdf(
             footer_lines.append(line)
     cell_box = f_cell.getbbox("Ag")
     footer_line_h = max(label_h, cell_box[3] - cell_box[1] + 2)
-    grid_bottom = margin + title_h + label_h + rows * (cell_px + pad)
+    axis_label_h = 0 if hide_empty_wells else label_h
+    grid_bottom = margin + title_h + axis_label_h + layout_rows * (cell_px + pad)
     footer_gap = max(3, margin // 3)
     footer_top = grid_bottom + footer_gap
     page_h = (footer_top + len(footer_lines) * footer_line_h + footer_gap
@@ -941,26 +980,30 @@ def compose_pdf(
     page = Image.new("RGB", (page_w, page_h), "white")
     draw = ImageDraw.Draw(page)
 
-    draw.text((margin, margin), normalize_text(f"{plate_name}  —  {rows}x{cols}"),
+    draw.text((margin, margin), normalize_text(layout_title),
               fill="black", font=f_title)
 
     grid_x = margin + gutter
-    grid_y = margin + title_h + label_h
-    for c in range(cols):
-        x = grid_x + c * (cell_px + pad)
-        draw.text((x + cell_px // 2, grid_y - label_h), f"{c + 1:02d}",
-                  fill="black", font=f_label, anchor="mb")
-    for r in range(rows):
-        y = grid_y + r * (cell_px + pad)
-        draw.text((grid_x - pad, y + cell_px // 2), chr(65 + r),
-                  fill="black", font=f_label, anchor="rm")
-
-    placed = {(f.row, f.col): f for f in frames}
-    for r in range(rows):
+    grid_y = margin + title_h + axis_label_h
+    if not hide_empty_wells:
         for c in range(cols):
+            x = grid_x + c * (cell_px + pad)
+            draw.text((x + cell_px // 2, grid_y - label_h), f"{c + 1:02d}",
+                      fill="black", font=f_label, anchor="mb")
+        for r in range(rows):
+            y = grid_y + r * (cell_px + pad)
+            draw.text((grid_x - pad, y + cell_px // 2), chr(65 + r),
+                      fill="black", font=f_label, anchor="rm")
+
+    placed = (
+        {(index // layout_cols, index % layout_cols): frame
+         for index, frame in enumerate(ordered_frames)}
+        if hide_empty_wells else {(f.row, f.col): f for f in frames}
+    )
+    for r in range(layout_rows):
+        for c in range(layout_cols):
             x, y = grid_x + c * (cell_px + pad), grid_y + r * (cell_px + pad)
             box = (x, y, x + cell_px, y + cell_px)
-            wid = f"{chr(65 + r)}{c + 1:02d}"
             f = placed.get((r, c))
             if f is not None:
                 page.paste(Image.new("RGB", (cell_px, cell_px), "black"), (x, y))
@@ -973,13 +1016,20 @@ def compose_pdf(
                 # the plate keeps its shape. Stroked rather than shadowed: a
                 # blurred glow around light text on bright signal is a smear,
                 # which is what made the scale bar unreadable on dark colours.
-                lines = f.caption or [f.well_id]
+                lines = list(f.caption)
+                if hide_empty_wells:
+                    lines = [f.well_id, *(line for line in lines if line != f.well_id)]
+                if not lines:
+                    lines = [f.well_id]
                 ty = y + pad
                 for line in lines:
                     draw.text((x + pad, ty), normalize_text(line), fill="white", font=f_cell,
                               stroke_width=max(1, cell_px // 300), stroke_fill="black")
                     ty += int(label_h * 0.85)
             else:
+                if hide_empty_wells:
+                    continue
+                wid = f"{chr(65 + r)}{c + 1:02d}"
                 draw.rectangle(box, outline="#c8c8c8", width=1)
                 state = EMPTY_CELL_LABELS.get(well_states.get(wid, ""), "Not acquired")
                 draw.text((x + cell_px // 2, y + cell_px // 2 - label_h), wid,
