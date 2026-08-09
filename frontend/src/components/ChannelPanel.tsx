@@ -1,7 +1,10 @@
 import { useState, useRef, useEffect } from 'react';
 import { useImageStore } from '../stores/imageStore';
+import { useViewStore } from '../stores/viewStore';
+import { reloadActiveChannelData } from '../hooks/useImageLoader';
 import { LUTS } from '../utils/colormap';
 import { effectiveScale, fullScaleFor } from '../utils/intensity';
+import { resetSettings } from '../utils/settingsStore';
 import { Histogram } from './Histogram';
 
 export function ChannelPanel() {
@@ -12,6 +15,43 @@ export function ChannelPanel() {
   const setChannelRange = useImageStore((s) => s.setChannelRange);
   const autoContrastChannel = useImageStore((s) => s.autoContrastChannel);
   const autoContrastAll = useImageStore((s) => s.autoContrastAll);
+  const activeImageId = useImageStore((s) => s.activeImageId);
+  const sourceViewDefaults = useImageStore((s) => s.sourceViewDefaults);
+  const resetActiveImageToSource = useImageStore((s) => s.resetActiveImageToSource);
+  const setLoadError = useImageStore((s) => s.setLoadError);
+  const viewMode = useViewStore((s) => s.viewMode);
+  const [resetting, setResetting] = useState(false);
+
+  const resetToSource = async () => {
+    if (!activeImageId || !sourceViewDefaults[activeImageId]) return;
+    const resetId = activeImageId;
+    const resetIdentity = metadata?.source_identity;
+    const resetRevision = metadata?.source_revision;
+    if (!window.confirm(
+      'このファイルの色・表示チャンネル・Min/Max・Z/T・MIP/投影を、元ファイルを開いた直後の設定に戻します。\n保存済みの調整内容は元に戻せません。続行しますか？',
+    )) return;
+
+    setResetting(true);
+    setLoadError(null);
+    try {
+      if (!resetActiveImageToSource()) throw new Error('元ファイルの初期設定を取得できません');
+      // resetSettings synchronously drops an unsent old snapshot before its
+      // promise is awaited; its queue then puts DELETE after any PUT in flight.
+      await Promise.all([
+        resetSettings(activeImageId),
+        reloadActiveChannelData(activeImageId),
+      ]);
+    } catch (e) {
+      const current = useImageStore.getState();
+      if (current.activeImageId === resetId
+          && current.metadata?.source_identity === resetIdentity
+          && current.metadata?.source_revision === resetRevision) {
+        setLoadError(`表示設定をリセットできません: ${e instanceof Error ? e.message : e}`);
+      }
+    } finally {
+      setResetting(false);
+    }
+  };
 
   if (!metadata) return null;
 
@@ -27,7 +67,25 @@ export function ChannelPanel() {
         </button>
       </div>
 
-      {channels.map((ch, i) => {
+      {viewMode === '2d' && (
+        <div className="p-2 border-b border-[var(--border)]">
+          <button
+            onClick={resetToSource}
+            disabled={resetting || !activeImageId || !sourceViewDefaults[activeImageId]}
+            className="w-full text-xs px-2 py-1.5 rounded bg-[var(--border)] text-[var(--text-primary)] hover:bg-[var(--accent)] hover:text-white disabled:opacity-40 disabled:hover:bg-[var(--border)] transition"
+          >
+            {resetting ? '戻しています…' : '元ファイルの設定に全て戻す'}
+          </button>
+        </div>
+      )}
+
+      {viewMode === '3d' && channels.length > 4 && (
+        <p className="m-2 mb-0 rounded border border-amber-500/50 bg-amber-500/10 p-2 text-[10px] leading-relaxed text-amber-300">
+          3D表示は先頭4チャンネルまでです。5番目以降の設定は3Dには反映されないため、2Dで調整してください。
+        </p>
+      )}
+
+      {(viewMode === '3d' ? channels.slice(0, 4) : channels).map((ch, i) => {
         // The track spans the channel's own scale, not the declared bit depth:
         // 12-bit data topping out near 600 gave a 0..4095 slider whose upper 86%
         // did nothing, which is why the contrast read as broken. It is a stored

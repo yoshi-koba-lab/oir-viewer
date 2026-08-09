@@ -1,3 +1,5 @@
+import type { VolumeMemoryPlan } from './volumeMemory';
+
 const BASE = '';
 
 /**
@@ -80,6 +82,8 @@ async function postJson<T>(path: string, body: unknown, what: string): Promise<T
 
 export interface ImageMetadata {
   id?: string;
+  /** True when Open activated an already-loaded exact source instead of decoding a new tab. */
+  reused?: boolean;
   filename: string;
   source_path: string;
   source_identity: string;
@@ -197,6 +201,77 @@ export async function fetchMetadata(id?: string): Promise<ImageMetadata> {
   return getJson<ImageMetadata>(`/api/metadata${q}`, 'メタデータの取得に失敗');
 }
 
+export interface SavedChannelView {
+  color: [number, number, number];
+  min: number;
+  max: number;
+  visible: boolean;
+}
+
+export interface SavedImageView {
+  channels: SavedChannelView[];
+  currentZ: number;
+  currentT: number;
+  showMIP: boolean;
+}
+
+export type ViewSettingsResponse =
+  | { found: false; reason: 'none' | 'source_changed' }
+  | {
+      found: true;
+      source_identity: string;
+      source_revision: string;
+      settings: SavedImageView;
+    };
+
+/** Read revision-bound display settings from the stable backend app directory. */
+export async function fetchViewSettings(id: string): Promise<ViewSettingsResponse> {
+  return getJson<ViewSettingsResponse>(
+    `/api/images/${encodeURIComponent(id)}/view-settings`,
+    '保存済み表示設定の取得に失敗',
+  );
+}
+
+/** Persist one complete display snapshot; partial writes are never meaningful. */
+export async function putViewSettings(
+  id: string,
+  settings: SavedImageView,
+  clientSession: string,
+  clientSequence: number,
+): Promise<{ saved: boolean; source_revision: string }> {
+  let res: Response;
+  try {
+    res = await fetch(`/api/images/${encodeURIComponent(id)}/view-settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...settings,
+        client_session: clientSession,
+        client_sequence: clientSequence,
+      }),
+      // The body is tiny. This gives a final slider edit a chance to complete
+      // during a renderer unload instead of silently losing the last change.
+      keepalive: true,
+    });
+  } catch (e) {
+    throw new Error(`表示設定を保存できません: サーバーに到達できません（${e instanceof Error ? e.message : e}）`);
+  }
+  return readJson(res, '表示設定を保存できません');
+}
+
+/** Remove every saved revision for the image's authoritative source path. */
+export async function deleteViewSettings(id: string): Promise<{ deleted: boolean }> {
+  let res: Response;
+  try {
+    res = await fetch(`/api/images/${encodeURIComponent(id)}/view-settings`, {
+      method: 'DELETE',
+    });
+  } catch (e) {
+    throw new Error(`表示設定をリセットできません: サーバーに到達できません（${e instanceof Error ? e.message : e}）`);
+  }
+  return readJson(res, '表示設定をリセットできません');
+}
+
 export interface FetchChannelsOpts {
   z: number;
   t: number;
@@ -304,14 +379,14 @@ export async function fetchHistogram(c: number, z: number, t: number): Promise<H
 }
 
 export async function fetchProfile(body: {
-  c: number; z: number; t: number;
+  id: string; c: number; z: number; t: number;
   x0: number; y0: number; x1: number; y1: number; width?: number;
 }): Promise<ProfileData> {
   return postJson<ProfileData>('/api/roi/profile', body, 'プロファイルの取得に失敗');
 }
 
 export async function fetchMeasure(body: {
-  c: number; z: number; t: number;
+  id: string; c: number; z: number; t: number;
   roi_type: string; params: Record<string, unknown>;
 }): Promise<MeasureData> {
   return postJson<MeasureData>('/api/roi/measure', body, 'ROI の測定に失敗');
@@ -364,6 +439,8 @@ export interface SaveRequest {
   basename?: string;
   /** Replace existing files. Omitted, a collision is refused and nothing written. */
   overwrite?: boolean;
+  /** Exact target states returned by the overwrite confirmation. */
+  expected_revisions?: Record<string, string>;
   image_ids: string[];
   channels: number[];
   channel_colors: number[][];
@@ -382,6 +459,63 @@ export interface SaveRequest {
   current_z: number;
   current_t: number;
   bit_depth_output: string;
+}
+
+export interface ExportJobProgress {
+  phase: string;
+  completed: number;
+  total: number;
+  percent: number;
+  label: string;
+}
+
+interface ExportJobStatus<T> extends ExportJobProgress {
+  done: boolean;
+  status_code: number;
+  result: T | null;
+  error: string;
+  response?: {
+    files?: string[]; count?: number; more?: number; output_dir?: string;
+    revisions?: Record<string, string>; error?: string;
+  } | null;
+}
+
+const waitForPoll = () => new Promise<void>((resolve) => window.setTimeout(resolve, 300));
+
+async function runExportJob<T>(
+  path: string,
+  body: unknown,
+  what: string,
+  onProgress?: (progress: ExportJobProgress) => void,
+): Promise<T> {
+  const started = await postJson<{ job_id: string }>(path, body, `${what}の開始に失敗`);
+  for (;;) {
+    const status = await getJson<ExportJobStatus<T>>(
+      `/api/export-jobs/${encodeURIComponent(started.job_id)}`,
+      `${what}の進行状況を取得できません`,
+    );
+    onProgress?.({
+      phase: status.phase,
+      completed: status.completed,
+      total: status.total,
+      percent: status.percent,
+      label: status.label,
+    });
+    if (status.done) {
+      if (status.status_code >= 200 && status.status_code < 300 && status.result) {
+        return status.result;
+      }
+      const failure = status.response ?? {};
+      if (status.status_code === 409 && failure.count) {
+        throw new OverwriteConflict(
+          failure.files ?? [], failure.count, failure.more ?? 0,
+          failure.output_dir ?? '', failure.revisions ?? {},
+        );
+      }
+      throw new Error(failure.error || status.error || `${what}に失敗しました`);
+    }
+    await waitForPoll();
+  }
 }
 
 export interface SaveResponse {
@@ -435,14 +569,11 @@ async function throwIfConflict(res: Response): Promise<void> {
   }
 }
 
-export async function saveImages(req: SaveRequest): Promise<SaveResponse> {
-  const res = await fetch('/api/save', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(req),
-  });
-  await throwIfConflict(res);
-  return readJson<SaveResponse>(res, '保存に失敗');
+export async function saveImages(
+  req: SaveRequest,
+  onProgress?: (progress: ExportJobProgress) => void,
+): Promise<SaveResponse> {
+  return runExportJob<SaveResponse>('/api/save/jobs', req, '保存', onProgress);
 }
 
 export interface ProjectionRequest {
@@ -467,14 +598,13 @@ export interface ProjectionResultItem {
   metadata: ImageMetadata;
 }
 
-export async function applyProjection(req: ProjectionRequest): Promise<{ results: ProjectionResultItem[] }> {
-  const res = await fetch('/api/projection', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(req),
-  });
-  await throwIfConflict(res);
-  return readJson<{ results: ProjectionResultItem[] }>(res, '投影の作成に失敗');
+export async function applyProjection(
+  req: ProjectionRequest,
+  onProgress?: (progress: ExportJobProgress) => void,
+): Promise<{ results: ProjectionResultItem[] }> {
+  return runExportJob<{ results: ProjectionResultItem[] }>(
+    '/api/projection/jobs', req, 'Z投影の保存', onProgress,
+  );
 }
 
 export function decodeUint16(b64: string, width: number, height: number): Uint16Array {
@@ -498,6 +628,8 @@ export interface RenderImagePayload {
 export interface SaveRenderRequest {
   /** Replace existing files instead of refusing. */
   overwrite?: boolean;
+  /** Exact target states returned by the overwrite confirmation. */
+  expected_revisions?: Record<string, string>;
   output_dir: string;
   basename: string;
   format: 'png' | 'tiff';
@@ -547,6 +679,93 @@ export interface VolumeBinResponse {
   channels: Array<{ data: Uint8Array; autoMin: number; autoMax: number }>;
 }
 
+/** A different multi-gigabyte operation invalidated the measured RAM phase. */
+export class VolumeMemoryEpochChangedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'VolumeMemoryEpochChangedError';
+  }
+}
+
+interface RawVolumeMemoryPlan {
+  plan_key: string;
+  memory_epoch: number;
+  source_bytes: number;
+  source_resident_bytes: number;
+  source_increment_bytes: number;
+  num_t: number;
+  num_channels: number;
+  num_z: number;
+  height: number;
+  width: number;
+  original_shape: [number, number, number, number];
+  texture_bytes: number;
+  wire_bytes: number;
+  server_stage_bytes: number;
+  plane_work_bytes: number;
+}
+
+/** Exact shape and allocation plan used by the subsequent binary endpoint. */
+export async function fetchVolumeMemoryPlan(
+  t: number,
+  id: string,
+  maxDim: number,
+  maxCh = 4,
+): Promise<VolumeMemoryPlan> {
+  const params = new URLSearchParams({
+    t: String(t), id, max_dim: String(maxDim), max_ch: String(maxCh),
+  });
+  const raw = await getJson<RawVolumeMemoryPlan>(
+    `/api/volume-plan?${params}`,
+    '3D表示のメモリ計算に失敗',
+  );
+  const shape = Array.isArray(raw.original_shape) ? raw.original_shape : [];
+  const positive = [
+    raw.source_bytes, raw.num_t, raw.num_channels, raw.num_z, raw.height, raw.width,
+    raw.texture_bytes, raw.wire_bytes, ...shape,
+  ];
+  const nonnegative = [
+    raw.source_resident_bytes, raw.source_increment_bytes,
+    raw.server_stage_bytes, raw.plane_work_bytes,
+  ];
+  const outputVoxels = raw.num_channels * raw.num_z * raw.height * raw.width;
+  const sourceBytes = shape.length === 4
+    ? shape.reduce((product, value) => product * value, 2 * raw.num_t) : 0;
+  const planKeyMatch = /^([0-9]+):([0-9a-f]{64})$/i.exec(raw.plan_key);
+  if (!planKeyMatch
+      || !Number.isSafeInteger(raw.memory_epoch) || raw.memory_epoch < 0
+      || Number(planKeyMatch[1]) !== raw.memory_epoch
+      || shape.length !== 4
+      || positive.some((value) => !Number.isSafeInteger(value) || value <= 0)
+      || nonnegative.some((value) => !Number.isSafeInteger(value) || value < 0)
+      || raw.num_channels > Math.min(4, maxCh)
+      || shape[0] < raw.num_channels
+      || !Number.isSafeInteger(outputVoxels) || outputVoxels !== raw.texture_bytes
+      || !Number.isSafeInteger(sourceBytes) || sourceBytes !== raw.source_bytes
+      || raw.source_resident_bytes > raw.source_bytes
+      || raw.source_increment_bytes !== raw.source_bytes - raw.source_resident_bytes
+      || raw.wire_bytes !== 32 + 8 * raw.num_channels + raw.texture_bytes) {
+    throw new Error('3D表示のメモリ計算に失敗: サーバーの計画値が自己矛盾しています');
+  }
+  return {
+    planKey: raw.plan_key,
+    memoryEpoch: raw.memory_epoch,
+    sourceBytes: raw.source_bytes,
+    sourceResidentBytes: raw.source_resident_bytes,
+    sourceIncrementBytes: raw.source_increment_bytes,
+    numT: raw.num_t,
+    numChannels: raw.num_channels,
+    numZ: raw.num_z,
+    height: raw.height,
+    width: raw.width,
+    originalShape: raw.original_shape,
+    textureBytes: raw.texture_bytes,
+    wireBytes: raw.wire_bytes,
+    serverStageBytes: raw.server_stage_bytes,
+    planeWorkBytes: raw.plane_work_bytes,
+  };
+}
+
 /**
  * Fetch the 3D volume as one binary blob. The JSON/base64 route inflates the
  * payload by a third and has to be parsed as a single huge string, which fails
@@ -558,15 +777,34 @@ export async function fetchVolumeBin(
   t: number,
   id: string | undefined,
   maxDim: number,
-  maxCh = 4,
+  maxCh: number,
+  planKey: string,
+  signal?: AbortSignal,
 ): Promise<VolumeBinResponse> {
   const params = new URLSearchParams({ t: String(t), max_dim: String(maxDim), max_ch: String(maxCh) });
   if (id) params.set('id', id);
-  const res = await fetch(`${BASE}/api/volume-bin?${params}`);
+  params.set('plan_key', planKey);
+  const res = await fetch(`${BASE}/api/volume-bin?${params}`, { signal });
   if (!res.ok) {
+    if (res.status === 409) {
+      try {
+        const body = await res.clone().json() as { reason?: string; error?: string };
+        if (body.reason === 'memory_epoch_changed') {
+          throw new VolumeMemoryEpochChangedError(
+            body.error || '3D表示中に別の大きな読込が行われたため、メモリを再計算します',
+          );
+        }
+      } catch (error) {
+        if (error instanceof VolumeMemoryEpochChangedError) throw error;
+        // Malformed 409 bodies are handled by the common HTTP error below.
+      }
+    }
     throw new Error(await describeHttpError(res, 'ボリュームの取得に失敗'));
   }
   const buf = await res.arrayBuffer();
+  if (buf.byteLength < 32) {
+    throw new Error('ボリュームの取得に失敗: 応答ヘッダーが途中で切れています');
+  }
   const dv = new DataView(buf);
   const numChannels = dv.getUint32(0, true);
   const numZ = dv.getUint32(4, true);
@@ -576,6 +814,20 @@ export async function fetchVolumeBin(
     dv.getUint32(16, true), dv.getUint32(20, true), dv.getUint32(24, true), dv.getUint32(28, true),
   ];
 
+  const dimensions = [numZ, height, width, ...originalShape];
+  const planeLen = numZ * height * width;
+  const expectedBytes = 32 + 8 * numChannels + numChannels * planeLen;
+  if (numChannels < 1 || numChannels > Math.min(4, maxCh)
+      || dimensions.some((value) => !Number.isInteger(value) || value <= 0)
+      || !Number.isSafeInteger(planeLen)
+      || !Number.isSafeInteger(expectedBytes)
+      || expectedBytes !== buf.byteLength) {
+    throw new Error(
+      `ボリュームの取得に失敗: 応答サイズまたは形状が一致しません `
+      + `(${numChannels}ch, ${width}x${height}x${numZ}, ${buf.byteLength} bytes)`,
+    );
+  }
+
   let off = 32;
   const levels: Array<[number, number]> = [];
   for (let c = 0; c < numChannels; c++) {
@@ -583,7 +835,6 @@ export async function fetchVolumeBin(
     off += 8;
   }
 
-  const planeLen = numZ * height * width;
   const channels = [];
   for (let c = 0; c < numChannels; c++) {
     channels.push({

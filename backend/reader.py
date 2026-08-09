@@ -590,11 +590,15 @@ class ImageReader:
             reader_j.setMetadataStore(meta)
             reader_j.setId(str(path))
 
-            n_c = reader_j.getSizeC()
-            n_z = reader_j.getSizeZ()
-            n_t = reader_j.getSizeT()
-            h = reader_j.getSizeY()
-            w = reader_j.getSizeX()
+            # Keep Java numeric proxies out of the Python metadata contract.
+            # They support integer arithmetic but are not exact built-in ints,
+            # which matters at validation and JSON boundaries in packaged OIR
+            # paths.
+            n_c = int(reader_j.getSizeC())
+            n_z = int(reader_j.getSizeZ())
+            n_t = int(reader_j.getSizeT())
+            h = int(reader_j.getSizeY())
+            w = int(reader_j.getSizeX())
             bpp = reader_j.getBitsPerPixel()
             is_little = reader_j.isLittleEndian()
             pixel_type = reader_j.getPixelType()  # 0=int8,1=uint8,2=int16,3=uint16,...

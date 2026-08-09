@@ -3,41 +3,106 @@ import { useViewStore } from '../stores/viewStore';
 import { useImageStore } from '../stores/imageStore';
 import { fetchMeasure, type MeasureData } from '../utils/api';
 
+interface MeasurementResult {
+  imageId: string;
+  sourceIdentity: string;
+  sourceRevision: string;
+  roiId: string;
+  z: number;
+  t: number;
+  values: { ch: number; data: MeasureData }[];
+}
+
 export function MeasurementPanel() {
   const activeRoiId = useViewStore((s) => s.activeRoiId);
   const rois = useViewStore((s) => s.rois);
   const channels = useImageStore((s) => s.channels);
   const metadata = useImageStore((s) => s.metadata);
+  const activeImageId = useImageStore((s) => s.activeImageId);
   const currentZ = useImageStore((s) => s.currentZ);
   const currentT = useImageStore((s) => s.currentT);
-  const [measurements, setMeasurements] = useState<{ ch: number; data: MeasureData }[]>([]);
+  const showMIP = useImageStore((s) => s.showMIP);
+  const projectionActive = useImageStore((s) => s.projection.active);
+  const viewMode = useViewStore((s) => s.viewMode);
+  const [result, setResult] = useState<MeasurementResult | null>(null);
 
   const activeRoi = rois.find((r) => r.id === activeRoiId);
 
   useEffect(() => {
-    if (!activeRoi || activeRoi.type === 'line') {
-      setMeasurements([]);
+    if (!activeRoi || activeRoi.type === 'line' || !activeImageId || !metadata
+        || viewMode !== '2d' || showMIP || projectionActive) {
+      setResult(null);
       return;
     }
 
-    const loadMeasurements = async () => {
-      const results: { ch: number; data: MeasureData }[] = [];
-      for (let c = 0; c < channels.length; c++) {
-        if (!channels[c].visible) continue;
-        const data = await fetchMeasure({
-          c,
-          z: currentZ,
-          t: currentT,
-          roi_type: activeRoi.type,
-          params: activeRoi.params,
-        });
-        results.push({ ch: c, data });
-      }
-      setMeasurements(results);
+    let cancelled = false;
+    const requestImageId = activeImageId;
+    const requestIdentity = metadata.source_identity;
+    const requestRevision = metadata.source_revision;
+    const requestRoiId = activeRoi.id;
+    const stillCurrent = () => {
+      const image = useImageStore.getState();
+      const view = useViewStore.getState();
+      return !cancelled
+        && image.activeImageId === requestImageId
+        && image.metadata?.source_identity === requestIdentity
+        && image.metadata?.source_revision === requestRevision
+        && image.currentZ === currentZ
+        && image.currentT === currentT
+        && view.activeRoiId === requestRoiId;
     };
 
-    loadMeasurements();
-  }, [activeRoi, channels, currentZ, currentT]);
+    const loadMeasurements = async () => {
+      const results: { ch: number; data: MeasureData }[] = [];
+      try {
+        for (let c = 0; c < channels.length; c++) {
+          if (!channels[c].visible) continue;
+          const data = await fetchMeasure({
+            id: requestImageId,
+            c,
+            z: currentZ,
+            t: currentT,
+            roi_type: activeRoi.type,
+            params: activeRoi.params,
+          });
+          if (!stillCurrent()) return;
+          results.push({ ch: c, data });
+        }
+        if (stillCurrent()) {
+          setResult({
+            imageId: requestImageId,
+            sourceIdentity: requestIdentity,
+            sourceRevision: requestRevision,
+            roiId: requestRoiId,
+            z: currentZ,
+            t: currentT,
+            values: results,
+          });
+        }
+      } catch (error) {
+        if (stillCurrent()) {
+          useImageStore.getState().setLoadError(
+            `ROI measurement failed: ${error instanceof Error ? error.message : error}`,
+          );
+        }
+      }
+    };
+
+    void loadMeasurements();
+    return () => { cancelled = true; };
+  }, [
+    activeRoi, activeImageId, metadata, channels, currentZ, currentT,
+    viewMode, showMIP, projectionActive,
+  ]);
+
+  const measurements = result
+    && result.imageId === activeImageId
+    && result.sourceIdentity === metadata?.source_identity
+    && result.sourceRevision === metadata?.source_revision
+    && result.roiId === activeRoiId
+    && result.z === currentZ
+    && result.t === currentT && viewMode === '2d' && !showMIP && !projectionActive
+    ? result.values : [];
 
   if (!activeRoi || activeRoi.type === 'line' || measurements.length === 0) return null;
 

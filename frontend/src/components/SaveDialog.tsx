@@ -1,6 +1,9 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useImageStore } from '../stores/imageStore';
-import { saveImages, chooseFolder, OverwriteConflict, type SaveRequest } from '../utils/api';
+import {
+  saveImages, chooseFolder, OverwriteConflict,
+  type ExportJobProgress, type SaveRequest,
+} from '../utils/api';
 import { dirnameOf, stemOf, filenameProblem } from '../utils/paths';
 
 interface Props {
@@ -48,7 +51,7 @@ export function SaveDialog({ open, onClose }: Props) {
   const [baseName, setBaseName] = useState('');
   /** Set when the backend refused because files are already there. */
   const [conflict, setConflict] = useState<
-    { files: string[]; count: number; more: number } | null
+    { files: string[]; count: number; more: number; revisions: Record<string, string> } | null
   >(null);
   const [browsing, setBrowsing] = useState(false);
   const [format, setFormat] = useState<Format>('tiff');
@@ -68,6 +71,8 @@ export function SaveDialog({ open, onClose }: Props) {
   const [tFrom, setTFrom] = useState(1);
   const [tTo, setTTo] = useState(1);
   const [saving, setSaving] = useState(false);
+  const [progress, setProgress] = useState<ExportJobProgress | null>(null);
+  const saveRun = useRef(false);
   const [error, setError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
   const [warnMsg, setWarnMsg] = useState('');
@@ -103,6 +108,7 @@ export function SaveDialog({ open, onClose }: Props) {
     setError('');
     setSuccessMsg('');
     setWarnMsg('');
+    setProgress(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
@@ -192,6 +198,7 @@ export function SaveDialog({ open, onClose }: Props) {
   };
 
   const handleSave = async (overwrite = false) => {
+    if (saveRun.current) return;
     if (!outputDir.trim()) {
       setError('保存先フォルダを入力してください');
       return;
@@ -217,11 +224,14 @@ export function SaveDialog({ open, onClose }: Props) {
       return;
     }
 
+    saveRun.current = true;
+    const expectedRevisions = overwrite ? (conflict?.revisions ?? {}) : {};
     setError('');
     setSuccessMsg('');
     setWarnMsg('');
     setConflict(null);
     setSaving(true);
+    setProgress({ phase: 'planning', completed: 0, total: 0, percent: 0, label: '保存内容を確認中…' });
 
     try {
       const chIndices = Array.from(selectedChannels).sort((a, b) => a - b);
@@ -238,6 +248,7 @@ export function SaveDialog({ open, onClose }: Props) {
         output_dir: outputDir.trim(),
         basename: selectedImages.size === 1 ? baseName.trim() : '',
         overwrite,
+        expected_revisions: expectedRevisions,
         image_ids: ids,
         channels: activeIndices,
         channel_colors: activeIndices.map((i) => [...channels[i].color]),
@@ -266,7 +277,7 @@ export function SaveDialog({ open, onClose }: Props) {
         bit_depth_output: bitDepth,
       };
 
-      const result: SaveResult = await saveImages(req);
+      const result: SaveResult = await saveImages(req, setProgress);
       if (result.saved.length === 0) {
         setError(
           result.skipped?.length
@@ -287,19 +298,24 @@ export function SaveDialog({ open, onClose }: Props) {
       // A refusal is a question, not a failure: nothing was written, and the
       // same request goes through once the user says to replace them.
       if (e instanceof OverwriteConflict) {
-        setConflict({ files: e.files, count: e.count, more: e.more });
+        setConflict({
+          files: e.files, count: e.count, more: e.more, revisions: e.revisions,
+        });
       } else {
         setError(e instanceof Error ? e.message : 'Save failed');
       }
     } finally {
+      saveRun.current = false;
       setSaving(false);
     }
   };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-      <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-5 w-[560px] max-h-[90vh] overflow-y-auto shadow-xl">
+      <div className="relative bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-5 w-[560px] max-h-[90vh] overflow-y-auto shadow-xl">
         <h3 className="text-sm font-bold mb-4 text-[var(--text-primary)]">Save Image As</h3>
+
+        <fieldset disabled={saving} className="contents">
 
         {/* Output folder */}
         <Section title="Save to">
@@ -628,9 +644,28 @@ export function SaveDialog({ open, onClose }: Props) {
             disabled={saving || !!conflict}
             className="px-4 py-2 rounded text-xs bg-[var(--accent)] text-white hover:opacity-90 transition disabled:opacity-50"
           >
-            {saving ? 'Saving...' : '保存'}
+            {saving ? `保存中 ${progress?.percent ?? 0}%` : '保存'}
           </button>
         </div>
+        </fieldset>
+
+        {saving && progress && (
+          <div className="sticky bottom-0 z-20 mt-3 rounded border border-[var(--border)] bg-[var(--bg-secondary)] p-3" aria-live="polite">
+            <div className="mb-1 flex justify-between gap-3 text-xs">
+              <span>{progress.label}</span>
+              <span className="font-mono tabular-nums">{progress.percent}%</span>
+            </div>
+            <progress
+              value={progress.percent}
+              max={100}
+              aria-label={`保存進捗 ${progress.percent}%`}
+              className="h-2 w-full accent-[var(--accent)]"
+            />
+            <p className="mt-1 text-[10px] text-[var(--text-secondary)]">
+              保存中は設定変更と画面を閉じる操作を停止しています。
+            </p>
+          </div>
+        )}
       </div>
 
       {conflict && (

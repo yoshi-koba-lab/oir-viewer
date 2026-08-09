@@ -1,6 +1,9 @@
 import { useState, useCallback, useEffect } from 'react';
-import { useImageLoader, uploadAndReload, openAndReload } from './hooks/useImageLoader';
+import {
+  useImageLoader, uploadAndReload, openAndReload, showDefaultViewForActiveImage,
+} from './hooks/useImageLoader';
 import { useImageStore } from './stores/imageStore';
+import { threeDSaveIsBusy, useOperationStore } from './stores/operationStore';
 import { useViewStore } from './stores/viewStore';
 import { Viewport } from './components/Viewport';
 import { ChannelPanel } from './components/ChannelPanel';
@@ -23,12 +26,15 @@ function App() {
   useImageLoader();
   const loading = useImageStore((s) => s.loading);
   const metadata = useImageStore((s) => s.metadata);
+  const activeImageId = useImageStore((s) => s.activeImageId);
   const viewMode = useViewStore((s) => s.viewMode);
+  const threeDSave = useOperationStore((s) => s.threeDSave);
   const [dragOver, setDragOver] = useState(false);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    if (threeDSaveIsBusy()) return;
     setDragOver(true);
   }, []);
 
@@ -42,6 +48,7 @@ function App() {
     e.preventDefault();
     e.stopPropagation();
     setDragOver(false);
+    if (threeDSaveIsBusy()) return;
 
     const files = Array.from(e.dataTransfer.files);
     if (files.length === 0) return;
@@ -49,13 +56,16 @@ function App() {
     // uploadAndReload records the reason in the store, which LoadErrorToast
     // renders and keeps on screen. Catching here only stops the rejection from
     // going unhandled — a second local toast would just overlap the first.
-    try {
-      for (const file of files) {
-        await uploadAndReload(file);
+    let lastOpenedId: string | null = null;
+    for (const file of files) {
+      try {
+        const id = await uploadAndReload(file, { showDefaultView: false });
+        if (id) lastOpenedId = id;
+      } catch {
+        /* already reported */
       }
-    } catch {
-      /* already reported */
     }
+    if (lastOpenedId) showDefaultViewForActiveImage(lastOpenedId);
   }, []);
 
   return (
@@ -84,7 +94,9 @@ function App() {
           {(viewMode === '2d' || viewMode === 'split') && <ZSliderVertical />}
 
           {/* Viewport */}
-          {viewMode === '3d' ? <Volume3DViewer /> : viewMode === 'split' ? <SplitView /> : <Viewport />}
+          {viewMode === '3d'
+            ? <Volume3DViewer key={activeImageId ?? 'none'} />
+            : viewMode === 'split' ? <SplitView /> : <Viewport />}
 
           {/* Right panel */}
           <div className="flex flex-col w-64 shrink-0 overflow-y-auto border-l border-[var(--border)]">
@@ -131,6 +143,38 @@ function App() {
           that must stay visible for as long as the file is open. */}
       <FileWarningBanner />
 
+      {/* This must live above the keyed 3D viewer. If navigation ever unmounts
+          that viewer unexpectedly, the backend operation and its progress remain
+          visible and the entire app stays interaction-locked until it settles. */}
+      {threeDSave && (
+        <div
+          data-global-3d-save-overlay
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70"
+          role="status"
+          aria-live="polite"
+          aria-label={`3D画像を保存中 ${threeDSave.percent}%`}
+          tabIndex={-1}
+          autoFocus
+        >
+          <div className="w-80 rounded-lg border border-white/20 bg-neutral-950/95 p-4 shadow-xl">
+            <div className="mb-2 flex items-center justify-between text-sm text-white">
+              <span>3D画像を保存中…</span>
+              <span className="font-mono tabular-nums">{threeDSave.percent}%</span>
+            </div>
+            <progress
+              value={threeDSave.percent}
+              max={100}
+              aria-label={`保存進捗 ${threeDSave.percent}%`}
+              className="h-2 w-full accent-[var(--accent)]"
+            />
+            <div className="mt-2 text-[11px] text-white/60">{threeDSave.label}</div>
+            <div className="mt-2 text-[10px] text-white/40">
+              完了するまで画像や表示モードを変更できません
+            </div>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }
@@ -144,12 +188,25 @@ function WelcomeScreen() {
   const [error, setError] = useState('');
 
   const open = async () => {
+    if (threeDSaveIsBusy()) return;
     setError('');
     setBusy(true);
     try {
       const picked = await chooseFiles();
+      if (threeDSaveIsBusy()) return;
       if (picked.cancelled || picked.paths.length === 0) return;
-      for (const p of picked.paths) await openAndReload(p);
+      let lastOpenedId: string | null = null;
+      const failures: string[] = [];
+      for (const p of picked.paths) {
+        try {
+          const id = await openAndReload(p, { showDefaultView: false });
+          if (id) lastOpenedId = id;
+        } catch (e) {
+          failures.push(`${p}: ${e instanceof Error ? e.message : e}`);
+        }
+      }
+      if (lastOpenedId) showDefaultViewForActiveImage(lastOpenedId);
+      if (failures.length) setError(failures.join('\n'));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {

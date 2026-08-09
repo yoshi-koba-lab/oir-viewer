@@ -1,11 +1,16 @@
 import { useRef, useState } from 'react';
 import { useViewStore, type ROITool, type ViewMode } from '../stores/viewStore';
 import { useImageStore } from '../stores/imageStore';
-import { openAndReload, basename } from '../hooks/useImageLoader';
+import { threeDSaveIsBusy, useOperationStore } from '../stores/operationStore';
+import { usePlateStore } from '../stores/plateStore';
+import {
+  openAndReload, basename, showDefaultViewForActiveImage,
+} from '../hooks/useImageLoader';
 import { chooseFiles } from '../utils/api';
 import { SaveDialog } from './SaveDialog';
 import { ProjectionDialog } from './ProjectionDialog';
 import { PlateDialog } from './PlateDialog';
+import { PlateSaveDialog } from './PlateSaveDialog';
 import { VERSION } from '../constants/version';
 
 const roiTools: { id: ROITool; label: string; icon: string }[] = [
@@ -26,15 +31,22 @@ export function Toolbar() {
   const { roiTool, setRoiTool, viewMode, setViewMode, rois, clearRois, activeRoiId, showMergeInSplit, setShowMergeInSplit } =
     useViewStore();
   const metadata = useImageStore((s) => s.metadata);
+  const showMIP = useImageStore((s) => s.showMIP);
+  const projectionActive = useImageStore((s) => s.projection.active);
+  const plate = usePlateStore((s) => s.scan);
+  const threeDSaveBusy = useOperationStore((s) => !!s.threeDSave);
   const [showOpenDialog, setShowOpenDialog] = useState(false);
-  const [showPlate, setShowPlate] = useState(false);
+  const [plateModal, setPlateModal] = useState<'plate' | 'save' | null>(null);
   const [showSaveDialog, setShowSaveDialog] = useState(false);
   const [showProjection, setShowProjection] = useState(false);
   const [filePath, setFilePath] = useState('');
   const [openError, setOpenError] = useState('');
   const [opening, setOpening] = useState(false);
   const setLoadError = useImageStore((s) => s.setLoadError);
-  const roiToolsUsable = viewMode === '2d';
+  const roiToolsUsable = viewMode === '2d' && !showMIP && !projectionActive;
+  const roiDisabledReason = viewMode !== '2d'
+    ? 'available in 2D view only'
+    : 'not available while MIP or Z projection is displayed';
 
   /**
    * Show a failure everywhere it could be looked for.
@@ -51,12 +63,14 @@ export function Toolbar() {
   };
 
   const handleOpen = async () => {
+    if (threeDSaveIsBusy()) return;
     const path = filePath.trim();
     if (!path) return;
     setOpenError('');
     setOpening(true);
     try {
-      await openAndReload(path);
+      const opened = await openAndReload(path);
+      if (!opened) return;
       setShowOpenDialog(false);
       setFilePath('');
     } catch (e: unknown) {
@@ -68,10 +82,12 @@ export function Toolbar() {
 
   /** Native file picker — the primary way in; the path box is the fallback. */
   const handleBrowse = async () => {
+    if (threeDSaveIsBusy()) return;
     setOpenError('');
     setOpening(true);
     try {
       const picked = await chooseFiles();
+      if (threeDSaveIsBusy()) return;
       if (picked.cancelled) return;
       if (picked.paths.length === 0) {
         // Not a cancel, but nothing came back either. Silence here is how a
@@ -80,13 +96,18 @@ export function Toolbar() {
         return;
       }
       const failures: string[] = [];
+      let lastOpenedId: string | null = null;
       for (const p of picked.paths) {
         try {
-          await openAndReload(p);
+          // Present only the last successful image. Mounting Maximum-quality 3D
+          // for every intermediate file would overlap several GB-scale loads.
+          const id = await openAndReload(p, { showDefaultView: false });
+          if (id) lastOpenedId = id;
         } catch (e) {
           failures.push(`${basename(p)}: ${e instanceof Error ? e.message : e}`);
         }
       }
+      if (lastOpenedId) showDefaultViewForActiveImage(lastOpenedId);
       if (failures.length) {
         report(failures.join('\n'));
       } else {
@@ -117,21 +138,23 @@ export function Toolbar() {
           reachable from inside the dialog. */}
       <button
         onClick={handleBrowse}
-        disabled={opening}
+        disabled={opening || threeDSaveBusy}
         className="px-2 py-1 rounded text-xs bg-[var(--accent)] text-white hover:opacity-90 disabled:opacity-50 transition"
         title="ファイルを選択して開く"
       >
         {opening ? 'Opening…' : 'Open'}
       </button>
       <button
-        onClick={() => setShowOpenDialog(true)}
+        onClick={() => { if (!threeDSaveIsBusy()) setShowOpenDialog(true); }}
+        disabled={threeDSaveBusy}
         className="px-1.5 py-1 rounded text-xs bg-[var(--border)] text-[var(--text-secondary)] hover:text-white transition"
         title="パスを直接入力して開く"
       >
         …
       </button>
       <button
-        onClick={() => setShowSaveDialog(true)}
+        onClick={() => { if (!threeDSaveIsBusy()) setShowSaveDialog(true); }}
+        disabled={threeDSaveBusy}
         className="px-2 py-1 rounded text-xs bg-[var(--accent)] text-white hover:opacity-90 transition"
       >
         Save As
@@ -140,7 +163,8 @@ export function Toolbar() {
       {/* Projection button */}
       {metadata && metadata.num_z > 1 && (
         <button
-          onClick={() => setShowProjection(true)}
+          onClick={() => { if (!threeDSaveIsBusy()) setShowProjection(true); }}
+          disabled={threeDSaveBusy}
           className="px-2 py-1 rounded text-xs bg-[var(--border)] text-[var(--text-secondary)] hover:text-white transition"
           title="Z Projection"
         >
@@ -148,16 +172,31 @@ export function Toolbar() {
         </button>
       )}
 
-      {/* Plate. Always enabled: it reads an acquisition folder, so it does not
-          depend on anything being open — and the workflow starts here. */}
-      <button
-        onClick={() => setShowPlate(true)}
-        className="px-2 py-1 rounded text-xs bg-[var(--border)] text-[var(--text-secondary)] hover:text-white transition"
-        title="MATL 撮影のプレート情報を読み込む"
-      >
-        Plate
-      </button>
-      {showPlate && <PlateDialog onClose={() => setShowPlate(false)} />}
+      {/* One discriminated state keeps selection and export mutually exclusive.
+          Replacing an active export with the picker would orphan the run and let
+          a different plate reset the conditions table underneath it. */}
+      <div className="flex items-center gap-1">
+        <button
+          onClick={() => { if (!threeDSaveIsBusy()) setPlateModal('plate'); }}
+          disabled={plateModal !== null || threeDSaveBusy}
+          className="px-2 py-1 rounded text-xs bg-[var(--border)] text-[var(--text-secondary)]
+                     hover:text-white disabled:opacity-40 transition"
+          title="MATL 撮影のプレート情報を読み込む"
+        >
+          Plate
+        </button>
+        <button
+          onClick={() => { if (!threeDSaveIsBusy()) setPlateModal('save'); }}
+          disabled={!plate || plateModal !== null || threeDSaveBusy}
+          className="px-2 py-1 rounded text-xs bg-[var(--border)] text-[var(--text-secondary)]
+                     hover:text-white disabled:opacity-40 transition"
+          title={plate ? '開いているウェルを3D PDFとして保存する' : '先にPlateでMATL撮影を読み込んでください'}
+        >
+          Plate Save
+        </button>
+      </div>
+      {plateModal === 'plate' && <PlateDialog onClose={() => setPlateModal(null)} />}
+      {plateModal === 'save' && <PlateSaveDialog onClose={() => setPlateModal(null)} />}
 
       {/* Open file dialog */}
       {showOpenDialog && (
@@ -166,7 +205,7 @@ export function Toolbar() {
             <h3 className="text-sm font-bold mb-3">Open Image File</h3>
             <button
               onClick={handleBrowse}
-              disabled={opening}
+              disabled={opening || threeDSaveBusy}
               className="w-full mb-3 px-3 py-2 rounded text-xs bg-[var(--accent)] text-white hover:opacity-90 disabled:opacity-50 transition"
             >
               ファイルを選択…（Finder）
@@ -193,7 +232,7 @@ export function Toolbar() {
               </button>
               <button
                 onClick={handleOpen}
-                disabled={opening || !filePath.trim()}
+                disabled={opening || threeDSaveBusy || !filePath.trim()}
                 className="px-3 py-1.5 rounded text-xs bg-[var(--accent)] text-white hover:opacity-90 transition disabled:opacity-50"
               >
                 {opening ? 'Opening...' : 'Open'}
@@ -221,12 +260,17 @@ export function Toolbar() {
                 ? 'bg-[var(--accent)] text-white'
                 : 'bg-[var(--border)] text-[var(--text-secondary)] enabled:hover:text-white'
             }`}
-            title={roiToolsUsable ? tool.label : `${tool.label} — available in 2D view only`}
+            title={roiToolsUsable ? tool.label : `${tool.label} — ${roiDisabledReason}`}
           >
             {tool.icon}
           </button>
         ))}
       </div>
+      {viewMode === '2d' && (showMIP || projectionActive) && (
+        <span className="text-[10px] text-amber-500 whitespace-nowrap">
+          ROI測定はMIP/Z投影中は無効です
+        </span>
+      )}
 
       {/* Separator */}
       <div className="w-px h-5 bg-[var(--border)]" />
@@ -237,12 +281,16 @@ export function Toolbar() {
         {viewModes.map((mode) => (
           <button
             key={mode.id}
-            onClick={() => setViewMode(mode.id)}
+            onClick={() => { if (!threeDSaveIsBusy()) setViewMode(mode.id); }}
+            disabled={threeDSaveBusy || (mode.id === '3d' && (!metadata || metadata.num_z <= 1))}
             className={`px-2 py-1 rounded text-xs transition ${
               viewMode === mode.id
                 ? 'bg-[var(--accent)] text-white'
-                : 'bg-[var(--border)] text-[var(--text-secondary)] hover:text-white'
+                : 'bg-[var(--border)] text-[var(--text-secondary)] enabled:hover:text-white'
             }`}
+            title={mode.id === '3d' && (!metadata || metadata.num_z <= 1)
+              ? 'Zスタックのない画像は3D表示できません'
+              : undefined}
           >
             {mode.label}
           </button>

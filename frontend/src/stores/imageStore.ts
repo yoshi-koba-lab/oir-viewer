@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { ImageMetadata, ImageListItem } from '../utils/api';
+import type { ImageMetadata, ImageListItem, SavedImageView } from '../utils/api';
 import { getLutColor, TRANSMITTED_COLOR } from '../utils/colormap';
 import { displayScaleFor, effectiveScale, planeMax } from '../utils/intensity';
 import {
@@ -64,11 +64,50 @@ export interface ImageViewState {
   volume3D: Volume3DState;
 }
 
+/** The exact display state before any persisted user override was applied. */
+export interface SourceViewDefaults {
+  channels: ChannelState[];
+  currentZ: number;
+  currentT: number;
+  showMIP: boolean;
+  projection: ProjectionState;
+  volume3D: Volume3DState;
+}
+
+/** Decoded pixels plus the auto window that belongs to that exact plane. */
+export interface PreparedChannelResponse {
+  channels: Array<{
+    channel: number;
+    data: Uint16Array;
+    auto_min: number;
+    auto_max: number;
+  }>;
+}
+
+/** Coordinates whose decoded response was verified before it is presented. */
+export interface PreparedImageView {
+  currentZ: number;
+  currentT: number;
+  showMIP: boolean;
+  projection: ProjectionState;
+}
+
+export interface PreparedImagePresentation {
+  id: string;
+  metadata: ImageMetadata;
+  sourceResponse: PreparedChannelResponse;
+  targetResponse: PreparedChannelResponse;
+  view: PreparedImageView;
+  sessionState?: ImageViewState;
+  persistedSettings?: SavedImageView;
+}
+
 interface ImageStore {
   // Multi-image
   imageList: ImageListItem[];
   activeImageId: string | null;
   imageViewStates: Record<string, ImageViewState>;
+  sourceViewDefaults: Record<string, SourceViewDefaults>;
 
   // Current image
   metadata: ImageMetadata | null;
@@ -86,8 +125,12 @@ interface ImageStore {
   setImageList: (list: ImageListItem[]) => void;
   setActiveImageId: (id: string | null) => void;
   saveViewState: () => void;
+  saveViewStateIfSource: (id: string, sourceIdentity: string, sourceRevision: string) => boolean;
   restoreViewState: (id: string) => void;
+  presentPreparedImage: (presentation: PreparedImagePresentation) => void;
   removeImageState: (id: string) => void;
+  captureSourceDefaults: () => void;
+  resetActiveImageToSource: (includeVolume3D?: boolean) => boolean;
 
   // Current image actions
   // Accepts null: closing the last image clears it.
@@ -116,10 +159,138 @@ function refitControlMax(ch: ChannelState, windowMax: number, bitDepth: number):
   );
 }
 
+/** Build the file-declared channel display before any pixels or saved view. */
+function channelsFromMetadata(metadata: ImageMetadata, count = metadata.num_channels): ChannelState[] {
+  const channelTypes = metadata.channel_types ?? [];
+  const channelColors = metadata.channel_colors ?? [];
+  const channelRanges = metadata.channel_ranges ?? [];
+  const channels: ChannelState[] = [];
+  for (let i = 0; i < count; i++) {
+    const isTransmitted = channelTypes[i] === 'transmitted';
+    const fileColor = channelColors[i];
+    let color: [number, number, number];
+    if (fileColor && fileColor.length === 3) {
+      color = fileColor as [number, number, number];
+    } else if (isTransmitted) {
+      color = TRANSMITTED_COLOR;
+    } else {
+      color = getLutColor(i);
+    }
+    const fileRange = channelRanges[i];
+    const hasFileRange = Array.isArray(fileRange)
+      && fileRange.length === 2 && fileRange[1] > fileRange[0];
+    channels.push({
+      visible: !isTransmitted,
+      color,
+      min: hasFileRange ? fileRange[0] : 0,
+      max: hasFileRange ? fileRange[1] : 65535,
+      autoMin: 0,
+      autoMax: 65535,
+      data: null,
+      hasLevels: hasFileRange,
+      displayMax: 0,
+      controlMax: 0,
+    });
+  }
+  return channels;
+}
+
+/** Attach one decoded channel without changing an already-established window. */
+function channelWithPixels(
+  channel: ChannelState,
+  data: Uint16Array,
+  autoMin: number,
+  autoMax: number,
+  bitDepth: number,
+): ChannelState {
+  const adoptAuto = !channel.hasLevels;
+  const pMax = planeMax(data);
+  const displayMax = pMax > 0
+    ? Math.max(channel.displayMax, displayScaleFor(pMax, bitDepth))
+    : channel.displayMax;
+  const nextMax = adoptAuto ? autoMax : channel.max;
+  return {
+    ...channel,
+    data,
+    autoMin,
+    autoMax,
+    displayMax,
+    controlMax: Math.max(
+      channel.controlMax,
+      displayMax,
+      displayScaleFor(nextMax, bitDepth),
+    ),
+    ...(adoptAuto ? { min: autoMin, max: autoMax, hasLevels: true } : {}),
+  };
+}
+
+function channelsWithResponse(
+  channels: ChannelState[],
+  response: PreparedChannelResponse,
+  bitDepth: number,
+): ChannelState[] {
+  const next = channels.map((channel) => ({ ...channel }));
+  for (const item of response.channels) {
+    next[item.channel] = channelWithPixels(
+      next[item.channel], item.data, item.auto_min, item.auto_max, bitDepth,
+    );
+  }
+  return next;
+}
+
+function channelsWithPersistedSettings(
+  channels: ChannelState[],
+  saved: SavedImageView,
+  bitDepth: number,
+): ChannelState[] {
+  return channels.map((channel, index) => {
+    const persisted = saved.channels[index];
+    if (!persisted) return { ...channel };
+    const min = Math.min(persisted.min, persisted.max);
+    const max = Math.max(persisted.min, persisted.max);
+    return {
+      ...channel,
+      color: [...persisted.color] as [number, number, number],
+      min,
+      max,
+      visible: persisted.visible,
+      hasLevels: true,
+      controlMax: Math.max(channel.controlMax, displayScaleFor(max, bitDepth)),
+    };
+  });
+}
+
+/** Refuse a partial or mis-sized response instead of displaying a plausible wrong image. */
+function assertPreparedResponse(
+  metadata: ImageMetadata,
+  response: PreparedChannelResponse,
+  label: string,
+): void {
+  if (response.channels.length !== metadata.num_channels) {
+    throw new Error(`${label}: expected ${metadata.num_channels} channels, got ${response.channels.length}`);
+  }
+  const planeLength = metadata.width * metadata.height;
+  const seen = new Set<number>();
+  for (const channel of response.channels) {
+    if (!Number.isInteger(channel.channel)
+        || channel.channel < 0 || channel.channel >= metadata.num_channels
+        || seen.has(channel.channel)) {
+      throw new Error(`${label}: invalid channel index ${channel.channel}`);
+    }
+    if (channel.data.length !== planeLength) {
+      throw new Error(
+        `${label}: channel ${channel.channel} has ${channel.data.length} pixels; expected ${planeLength}`,
+      );
+    }
+    seen.add(channel.channel);
+  }
+}
+
 export const useImageStore = create<ImageStore>((set, get) => ({
   imageList: [],
   activeImageId: null,
   imageViewStates: {},
+  sourceViewDefaults: {},
 
   metadata: null,
   channels: [],
@@ -151,6 +322,15 @@ export const useImageStore = create<ImageStore>((set, get) => ({
       projection: { ...projection },
     };
     set({ imageViewStates: states });
+  },
+
+  saveViewStateIfSource: (id, sourceIdentity, sourceRevision) => {
+    const state = get();
+    if (state.activeImageId !== id
+        || state.metadata?.source_identity !== sourceIdentity
+        || state.metadata?.source_revision !== sourceRevision) return false;
+    state.saveViewState();
+    return true;
   },
 
   restoreViewState: (id) => {
@@ -187,10 +367,164 @@ export const useImageStore = create<ImageStore>((set, get) => ({
     }
   },
 
+  presentPreparedImage: (presentation) => {
+    const {
+      id, metadata, sourceResponse, targetResponse,
+      view, sessionState, persistedSettings,
+    } = presentation;
+    assertPreparedResponse(metadata, sourceResponse, 'Source baseline');
+    assertPreparedResponse(metadata, targetResponse, 'Restored view');
+    if (sessionState && sessionState.channels.length !== metadata.num_channels) {
+      throw new Error(
+        `Restored view: expected ${metadata.num_channels} channel settings, got ${sessionState.channels.length}`,
+      );
+    }
+
+    // One Zustand publication is the presentation boundary: subscribers can
+    // observe either the outgoing coherent image or this fully decoded view,
+    // never restored Z/T/MIP labels paired with source-baseline pixels.
+    set((state) => {
+      const existingDefaults = state.sourceViewDefaults[id];
+      const freshVolume = existingDefaults
+        ? { ...existingDefaults.volume3D }
+        : volume3DForFreshImage(state.volume3D, metadata.num_z);
+      const sourceChannels = channelsWithResponse(
+        channelsFromMetadata(metadata), sourceResponse, metadata.bit_depth,
+      );
+      let channels = sourceChannels;
+      let volume3D = freshVolume;
+      let imageViewStates = state.imageViewStates;
+
+      if (sessionState) {
+        volume3D = volume3DForRestoredImage(
+          freshVolume, sessionState.volume3D, metadata.num_z,
+        );
+        channels = sessionState.channels.map((channel) => ({ ...channel, data: null }));
+        imageViewStates = {
+          ...imageViewStates,
+          [id]: { ...sessionState, volume3D: { ...volume3D } },
+        };
+      } else if (persistedSettings) {
+        channels = channelsWithPersistedSettings(
+          sourceChannels, persistedSettings, metadata.bit_depth,
+        );
+      }
+
+      if (sessionState || targetResponse !== sourceResponse) {
+        channels = channelsWithResponse(channels, targetResponse, metadata.bit_depth);
+      }
+      const sourceViewDefaults = existingDefaults
+        ? state.sourceViewDefaults
+        : {
+            ...state.sourceViewDefaults,
+            [id]: {
+              channels: sourceChannels.map((channel) => ({ ...channel, data: null })),
+              currentZ: 0,
+              currentT: 0,
+              showMIP: false,
+              projection: {
+                active: false as const,
+                method: 'max' as const,
+                zFrom: 0,
+                zTo: Math.max(0, metadata.num_z - 1),
+              },
+              volume3D: { ...freshVolume },
+            },
+          };
+
+      return {
+        activeImageId: id,
+        metadata,
+        channels,
+        currentZ: view.currentZ,
+        currentT: view.currentT,
+        showMIP: view.showMIP,
+        projection: { ...view.projection },
+        volume3D,
+        imageViewStates,
+        sourceViewDefaults,
+      };
+    });
+  },
+
   removeImageState: (id) => {
     const states = { ...get().imageViewStates };
     delete states[id];
-    set({ imageViewStates: states });
+    const defaults = { ...get().sourceViewDefaults };
+    delete defaults[id];
+    set({ imageViewStates: states, sourceViewDefaults: defaults });
+  },
+
+  // Called after the first fresh Z0/T0 pixels have established either the file's
+  // embedded LUT window or the fallback auto levels, and before a saved user view
+  // is applied. Keeping only display state avoids pinning one decoded plane per tab.
+  captureSourceDefaults: () => {
+    const {
+      activeImageId, metadata, channels, sourceViewDefaults,
+      currentZ, currentT, showMIP, projection, volume3D,
+    } = get();
+    if (!activeImageId || !metadata || sourceViewDefaults[activeImageId]
+        || channels.length !== metadata.num_channels
+        || currentZ !== 0 || currentT !== 0 || showMIP || projection.active) return;
+    set({
+      sourceViewDefaults: {
+        ...sourceViewDefaults,
+        [activeImageId]: {
+          channels: channels.map((channel) => ({ ...channel, data: null })),
+          currentZ: 0,
+          currentT: 0,
+          showMIP: false,
+          projection: {
+            active: false, method: 'max', zFrom: 0, zTo: Math.max(0, metadata.num_z - 1),
+          },
+          volume3D: { ...volume3D },
+        },
+      },
+    });
+  },
+
+  // Reset every per-image 2D display choice, but deliberately leave global
+  // annotations, scale-bar preferences and the per-image 3D camera/slab alone.
+  // The source itself and cached pixels are never written or reinterpreted here.
+  resetActiveImageToSource: (includeVolume3D = false) => {
+    const {
+      activeImageId, sourceViewDefaults, imageViewStates, volume3D,
+      channels: liveChannels, currentZ, currentT, showMIP, projection: liveProjection,
+    } = get();
+    if (!activeImageId) return false;
+    const defaults = sourceViewDefaults[activeImageId];
+    if (!defaults) return false;
+    const samePlane = currentZ === defaults.currentZ && currentT === defaults.currentT
+      && showMIP === defaults.showMIP && liveProjection.active === defaults.projection.active;
+    const channels = defaults.channels.map((channel, index) => ({
+      ...channel,
+      // On the usual Z0/T0 path the pixels are already exactly the fresh plane,
+      // so keep them and make reset visually atomic. A different plane is blanked
+      // until the reset handler explicitly reloads Z0/T0.
+      data: samePlane ? (liveChannels[index]?.data ?? null) : null,
+    }));
+    const projection = { ...defaults.projection };
+    const nextVolume3D = includeVolume3D ? { ...defaults.volume3D } : { ...volume3D };
+    set({
+      channels,
+      currentZ: defaults.currentZ,
+      currentT: defaults.currentT,
+      showMIP: defaults.showMIP,
+      projection,
+      volume3D: nextVolume3D,
+      imageViewStates: {
+        ...imageViewStates,
+        [activeImageId]: {
+          channels: channels.map((channel) => ({ ...channel, data: null })),
+          currentZ: defaults.currentZ,
+          currentT: defaults.currentT,
+          showMIP: defaults.showMIP,
+          projection: { ...projection },
+          volume3D: { ...nextVolume3D },
+        },
+      },
+    });
+    return true;
   },
 
   // Metadata is the first trustworthy point at which a fresh image's Z range
@@ -205,88 +539,14 @@ export const useImageStore = create<ImageStore>((set, get) => ({
 
   initChannels: (n) => {
     const meta = get().metadata;
-    const channelTypes = meta?.channel_types ?? [];
-    const channelColors = meta?.channel_colors ?? [];
-    const channelRanges = meta?.channel_ranges ?? [];
-    const channels: ChannelState[] = [];
-    for (let i = 0; i < n; i++) {
-      const isTransmitted = channelTypes[i] === 'transmitted';
-      // Priority: file-embedded color > transmitted gray > default LUT
-      const fileColor = channelColors[i];
-      let color: [number, number, number];
-      if (fileColor && fileColor.length === 3) {
-        color = fileColor as [number, number, number];
-      } else if (isTransmitted) {
-        color = TRANSMITTED_COLOR;
-      } else {
-        color = getLutColor(i);
-      }
-      // Prefer the display range the microscope recorded, so the image opens
-      // looking as it did at acquisition instead of auto-stretched. hasLevels
-      // marks it as established so incoming pixels don't overwrite it.
-      //
-      // This is honoured even when the range covers the whole bit depth, which
-      // is what a file records when nobody adjusted the LUT. Falling back to
-      // auto levels there was tried and is worse: auto-stretching every channel
-      // of a 5-channel stack and adding them saturates the merge to white. Flat
-      // is at least what the microscope showed, and the contrast controls are
-      // there to fix it.
-      const fileRange = channelRanges[i];
-      const hasFileRange =
-        Array.isArray(fileRange) && fileRange.length === 2 && fileRange[1] > fileRange[0];
-      channels.push({
-        visible: !isTransmitted,  // DIC/brightfield off by default
-        color,
-        min: hasFileRange ? fileRange[0] : 0,
-        max: hasFileRange ? fileRange[1] : 65535,
-        autoMin: 0,
-        autoMax: 65535,
-        data: null,
-        hasLevels: hasFileRange,
-        // 0 = nothing measured yet; the first plane sets the real scale.
-        displayMax: 0,
-        controlMax: 0,
-      });
-    }
-    set({ channels });
+    set({ channels: meta ? channelsFromMetadata(meta, n) : [] });
   },
 
   setChannelData: (c, data, autoMin, autoMax) => {
     const channels = [...get().channels];
     if (channels[c]) {
-      // Adopt the auto levels only until this channel has levels of its own,
-      // so a restored view state or a hand-tuned window survives new pixels
-      // arriving for a different Z/T.
-      const adoptAuto = !channels[c].hasLevels;
-      // Widen the controls to fit this plane, never narrow them: stepping
-      // through Z would otherwise rescale the slider under the user's hand.
-      //
-      // An all-zero plane is skipped rather than measured. displayScaleFor(0)
-      // means "nothing known, assume the full bit depth", and because the widen
-      // is monotonic, scrubbing across one empty slice would otherwise blow the
-      // axis out to 4095 permanently and undo the whole point of measuring it.
       const bitDepth = get().metadata?.bit_depth ?? 16;
-      const pMax = planeMax(data);
-      const displayMax = pMax > 0
-        ? Math.max(channels[c].displayMax, displayScaleFor(pMax, bitDepth))
-        : channels[c].displayMax;
-      const nextMax = adoptAuto ? autoMax : channels[c].max;
-      channels[c] = {
-        ...channels[c],
-        data,
-        autoMin,
-        autoMax,
-        displayMax,
-        // Fit the track to whichever is larger: where the data is, or where the
-        // window currently sits (a file that recorded a full-range LUT opens at
-        // the top of the range whatever the pixels do).
-        controlMax: Math.max(
-          channels[c].controlMax,
-          displayMax,
-          displayScaleFor(nextMax, bitDepth),
-        ),
-        ...(adoptAuto ? { min: autoMin, max: autoMax, hasLevels: true } : {}),
-      };
+      channels[c] = channelWithPixels(channels[c], data, autoMin, autoMax, bitDepth);
       set({ channels });
     }
   },

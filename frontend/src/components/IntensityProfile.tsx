@@ -3,42 +3,108 @@ import { useViewStore } from '../stores/viewStore';
 import { useImageStore } from '../stores/imageStore';
 import { fetchProfile, type ProfileData } from '../utils/api';
 
+interface ProfileResult {
+  imageId: string;
+  sourceIdentity: string;
+  sourceRevision: string;
+  roiId: string;
+  z: number;
+  t: number;
+  values: { ch: number; data: ProfileData }[];
+}
+
 export function IntensityProfile() {
   const activeRoiId = useViewStore((s) => s.activeRoiId);
   const rois = useViewStore((s) => s.rois);
   const channels = useImageStore((s) => s.channels);
+  const activeImageId = useImageStore((s) => s.activeImageId);
+  const metadata = useImageStore((s) => s.metadata);
   const currentZ = useImageStore((s) => s.currentZ);
   const currentT = useImageStore((s) => s.currentT);
-  const [profiles, setProfiles] = useState<{ ch: number; data: ProfileData }[]>([]);
+  const showMIP = useImageStore((s) => s.showMIP);
+  const projectionActive = useImageStore((s) => s.projection.active);
+  const viewMode = useViewStore((s) => s.viewMode);
+  const [result, setResult] = useState<ProfileResult | null>(null);
 
   const activeRoi = rois.find((r) => r.id === activeRoiId);
 
   useEffect(() => {
-    if (!activeRoi || activeRoi.type !== 'line') {
-      setProfiles([]);
+    if (!activeRoi || activeRoi.type !== 'line' || !activeImageId || !metadata
+        || viewMode !== '2d' || showMIP || projectionActive) {
+      setResult(null);
       return;
     }
 
-    const loadProfiles = async () => {
-      const results: { ch: number; data: ProfileData }[] = [];
-      for (let c = 0; c < channels.length; c++) {
-        if (!channels[c].visible) continue;
-        const data = await fetchProfile({
-          c,
-          z: currentZ,
-          t: currentT,
-          x0: activeRoi.params.x0,
-          y0: activeRoi.params.y0,
-          x1: activeRoi.params.x1,
-          y1: activeRoi.params.y1,
-        });
-        results.push({ ch: c, data });
-      }
-      setProfiles(results);
+    let cancelled = false;
+    const requestImageId = activeImageId;
+    const requestIdentity = metadata.source_identity;
+    const requestRevision = metadata.source_revision;
+    const requestRoiId = activeRoi.id;
+    const stillCurrent = () => {
+      const image = useImageStore.getState();
+      const view = useViewStore.getState();
+      return !cancelled
+        && image.activeImageId === requestImageId
+        && image.metadata?.source_identity === requestIdentity
+        && image.metadata?.source_revision === requestRevision
+        && image.currentZ === currentZ
+        && image.currentT === currentT
+        && view.activeRoiId === requestRoiId;
     };
 
-    loadProfiles();
-  }, [activeRoi, channels, currentZ, currentT]);
+    const loadProfiles = async () => {
+      const results: { ch: number; data: ProfileData }[] = [];
+      try {
+        for (let c = 0; c < channels.length; c++) {
+          if (!channels[c].visible) continue;
+          const data = await fetchProfile({
+            id: requestImageId,
+            c,
+            z: currentZ,
+            t: currentT,
+            x0: activeRoi.params.x0,
+            y0: activeRoi.params.y0,
+            x1: activeRoi.params.x1,
+            y1: activeRoi.params.y1,
+          });
+          if (!stillCurrent()) return;
+          results.push({ ch: c, data });
+        }
+        if (stillCurrent()) {
+          setResult({
+            imageId: requestImageId,
+            sourceIdentity: requestIdentity,
+            sourceRevision: requestRevision,
+            roiId: requestRoiId,
+            z: currentZ,
+            t: currentT,
+            values: results,
+          });
+        }
+      } catch (error) {
+        if (stillCurrent()) {
+          useImageStore.getState().setLoadError(
+            `Intensity profile failed: ${error instanceof Error ? error.message : error}`,
+          );
+        }
+      }
+    };
+
+    void loadProfiles();
+    return () => { cancelled = true; };
+  }, [
+    activeRoi, activeImageId, metadata, channels, currentZ, currentT,
+    viewMode, showMIP, projectionActive,
+  ]);
+
+  const profiles = result
+    && result.imageId === activeImageId
+    && result.sourceIdentity === metadata?.source_identity
+    && result.sourceRevision === metadata?.source_revision
+    && result.roiId === activeRoiId
+    && result.z === currentZ
+    && result.t === currentT && viewMode === '2d' && !showMIP && !projectionActive
+    ? result.values : [];
 
   if (!activeRoi || activeRoi.type !== 'line' || profiles.length === 0) return null;
 

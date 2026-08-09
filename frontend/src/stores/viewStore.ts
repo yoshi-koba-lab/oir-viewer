@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { DEFAULT_SCALEBAR_COLOR, type ScalebarPos } from '../utils/scalebar';
+import { threeDSaveIsBusy } from './operationStore';
 
 export type ROITool = 'none' | 'line' | 'rect' | 'ellipse';
 export type ViewMode = '2d' | 'mip' | '3d' | 'split' | 'compare';
@@ -86,7 +87,12 @@ export const useViewStore = create<ViewStore>((set) => ({
   setActiveRoi: (id) => set({ activeRoiId: id }),
   setDrawingRoi: (r) => set({ drawingRoi: r }),
   clearRois: () => set({ rois: [], activeRoiId: null }),
-  setViewMode: (m) => set({ viewMode: m }),
+  // A 3D save owns a live WebGL snapshot until the backend write completes.
+  // Refuse even non-UI callers: changing mode unmounts the keyed viewer and used
+  // to discard its local lock while the request continued in the background.
+  setViewMode: (m) => {
+    if (!threeDSaveIsBusy()) set({ viewMode: m });
+  },
   setSplitCount: (n) => set({ splitCount: n }),
   setShowMergeInSplit: (v) => set({ showMergeInSplit: v }),
   setPlayingT: (p) => set({ playingT: p }),

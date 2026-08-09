@@ -11,6 +11,7 @@
  */
 const { app, BrowserWindow, shell, dialog, ipcMain, Menu } = require('electron');
 const { spawn } = require('node:child_process');
+const { randomUUID } = require('node:crypto');
 const http = require('node:http');
 const path = require('node:path');
 const fs = require('node:fs');
@@ -18,6 +19,13 @@ const fs = require('node:fs');
 const isDev = !app.isPackaged;
 /** Give the JVM + Bio-Formats a generous window on a cold start. */
 const BACKEND_TIMEOUT_MS = 120_000;
+/**
+ * Chromium may retain index.html after the packaged backend exits, then serve
+ * that stale document when a newer app happens to reuse the same loopback
+ * port.  Keep the origin stable (so localStorage/view settings survive) while
+ * giving every desktop launch a distinct HTTP cache key.
+ */
+const FRONTEND_LAUNCH_NONCE = randomUUID();
 
 let backend = null;
 let mainWindow = null;
@@ -239,7 +247,10 @@ function createWindow(port) {
   });
 
   mainWindow.once('ready-to-show', () => mainWindow.show());
-  mainWindow.loadURL(`http://127.0.0.1:${port}/`);
+  const frontendUrl = new URL(`http://127.0.0.1:${port}/`);
+  frontendUrl.searchParams.set('desktop-version', app.getVersion());
+  frontendUrl.searchParams.set('launch', FRONTEND_LAUNCH_NONCE);
+  mainWindow.loadURL(frontendUrl.toString());
 
   // Keep external links in the user's browser, not in the app frame.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {

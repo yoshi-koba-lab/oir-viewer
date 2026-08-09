@@ -11,9 +11,8 @@ const { contextBridge, ipcRenderer } = require('electron');
  * timeout — the Windows "Opening…" hang. Electron already owns a real native
  * dialog on every platform; this exposes that one.
  *
- * Only these two calls are exposed, and neither takes a path from the page:
- * the renderer can ask for a picker and receives whatever the user chose,
- * nothing more.
+ * The picker calls take no path from the page: the renderer receives whatever
+ * the user chose, nothing more.
  */
 contextBridge.exposeInMainWorld('electronAPI', {
   chooseFiles: () => ipcRenderer.invoke('dialog:chooseFiles'),

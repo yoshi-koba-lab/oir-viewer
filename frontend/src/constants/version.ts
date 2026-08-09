@@ -5,6 +5,183 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.5.6 — 2026-08-09 — Opening a Z stack no longer performs or displays any
+//     local-RAM admission warning, including the low-memory Continue/2D choice
+//     introduced in the 1.5.5 candidate. `/api/volume-plan` deliberately remains:
+//     it is now only an integrity handshake binding source identity/revision, T,
+//     source and output shapes, source residency and the process-wide heavy-work
+//     epoch to the following `/api/volume-bin` request. The renderer also checks
+//     the binary header, shape and byte count. This contract prevents stale or
+//     mismatched voxels from becoming a plausible image; it does not claim that
+//     the machine has enough RAM and it never asks the user to override a limit.
+//     A fresh Z > 1 image still opens in 3D at Maximum quality. Its initial 100%
+//     zoom is now an eight-corner perspective fit of the physically proportioned
+//     volume into the unobscured canvas (94% of the limiting dimension, excluding
+//     the controls), rather than the old fixed camera radius. Zoom is a numeric
+//     10-1000% value, stays synchronised with the wheel, survives tab changes and
+//     can return to the exact fit with one action. Missing physical calibration
+//     changes framing to voxel proportions but never invents a metric scale.
+//     A 3D scale bar is visible by default inside the image at bottom left, and
+//     saved 3D images include it by default. Because perspective makes pixel
+//     length depth-dependent, the value is explicitly calculated at the volume's
+//     centre depth. All X/Y/Z voxel sizes must be positive; otherwise no numeric
+//     bar is displayed or exported. Plate Save uses the same camera and scale
+//     maths. It defaults to one editable 100% zoom for every well, can instead use
+//     each tab's zoom, and defaults to a centre-depth bottom-left scale bar. The
+//     applied zoom and bar are recorded in the PDF table and footer.
+//     Every export path now reports a determinate percentage and save-specific
+//     Japanese status instead of a generic loading message. Percentages advance
+//     only when real work finishes: backend 2D and projection jobs count completed
+//     output files plus publication; 3D counts each verified framebuffer capture
+//     plus the filesystem request; Plate counts preflight, volume and render for
+//     each well, then PDF publication (18 units for eight wells). No path reaches
+//     100% until staged output has been reopened and validated and the requested
+//     destination has been atomically published. A process-wide 3D-save owner
+//     blocks tab, mode, open/drop/close and other save transitions until that
+//     backend request definitively ends, so unmounting the viewer cannot discard
+//     its lock or progress display.
+//     2D, 3D and projection output is staged beside its destination, validated and
+//     then atomically published. A target that is any currently open source file,
+//     including a hard-link or symlink alias, is rejected before pixel/base64 work
+//     and checked again at the publication boundary; overwrite confirmation never
+//     permits replacing source microscopy data with a rendered RGB image.
+//     A non-empty 2D `image_ids` list is likewise an exact, all-or-nothing
+//     selection. If any explicit id became stale after the dialog opened, the
+//     request fails before pixels rather than falling back to the active tab or
+//     publishing the surviving prefix under the requested name. Active-image
+//     fallback remains only for legacy callers that supply no ids at all.
+//     The final source-build Plate path was then run end to end on the local copy
+//     of the real acquisition: 105 files / 73,916,686,439 bytes, with all eight
+//     ready wells B02-B05 and C02-C05. Independent scan, inventory and summary
+//     manifests matched exactly before and after. Export took 178.459 s, backend
+//     peak RSS was 6,758,858,752 bytes and minimum system-available memory was
+//     15,649,374,208 bytes. Its `real8-v156-zoom100-scalebar.pdf` was 918,448
+//     bytes (SHA-256 prefix c7b43009), two pages, and all eight cell audits had no
+//     failures. The eight volume payload hashes were unique; every four-channel
+//     volume and its final Z plane contained signal. All cells recorded unified
+//     100% zoom and a 500 µm centre-depth bar at bottom left. Rendered pages passed
+//     visual inspection for conditions, table and footer. The preceding real
+//     Open/Maximum phase took approximately 88.378 s, peaked at 9,346,056,192
+//     bytes RSS and observed 12,501,729,280 bytes minimum system-available memory.
+//     An existing-PDF preflight invoked zero volume requests, preserved the
+//     sentinel SHA-256 and mtime, and used the exact name without a suffix.
+//     This proves the source build only. The first frozen r1 app was rejected
+//     before its scientific smoke: a v1.5.6 process/backend reused loopback port
+//     8768, but Chromium served the cached v1.5.3 index and the backend log showed
+//     update-check `current=1.5.3`. Electron's `loadURL` now appends the desktop
+//     version and a per-launch UUID as `desktop-version` and `launch` query
+//     parameters. The cache key is fresh on every launch while the origin stays
+//     unchanged, preserving localStorage and view-setting identity. The refrozen
+//     r2 app then passed in that same old-cache environment. Its log proved
+//     `frozen=True`, version 1.5.6, a GET for
+//     `/?desktop-version=1.5.6&launch=<UUID>`, the current
+//     `index-BkMn0YNV.js` / `index-BRXG3J-T.css` assets, and update-check
+//     `current=1.5.6`.
+//     This package smoke deliberately covered B02 and C05, two of the eight real
+//     wells, distinct from the source build's complete eight-well run. Both opened
+//     by default in 3D at Maximum, 100% fit, full Z and a bottom-left 500 µm bar,
+//     with no RAM modal. B02 was changed to 125%, then Plate Save High 512 / Normal
+//     600 overrode both wells to unified 100% with scale bars. The live UI showed
+//     save-specific progress at 16, 50 and 100%; the deterministic two-well series
+//     is 0,16,33,50,66,83,100, and 100 followed successful PDF publication.
+//     `real2-v156-package-r2-zoom100-scalebar.pdf` was 479,631 bytes, two pages,
+//     SHA-256 eb7b37447bcaa23277877606837a573425778cb02a4a5e7cd351a73aced3059b.
+//     PDF audit rendered B02/C05 with no failures and signal fractions 0.69588458
+//     / 0.679710177; their MAE 17.4733 and correlation 0.36095 confirmed distinct
+//     non-black cells. Visual inspection passed both lower-left 500 µm bars, B02's
+//     Unicode condition, the two table rows at unified 100% / 500 µm centre depth,
+//     High-512 / zoom-100 / scale-bar / cell-600 / two-well footer and all clipping.
+//     The backend log contained exactly two volume-bin calls and one PDF POST; two
+//     target checks were the expected blur and Create preflights. The 105-file,
+//     73,916,686,439-byte source scan/inventory/summary remained byte-for-byte
+//     identical with all eight wells ready. Package open sampling took 195.584 s
+//     (peak RSS 11,164,794,880 bytes; minimum available 30,380,064,768), and export
+//     sampling took 78.825 s (peak RSS 10,623,352,832; minimum available
+//     32,459,063,296). r1 remains rejected; r2 is the accepted package candidate.
+//   1.5.5 — 2026-08-09 — A newly activated image now opens in the view its data
+//     supports: Z > 1 enters 3D, Z = 1 stays in 2D, and 3D starts at Maximum
+//     quality. Batch and Plate opens deliberately keep intermediate wells in 2D
+//     and mount only the last volume, so choosing eight wells cannot start eight
+//     overlapping Maximum loads.
+//     The old fixed-size 3D warning is gone. Before `/api/volume-bin` allocates
+//     its response, a pixel-free plan reports the exact output shape, source
+//     residency, wire buffer, server staging, plane work and texture bytes. The
+//     renderer estimates the additional peak as source increment plus the larger
+//     of the server and delivery phases, plus 300 MiB for the slice cache, then
+//     preserves max(2 GiB, 10 percent of physical RAM) as a reserve. It asks only
+//     when current available RAM cannot cover that total, or when availability
+//     cannot be measured; the choices are 2D or an explicit Continue. Electron's
+//     privileged process supplies its cross-platform memory counters, with an
+//     OS-specific backend fallback for source builds; swap is never permission
+//     for another multi-gigabyte allocation.
+//     The boundary is intentionally precise: this admission check precedes 3D
+//     volume generation, not the original file's `/api/open` decode. A source
+//     already resident contributes zero additional source bytes; an evicted one
+//     contributes its full reload. The real C5/Z50/2929x2909 selftest pins that
+//     source at 4,260,230,500 bytes. With a 2048 GPU cap and four renderable
+//     channels the planned texture is 4x50x2048x2034 = 833,126,400 bytes; four
+//     channels at source resolution are 1,704,092,200 bytes.
+//     The first frozen v1.5.5 smoke found a package-only boundary behind those
+//     same values: Bio-Formats supplies its dimensions as JPype Java integers,
+//     while the new planner initially accepted only objects whose exact type was
+//     Python `int`. The displayed tuple `(1, 5, 50, 2923, 2900)` was therefore
+//     rejected before allocation. Java dimensions are now canonicalised at the
+//     reader boundary and again with the integer protocol at the planner; the
+//     route selftest uses non-native integer dimensions and the real C5/Z50 shape
+//     so pure-Python literals cannot hide the packaged path again.
+//     An approval token
+//     binds revision, T, shape, output and residency, so a stale plan returns 409
+//     before the pixel loader. One process-wide reservation serialises source
+//     decode, activate/metadata reload, 2D deferred reads, Save, Projection,
+//     interactive 3D and Plate volumes; large binary responses retain it until
+//     their final ASGI byte is sent. Every heavy phase advances a memory epoch
+//     embedded in the plan token. If another phase intervenes, volume-bin returns
+//     a classified 409 and the renderer remeasures shape and free RAM instead of
+//     executing a stale single-load estimate. Client and server also cross-check
+//     the binary header, shape and byte count before WebGL can display it.
+//     Per-file display settings no longer depend on Chromium localStorage, whose
+//     origin changes with the packaged backend's loopback port. The backend owns
+//     one atomic `~/.oir-viewer/view-settings.json`, and returns an entry only for
+//     the exact canonical source path, identity and revision. It preserves a
+//     corrupt store rather than silently replacing it. Thread and sidecar OS
+//     locks serialize packaged and source backends as well as requests in one
+//     process. Per-image PUT and DELETE operations are serialised; reset
+//     invalidates an older GET synchronously, so a slow save or load cannot
+//     resurrect deleted Min/Max values. A page-unload keepalive carries a
+//     renderer-session sequence that the atomic backend store enforces, so an
+//     older in-flight PUT cannot overwrite the final sub-400-ms edit. Both views now
+//     expose `元ファイルの設定に全て戻す`: 2D restores channel visibility,
+//     colours, Min/Max, Z/T, MIP and projection; 3D additionally restores camera,
+//     Z slab and Maximum quality. DELETE is queued behind older PUTs; even if the
+//     restored baseline is saved afterwards, the previous adjustments cannot
+//     overtake reset and return.
+//     Late channel replies are similarly bound to image identity/revision and the
+//     exact Z/T/projection request, preventing pixels for a previous tab or plane
+//     from landing under the current filename. A resampled 3D volume maps the slab
+//     by covered fraction (for example 65-128/128 becomes 101-200/200), rather than
+//     silently changing the physical depth shown. The reset baseline itself is an
+//     explicit Z1/T1, non-MIP source snapshot fetched before a new image is
+//     presented or saved settings are applied; the saved Z/T/MIP target pixels,
+//     labels and LUT are then staged and published together. A slow first load can
+//     no longer capture the old user window as the supposed file default, or show
+//     pixels from Z1 under a restored Z50 label. Whole-image Open/Drop/activate/
+//     close transitions are FIFO so a late backend completion cannot leave the UI
+//     and the persisted session naming different active tabs. Opening an already
+//     open source reuses its exact identity/revision tab, and duplicate session
+//     entries are discarded, so another in-memory copy cannot resurrect settings
+//     that Reset removed.
+//     ROI profile and measurement requests carry explicit image and view
+//     provenance, and are available only in a plain single-plane 2D view. MIP,
+//     Z projection, Split and 3D cannot silently report a raw slice as if it were
+//     the displayed image. A 3D render can be saved only after the exact image,
+//     revision, T, quality and plan have completed a verified WebGL render. GPU
+//     upload errors or context loss invalidate that proof, and MERGE plus
+//     per-channel output is published only when every requested frame exists.
+//     Finally, Plate is now only the cheap MATL scan, well selection and serial
+//     open flow. A separate Plate Save button immediately to its right owns the
+//     condition table, PDF options and the existing transactional export. This
+//     removes a save dialog from the act of opening wells without weakening any
+//     source-revision, preflight-conflict or publication check added in 1.5.4.
 //   1.5.4 — 2026-08-09 — Plate PDF and Z projection exports now behave as
 //     transactions: the source shown, the target confirmed, and the bytes
 //     published must all still be the same things when a long export finishes.
@@ -472,4 +649,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.5.4';
+export const VERSION = '1.5.6';

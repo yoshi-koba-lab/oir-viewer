@@ -12,7 +12,8 @@ import base64
 import traceback
 import uuid
 import unicodedata
-from collections.abc import Callable
+import operator
+from collections.abc import Callable, Iterator
 
 
 def _force_utf8_stdio() -> None:
@@ -42,11 +43,12 @@ from pathlib import Path
 
 import numpy as np
 import uvicorn
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 import json
+import math
 import re
 import time
-from fastapi import FastAPI, Query, UploadFile, File
+from fastapi import FastAPI, Query, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
@@ -61,6 +63,7 @@ from processor import (
 )
 from roi import line_profile, measure_roi
 import plate
+import view_settings
 
 # Multi-image state: id -> ImageReader
 images: dict[str, ImageReader] = {}
@@ -70,6 +73,8 @@ active_id: str | None = None
 APP_DIR = os.path.join(os.path.expanduser("~"), ".oir-viewer")
 UPLOADS_DIR = os.path.join(APP_DIR, "uploads")
 SESSION_FILE = os.path.join(APP_DIR, "session.json")
+VIEW_SETTINGS_FILE = os.path.join(APP_DIR, "view-settings.json")
+_view_settings_store = view_settings.ViewSettingsStore(VIEW_SETTINGS_FILE)
 
 
 def _save_session() -> None:
@@ -146,6 +151,7 @@ def _restore_session() -> int:
     if not isinstance(entries, list):
         return 0
     restored = 0
+    seen_sources: set[tuple[str, str]] = set()
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -159,6 +165,10 @@ def _restore_session() -> int:
             if ((saved_identity and saved_identity != current_source.identity)
                     or (saved_revision and saved_revision != current_source.revision)):
                 print(f"Session restore skipped changed source: {path}")
+                continue
+            source_key = (current_source.identity, current_source.revision)
+            if source_key in seen_sources:
+                print(f"Session restore skipped duplicate source: {path}")
                 continue
             meta = ImageMetadata(
                 filename=entry.get("filename") or os.path.basename(path),
@@ -174,6 +184,7 @@ def _restore_session() -> int:
             r = ImageReader()
             r.defer(path, meta)
             add_image(r)
+            seen_sources.add(source_key)
             restored += 1
         except Exception as e:
             print(f"Session restore skipped {path}: {e}")
@@ -223,7 +234,7 @@ def _selftest_session() -> int:
             SESSION_FILE = os.path.join(APP_DIR, "session.json")
             os.makedirs(UPLOADS_DIR)
             with open(SESSION_FILE, "w") as f:
-                json.dump({"images": [
+                entries = [
                     {
                         "source_path": target,
                         "filename": os.path.basename(target),
@@ -231,7 +242,12 @@ def _selftest_session() -> int:
                         "width": 32, "height": 32,
                     }
                     for target in targets
-                ]}, f)
+                ]
+                # A duplicate tab can be left by an older Plate retry. Restoring
+                # it would give one source two in-memory settings snapshots, so a
+                # reset in one tab could be silently resurrected by the other.
+                entries.append(dict(entries[0]))
+                json.dump({"images": entries}, f)
             images, active_id, _lru = {}, None, []
             # Exactly one of these small test images. Loading the second through
             # /api/metadata must evict the first under the ordinary pixel budget.
@@ -256,6 +272,11 @@ def _selftest_session() -> int:
             # second reader merely to answer channel names and physical sizes.
             repeated_first = get_metadata(ids[0])
             resident_after_repeat = [images[i].loaded_bytes for i in ids]
+            reopened = open_file(targets[0])
+            dedup_open_ok = (isinstance(reopened, dict)
+                             and reopened.get("id") == ids[0]
+                             and reopened.get("reused") is True
+                             and len(images) == 2)
     except Exception as e:
         print(f"selftest FAILED: session restore -> {type(e).__name__}: {e}", flush=True)
         return 20
@@ -266,6 +287,10 @@ def _selftest_session() -> int:
 
     if n != 2:
         print(f"selftest FAILED: restored {n} images, expected 2", flush=True)
+        return 21
+    if not dedup_open_ok:
+        print("selftest FAILED: opening an already-open source created a duplicate tab",
+              flush=True)
         return 21
     if resident_before:
         print(f"selftest FAILED: restore read {resident_before} bytes of pixels; "
@@ -312,7 +337,13 @@ def _selftest_session() -> int:
     print(f"selftest: session restore OK (0 pixel bytes, budget "
           f"{IMAGE_BUDGET_BYTES / 1024 ** 3:.1f} GB; metadata upgraded one at a time)",
           flush=True)
-    return _selftest_export_targets()
+    return (_selftest_export_targets()
+            or _selftest_export_job_progress()
+            or _selftest_memory_heavy_reservation()
+            or _selftest_plate_volume_reservation()
+            or _selftest_volume_memory_plan()
+            or view_settings.selftest()
+            or _selftest_view_settings_api())
 
 
 @asynccontextmanager
@@ -335,6 +366,229 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="OIR Viewer", lifespan=lifespan)
 
+
+# Export jobs expose progress from completed backend work, never from a timer.
+# The ordinary synchronous routes remain available for compatibility and tests;
+# the desktop UI uses these bounded, short-lived records for long saves.
+_EXPORT_JOBS: dict[str, dict] = {}
+_EXPORT_JOBS_LOCK = threading.Lock()
+_EXPORT_JOB_LOCAL = threading.local()
+_EXPORT_JOB_TTL_S = 60 * 60
+_EXPORT_JOB_MAX_ACTIVE = 2
+_EXPORT_JOB_MAX_RECORDS = 128
+
+
+def _export_progress(
+    phase: str, completed: int, total: int, label: str,
+) -> None:
+    callback = getattr(_EXPORT_JOB_LOCAL, "progress", None)
+    if callback is not None:
+        callback(phase, completed, total, label)
+
+
+def _response_body(value) -> tuple[int, dict]:
+    if isinstance(value, JSONResponse):
+        try:
+            body = json.loads(bytes(value.body).decode("utf-8"))
+        except Exception:
+            body = {"error": "保存処理の応答を読み取れませんでした。"}
+        return int(value.status_code), body if isinstance(body, dict) else {"error": str(body)}
+    if isinstance(value, dict):
+        return 200, value
+    return 500, {"error": "保存処理が不正な応答を返しました。"}
+
+
+def _purge_export_jobs(now: float) -> None:
+    expired = [
+        job_id for job_id, job in _EXPORT_JOBS.items()
+        if job.get("done") and now - float(job.get("updated_at", now)) > _EXPORT_JOB_TTL_S
+    ]
+    for job_id in expired:
+        _EXPORT_JOBS.pop(job_id, None)
+
+    # Polling clients normally consume completed records immediately, but a
+    # crashed/closed renderer must not make the registry grow forever.
+    excess = len(_EXPORT_JOBS) - _EXPORT_JOB_MAX_RECORDS
+    if excess > 0:
+        completed = sorted(
+            (
+                (float(job.get("updated_at", 0)), job_id)
+                for job_id, job in _EXPORT_JOBS.items()
+                if job.get("done")
+            ),
+        )
+        for _updated_at, job_id in completed[:excess]:
+            _EXPORT_JOBS.pop(job_id, None)
+
+
+def _start_export_job(kind: str, work: Callable[[], object]) -> str:
+    job_id = uuid.uuid4().hex
+    now = time.monotonic()
+    with _EXPORT_JOBS_LOCK:
+        _purge_export_jobs(now)
+        active = sum(1 for job in _EXPORT_JOBS.values() if not job.get("done"))
+        if active >= _EXPORT_JOB_MAX_ACTIVE:
+            raise HTTPException(
+                status_code=429,
+                detail="別の保存処理が実行中です。完了してからもう一度お試しください。",
+            )
+        if len(_EXPORT_JOBS) >= _EXPORT_JOB_MAX_RECORDS:
+            oldest_completed = sorted(
+                (
+                    (float(job.get("updated_at", 0)), old_id)
+                    for old_id, job in _EXPORT_JOBS.items()
+                    if job.get("done")
+                ),
+            )
+            remove_count = len(_EXPORT_JOBS) - _EXPORT_JOB_MAX_RECORDS + 1
+            for _updated_at, old_id in oldest_completed[:remove_count]:
+                _EXPORT_JOBS.pop(old_id, None)
+        # If the configured record bound is ever smaller than the active bound,
+        # fail closed instead of creating an untracked worker thread.
+        if len(_EXPORT_JOBS) >= _EXPORT_JOB_MAX_RECORDS:
+            raise HTTPException(
+                status_code=503,
+                detail="保存履歴が上限に達しました。少し待ってからもう一度お試しください。",
+            )
+        _EXPORT_JOBS[job_id] = {
+            "job_id": job_id, "kind": kind, "phase": "planning",
+            "completed": 0, "total": 0, "percent": 0,
+            "label": "保存内容を確認中…", "done": False,
+            "status_code": 0, "result": None, "error": "", "updated_at": now,
+        }
+
+    def progress(phase: str, completed: int, total: int, label: str) -> None:
+        safe_total = max(0, int(total))
+        safe_completed = max(0, min(int(completed), safe_total)) if safe_total else 0
+        # 100 is reserved for a successful, verified publication response.
+        percent = min(99, round(safe_completed * 100 / safe_total)) if safe_total else 0
+        with _EXPORT_JOBS_LOCK:
+            job = _EXPORT_JOBS.get(job_id)
+            if not job or job.get("done"):
+                return
+            job.update({
+                "phase": phase, "completed": safe_completed, "total": safe_total,
+                "percent": percent, "label": label, "updated_at": time.monotonic(),
+            })
+
+    def run() -> None:
+        _EXPORT_JOB_LOCAL.progress = progress
+        try:
+            status_code, body = _response_body(work())
+        except Exception as exc:
+            traceback.print_exc()
+            status_code, body = 500, {"error": _describe(exc)}
+        finally:
+            try:
+                del _EXPORT_JOB_LOCAL.progress
+            except AttributeError:
+                pass
+        ok = 200 <= status_code < 300
+        with _EXPORT_JOBS_LOCK:
+            job = _EXPORT_JOBS.get(job_id)
+            if job is None:
+                return
+            job.update({
+                "phase": "complete" if ok else "failed",
+                "percent": 100 if ok else job.get("percent", 0),
+                "label": "保存完了" if ok else "保存を完了できませんでした",
+                "done": True, "status_code": status_code,
+                "result": body if ok else None,
+                "error": "" if ok else str(body.get("error") or "保存に失敗しました"),
+                "response": None if ok else body,
+                "updated_at": time.monotonic(),
+            })
+
+    threading.Thread(target=run, name=f"oir-{kind}-{job_id[:8]}", daemon=True).start()
+    return job_id
+
+
+@app.get("/api/export-jobs/{job_id}")
+def export_job_status(job_id: str):
+    with _EXPORT_JOBS_LOCK:
+        _purge_export_jobs(time.monotonic())
+        job = _EXPORT_JOBS.get(job_id)
+        if job is None:
+            return JSONResponse(status_code=404, content={"error": "保存ジョブが見つかりません。"})
+        return {key: value for key, value in job.items() if key != "updated_at"}
+
+
+def _selftest_export_job_progress() -> int:
+    """Prove publication-gated progress and bounded workers/records."""
+    def work():
+        _export_progress("rendering", 1, 2, "one")
+        _export_progress("publishing", 1, 2, "publish")
+        return {"saved": ["one"]}
+
+    blockers: list[threading.Event] = []
+    job_ids: list[str] = []
+    try:
+        job_id = _start_export_job("selftest", work)
+        job_ids.append(job_id)
+        deadline = time.monotonic() + 2
+        job = None
+        while time.monotonic() < deadline:
+            with _EXPORT_JOBS_LOCK:
+                job = dict(_EXPORT_JOBS[job_id])
+            if job.get("done"):
+                break
+            time.sleep(0.01)
+        if (not job or not job.get("done") or job.get("percent") != 100
+                or job.get("result") != {"saved": ["one"]}):
+            raise AssertionError(f"completed job state drifted: {job}")
+
+        # Exactly the configured number of workers may run. The next request is
+        # refused before it creates another thread.
+        for _index in range(_EXPORT_JOB_MAX_ACTIVE):
+            blocker = threading.Event()
+            blockers.append(blocker)
+            job_ids.append(_start_export_job(
+                "blocking-selftest", lambda event=blocker: (
+                    event.wait(2) and {"saved": ["released"]}
+                ),
+            ))
+        try:
+            _start_export_job("excess-selftest", lambda: {"saved": []})
+        except HTTPException as exc:
+            if exc.status_code != 429:
+                raise
+        else:
+            raise AssertionError("export worker limit accepted an excess job")
+
+        for blocker in blockers:
+            blocker.set()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with _EXPORT_JOBS_LOCK:
+                if all(_EXPORT_JOBS[job].get("done") for job in job_ids[1:]):
+                    break
+            time.sleep(0.01)
+
+        with _EXPORT_JOBS_LOCK:
+            fresh = time.monotonic()
+            for index in range(_EXPORT_JOB_MAX_RECORDS + 5):
+                old_id = f"old-{index}"
+                _EXPORT_JOBS[old_id] = {
+                    "done": True, "updated_at": fresh + index / 1000,
+                }
+            _purge_export_jobs(fresh)
+            if len(_EXPORT_JOBS) > _EXPORT_JOB_MAX_RECORDS:
+                raise AssertionError("completed export record bound was exceeded")
+    except Exception as exc:
+        print(f"selftest FAILED: export job progress -> {exc}", flush=True)
+        return 35
+    finally:
+        for blocker in blockers:
+            blocker.set()
+        with _EXPORT_JOBS_LOCK:
+            for job_id in job_ids:
+                _EXPORT_JOBS.pop(job_id, None)
+            for job_id in list(_EXPORT_JOBS):
+                if job_id.startswith("old-"):
+                    _EXPORT_JOBS.pop(job_id, None)
+    print("selftest: export jobs OK (publish-gated 100%, bounded workers/records)", flush=True)
+    return 0
+
 # This server reads and writes arbitrary local paths, so it must not be drivable
 # from any page the user happens to visit. Only our own UI origins are allowed:
 # the Vite dev server (5173, plus the ports it falls back to when 5173 is taken),
@@ -353,33 +607,6 @@ app.add_middleware(
 )
 
 
-def _physical_ram_bytes() -> int:
-    """Total RAM, or 0 when it cannot be determined."""
-    try:
-        if sys.platform == "win32":
-            import ctypes
-
-            class _MemStatus(ctypes.Structure):
-                _fields_ = [("dwLength", ctypes.c_ulong),
-                            ("dwMemoryLoad", ctypes.c_ulong),
-                            ("ullTotalPhys", ctypes.c_ulonglong),
-                            ("ullAvailPhys", ctypes.c_ulonglong),
-                            ("ullTotalPageFile", ctypes.c_ulonglong),
-                            ("ullAvailPageFile", ctypes.c_ulonglong),
-                            ("ullTotalVirtual", ctypes.c_ulonglong),
-                            ("ullAvailVirtual", ctypes.c_ulonglong),
-                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-
-            st = _MemStatus()
-            st.dwLength = ctypes.sizeof(_MemStatus)
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
-                return int(st.ullTotalPhys)
-            return 0
-        return int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
-    except Exception:
-        return 0
-
-
 #: How many bytes of decoded pixels all open images may hold between them.
 #:
 #: A fraction of the machine rather than a fixed number, because the same figure
@@ -387,7 +614,32 @@ def _physical_ram_bytes() -> int:
 #: plate well is 2911x2923x50x5 uint16 = 4.25 GB, so eight of them is 34 GB:
 #: fine on the workstation, fatal anywhere else. 40% leaves room for the JVM,
 #: the slice cache, Electron and the OS.
-_RAM = _physical_ram_bytes()
+_RAM = 0
+try:
+    if sys.platform == "win32":
+        # This total is retained solely for the decoded-image cache budget. The
+        # removed opening warning's volatile "available RAM" plumbing is not.
+        import ctypes
+
+        class _BudgetMemStatus(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+        _budget_status = _BudgetMemStatus()
+        _budget_status.dwLength = ctypes.sizeof(_BudgetMemStatus)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(_budget_status)):
+            _RAM = int(_budget_status.ullTotalPhys)
+    else:
+        _RAM = int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
+except Exception:
+    _RAM = 0
 try:
     _budget_env = os.environ.get("OIR_PIXEL_BUDGET_MB", "")
     IMAGE_BUDGET_BYTES = (int(_budget_env) * 1024 * 1024 if _budget_env
@@ -404,6 +656,41 @@ _lru: list[str] = []
 #: KeyError-shaped 500 with no wrongdoing anywhere. RLock, because add_image
 #: calls _touch and _enforce_budget while already holding it.
 _state_lock = threading.RLock()
+
+# One operation that can own or create multi-gigabyte pixel state at a time.
+#
+# This is intentionally process-wide rather than per reader. A real well is
+# about 4.25 GB decoded, while a source-resolution 3D reply is another 1.7 GB;
+# two individually reasonable requests overlapping are what caused the packaged
+# app to disappear without a Python exception. The epoch makes a memory plan a
+# single-phase admission decision: any later heavy operation invalidates it.
+_MEMORY_HEAVY_LOCK = threading.Semaphore(1)
+_MEMORY_EPOCH_LOCK = threading.Lock()
+_memory_epoch = 0
+
+
+def _memory_epoch_snapshot() -> int:
+    with _MEMORY_EPOCH_LOCK:
+        return _memory_epoch
+
+
+def _advance_memory_epoch() -> int:
+    global _memory_epoch
+    with _MEMORY_EPOCH_LOCK:
+        _memory_epoch += 1
+        return _memory_epoch
+
+
+@contextmanager
+def _memory_heavy_reservation(*, advances_epoch: bool = True):
+    """Serialise a memory-heavy phase and invalidate older plans on entry."""
+    _MEMORY_HEAVY_LOCK.acquire()
+    try:
+        if advances_epoch:
+            _advance_memory_epoch()
+        yield
+    finally:
+        _MEMORY_HEAVY_LOCK.release()
 
 
 def _touch(image_id: str) -> None:
@@ -438,6 +725,110 @@ def _enforce_budget(keep: str | None = None) -> None:
                       flush=True)
 
 
+@contextmanager
+def _reader_ready_reservation(
+    reader: ImageReader, image_id: str, *, metadata_only: bool = False,
+) -> Iterator[bool]:
+    """Hold the shared gate while making and using one reader ready.
+
+    Yields whether pixels were read. Merely revisiting an already-resident tab
+    does not advance the epoch. Keeping the gate through the caller's immediate
+    pixel snapshot prevents budget eviction from forcing an unreserved reload in
+    the few instructions after the residency check.
+    """
+    with _memory_heavy_reservation(advances_epoch=False):
+        with reader._pixels_lock:
+            needs_load = (not reader._metadata_authoritative
+                          if metadata_only else reader.data is None)
+            if needs_load:
+                _advance_memory_epoch()
+            if metadata_only:
+                loaded = reader.ensure_metadata()
+            else:
+                reader.ensure_loaded()
+                loaded = needs_load
+        # Evict before releasing the shared gate. Releasing first permits a
+        # second 4.25 GB decode to start while the older source is still resident.
+        if needs_load:
+            _enforce_budget(keep=image_id)
+        yield bool(loaded)
+
+
+def _ensure_reader_ready_reserved(
+    reader: ImageReader, image_id: str, *, metadata_only: bool = False,
+) -> bool:
+    """Make a reader ready, releasing the shared reservation on return."""
+    with _reader_ready_reservation(
+        reader, image_id, metadata_only=metadata_only,
+    ) as loaded:
+        return loaded
+
+
+def _selftest_memory_heavy_reservation() -> int:
+    """Prove heavy phases are exclusive and advance one shared generation."""
+    global _memory_epoch
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    state_lock = threading.Lock()
+    state = {"active": 0, "peak": 0}
+    errors: list[BaseException] = []
+
+    def worker(entered: threading.Event, wait: bool) -> None:
+        try:
+            with _memory_heavy_reservation():
+                with state_lock:
+                    state["active"] += 1
+                    state["peak"] = max(state["peak"], state["active"])
+                entered.set()
+                if wait and not release_first.wait(2):
+                    raise RuntimeError("reservation selftest timed out")
+                with state_lock:
+                    state["active"] -= 1
+        except BaseException as e:
+            errors.append(e)
+
+    with _MEMORY_EPOCH_LOCK:
+        saved_epoch = _memory_epoch
+    first = threading.Thread(target=worker, args=(first_entered, True), daemon=True)
+    second = threading.Thread(target=worker, args=(second_entered, False), daemon=True)
+    try:
+        first.start()
+        if not first_entered.wait(1):
+            raise AssertionError("first reservation did not start")
+        second.start()
+        if second_entered.wait(0.05):
+            raise AssertionError("two memory-heavy reservations overlapped")
+        release_first.set()
+        first.join(2)
+        second.join(2)
+        if (first.is_alive() or second.is_alive() or errors
+                or not second_entered.is_set() or state["peak"] != 1
+                or _memory_epoch_snapshot() != saved_epoch + 2):
+            raise AssertionError(
+                f"reservation state drifted: peak={state['peak']}, "
+                f"epoch={_memory_epoch_snapshot() - saved_epoch}, errors={errors}"
+            )
+    except Exception as e:
+        print(f"selftest FAILED: memory reservation -> {type(e).__name__}: {e}",
+              flush=True)
+        return 31
+    finally:
+        release_first.set()
+        first.join(2)
+        second.join(2)
+        with _MEMORY_EPOCH_LOCK:
+            _memory_epoch = saved_epoch
+
+    if _VOLUME_BUILD_LOCK is not _MEMORY_HEAVY_LOCK:
+        print("selftest FAILED: volume response does not use shared memory gate",
+              flush=True)
+        return 31
+    print("selftest: memory reservation OK (exclusive, shared epoch, response gate)",
+          flush=True)
+    return 0
+
+
 def get_reader(image_id: str | None = None) -> ImageReader:
     """Get the reader for a given image ID, or the active one."""
     rid = image_id or active_id
@@ -460,6 +851,31 @@ def add_image(reader: ImageReader) -> str:
     _enforce_budget(keep=img_id)
     _save_session()
     return img_id
+
+
+def _open_image_with_source(
+    source_path: str, source_identity: str, source_revision: str,
+) -> tuple[str, ImageReader] | None:
+    """Return the existing tab for the exact same source bytes, if any.
+
+    Two ids for one canonical source carry independent in-memory view snapshots
+    but share one durable settings record. Resetting one could therefore be
+    undone later by the other tab. Reusing the existing id removes that
+    ambiguity before any pixels are decoded again.
+    """
+    requested_path = _path_key(source_path)
+    with _state_lock:
+        for image_id, reader in images.items():
+            meta = reader.metadata
+            if (meta.source_identity == source_identity
+                    and meta.source_revision == source_revision):
+                return image_id, reader
+            if meta.source_path and _path_key(meta.source_path) == requested_path:
+                raise RuntimeError(
+                    "The source file changed while an older tab is still open. "
+                    "Close the older tab before opening the replacement."
+                )
+    return None
 
 
 @app.get("/api/images")
@@ -496,18 +912,19 @@ def activate_image(image_id: str):
     `def` endpoint in its thread pool.
     """
     global active_id
-    if image_id not in images:
-        return JSONResponse(status_code=404, content={"error": "Image not found"})
-    active_id = image_id
-    _touch(image_id)
+    with _state_lock:
+        reader = images.get(image_id)
+        if reader is None:
+            return JSONResponse(status_code=404, content={"error": "Image not found"})
+        active_id = image_id
+        _touch(image_id)
     try:
-        images[image_id].ensure_loaded()
+        _ensure_reader_ready_reserved(reader, image_id)
     except Exception as e:
         traceback.print_exc()
         return JSONResponse(status_code=400, content={"error": _describe(e)})
-    # After loading, not before: the well just read is the one to keep.
-    _enforce_budget(keep=image_id)
-    return images[image_id].metadata.to_dict()
+    # A newly loaded tab was budgeted before the reservation was released.
+    return reader.metadata.to_dict()
 
 
 @app.delete("/api/images/{image_id}")
@@ -524,6 +941,291 @@ async def close_image(image_id: str):
             active_id = next(iter(images), None)
     _save_session()
     return {"closed": image_id, "active_id": active_id}
+
+
+class SavedChannelView(BaseModel):
+    color: list[int]
+    min: float
+    max: float
+    visible: bool
+
+
+class SavedImageView(BaseModel):
+    channels: list[SavedChannelView]
+    currentZ: int
+    currentT: int
+    showMIP: bool
+    client_session: str = ""
+    client_sequence: int = 0
+
+
+def _validated_view_settings(meta: ImageMetadata, raw: object) -> dict:
+    """Return a canonical payload, refusing any state that could mis-map pixels."""
+    if not isinstance(raw, dict):
+        raise ValueError("View settings are not an object")
+    channels = raw.get("channels")
+    if not isinstance(channels, list) or len(channels) != meta.num_channels:
+        raise ValueError(
+            f"View settings have {len(channels) if isinstance(channels, list) else 'invalid'} "
+            f"channels; the source has {meta.num_channels}"
+        )
+
+    bit_depth = max(1, min(16, int(meta.bit_depth or 16)))
+    full_scale = float((1 << bit_depth) - 1)
+    clean_channels = []
+    for index, channel in enumerate(channels):
+        if not isinstance(channel, dict):
+            raise ValueError(f"Channel {index + 1} settings are not an object")
+        color = channel.get("color")
+        if (not isinstance(color, (list, tuple)) or len(color) != 3
+                or any(type(v) is not int or v < 0 or v > 255 for v in color)):
+            raise ValueError(f"Channel {index + 1} has an invalid RGB colour")
+        lo, hi = channel.get("min"), channel.get("max")
+        if (isinstance(lo, bool) or isinstance(hi, bool)
+                or not isinstance(lo, (int, float)) or not isinstance(hi, (int, float))
+                or not math.isfinite(float(lo)) or not math.isfinite(float(hi))
+                or float(lo) < 0 or float(hi) < float(lo) or float(hi) > full_scale):
+            raise ValueError(f"Channel {index + 1} has an invalid Min/Max window")
+        visible = channel.get("visible")
+        if type(visible) is not bool:
+            raise ValueError(f"Channel {index + 1} has an invalid visibility flag")
+        clean_channels.append({
+            "color": [int(v) for v in color],
+            "min": float(lo),
+            "max": float(hi),
+            "visible": visible,
+        })
+
+    current_z, current_t, show_mip = (
+        raw.get("currentZ"), raw.get("currentT"), raw.get("showMIP")
+    )
+    if type(current_z) is not int or not 0 <= current_z < max(1, meta.num_z):
+        raise ValueError("Saved Z position is outside this source")
+    if type(current_t) is not int or not 0 <= current_t < max(1, meta.num_t):
+        raise ValueError("Saved T position is outside this source")
+    if type(show_mip) is not bool:
+        raise ValueError("Saved MIP state is invalid")
+    return {
+        "channels": clean_channels,
+        "currentZ": current_z,
+        "currentT": current_t,
+        "showMIP": show_mip,
+    }
+
+
+def _authoritative_view_source(image_id: str) -> tuple[ImageReader, ImageMetadata] | JSONResponse:
+    """Resolve rich metadata and prove the source did not change underneath it."""
+    with _state_lock:
+        reader = images.get(image_id)
+    if reader is None:
+        return JSONResponse(status_code=404, content={"error": "Image not found"})
+    try:
+        _ensure_reader_ready_reserved(reader, image_id, metadata_only=True)
+        meta = reader.metadata
+        if not meta.source_path or not meta.source_identity or not meta.source_revision:
+            raise ValueError("The source has no stable identity for saved view settings")
+        current = snapshot_source(meta.source_path)
+        if (current.identity != meta.source_identity
+                or current.revision != meta.source_revision):
+            return JSONResponse(status_code=409, content={
+                "error": "元画像が変更されたため、以前の表示設定は適用・保存しません。"
+            })
+        return reader, meta
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": _describe(e)})
+
+
+@app.get("/api/images/{image_id}/view-settings")
+def get_view_settings(image_id: str):
+    """Return settings only when they belong to the exact current source bytes."""
+    source = _authoritative_view_source(image_id)
+    if isinstance(source, JSONResponse):
+        return source
+    _reader, meta = source
+    try:
+        saved, reason = _view_settings_store.get(
+            meta.source_path, meta.source_identity, meta.source_revision,
+        )
+        if saved is None:
+            return {"found": False, "reason": reason}
+        clean = _validated_view_settings(meta, saved)
+        return {
+            "found": True,
+            "source_identity": meta.source_identity,
+            "source_revision": meta.source_revision,
+            "settings": clean,
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": _describe(e)})
+
+
+@app.put("/api/images/{image_id}/view-settings")
+def put_view_settings(image_id: str, req: SavedImageView):
+    """Atomically save a validated display state for the current source revision."""
+    source = _authoritative_view_source(image_id)
+    if isinstance(source, JSONResponse):
+        return source
+    _reader, meta = source
+    try:
+        raw = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+        clean = _validated_view_settings(meta, raw)
+        client_session = str(req.client_session or "")
+        client_sequence = int(req.client_sequence)
+        if client_session:
+            if (not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", client_session)
+                    or type(req.client_sequence) is not int
+                    or not 1 <= client_sequence <= 2 ** 53 - 1):
+                raise ValueError("Saved view write sequence is invalid")
+        elif client_sequence != 0:
+            raise ValueError("Saved view sequence has no renderer session")
+        # Recheck after validation: a split companion can change at any time.
+        current = snapshot_source(meta.source_path)
+        if (current.identity != meta.source_identity
+                or current.revision != meta.source_revision):
+            return JSONResponse(status_code=409, content={
+                "error": "元画像が変更されたため、表示設定を保存しませんでした。"
+            })
+        saved = _view_settings_store.put(
+            meta.source_path, meta.source_identity, meta.source_revision, clean,
+            client_session=client_session, client_sequence=client_sequence,
+        )
+        return {"saved": saved, "source_revision": meta.source_revision}
+    except ValueError as e:
+        return JSONResponse(status_code=422, content={"error": _describe(e)})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": _describe(e)})
+
+
+@app.delete("/api/images/{image_id}/view-settings")
+def delete_view_settings(image_id: str):
+    """Forget every saved revision for this path, even if its drive is absent."""
+    with _state_lock:
+        reader = images.get(image_id)
+    if reader is None:
+        return JSONResponse(status_code=404, content={"error": "Image not found"})
+    source_path = reader.metadata.source_path
+    if not source_path:
+        return JSONResponse(status_code=409, content={
+            "error": "This image has no source path to reset"
+        })
+    try:
+        return {"deleted": _view_settings_store.delete(source_path)}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": _describe(e)})
+
+
+def _selftest_view_settings_api() -> int:
+    """Prove the API validates, revision-binds and independently resets state."""
+    global images, active_id, _lru, _view_settings_store
+
+    saved_images, saved_active, saved_lru = images, active_id, _lru
+    saved_store = _view_settings_store
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            source_path = os.path.join(tmp, "view-source.oir")
+            Path(source_path).write_bytes(b"stable source bytes")
+            source = snapshot_source(source_path)
+            meta = ImageMetadata(
+                filename=os.path.basename(source_path),
+                source_path=source_path,
+                source_identity=source.identity,
+                source_revision=source.revision,
+                num_channels=2,
+                num_z=4,
+                num_t=3,
+                width=8,
+                height=8,
+                bit_depth=12,
+            )
+
+            class _MetadataReader:
+                def __init__(self, metadata: ImageMetadata):
+                    self.metadata = metadata
+                    self._pixels_lock = threading.RLock()
+                    self._metadata_authoritative = True
+
+                def ensure_metadata(self) -> bool:
+                    return False
+
+            images, active_id, _lru = {"view": _MetadataReader(meta)}, "view", []
+            _view_settings_store = view_settings.ViewSettingsStore(
+                os.path.join(tmp, "view-settings.json")
+            )
+            payload = {
+                "channels": [
+                    {"color": [0, 255, 0], "min": 12.0,
+                     "max": 2048.0, "visible": True},
+                    {"color": [255, 0, 255], "min": 0.0,
+                     "max": 4095.0, "visible": False},
+                ],
+                "currentZ": 3,
+                "currentT": 2,
+                "showMIP": True,
+            }
+
+            request = SavedImageView(**payload)
+            saved = put_view_settings("view", request)
+            loaded = get_view_settings("view")
+            if (saved.get("saved") is not True
+                    or loaded.get("found") is not True
+                    or loaded.get("source_identity") != source.identity
+                    or loaded.get("source_revision") != source.revision
+                    or loaded.get("settings") != payload):
+                raise AssertionError("validated settings did not round-trip through the API")
+
+            invalid = SavedImageView(
+                channels=[SavedChannelView(
+                    color=[255, 255, 255], min=0, max=4095, visible=True,
+                )],
+                currentZ=0,
+                currentT=0,
+                showMIP=False,
+            )
+            rejected = put_view_settings("view", invalid)
+            if not isinstance(rejected, JSONResponse) or rejected.status_code != 422:
+                raise AssertionError("a channel-count mismatch was accepted")
+
+            # The unload keepalive request bypasses the renderer's Promise tail.
+            # If it arrives before an older PUT, the endpoint must still retain
+            # the larger renderer sequence.
+            newer_payload = {**payload, "currentZ": 2}
+            older_payload = {**payload, "currentZ": 1}
+            newer = put_view_settings("view", SavedImageView(
+                **newer_payload, client_session="renderer-test", client_sequence=2,
+            ))
+            older = put_view_settings("view", SavedImageView(
+                **older_payload, client_session="renderer-test", client_sequence=1,
+            ))
+            ordered = get_view_settings("view")
+            if (newer.get("saved") is not True or older.get("saved") is not False
+                    or ordered.get("settings", {}).get("currentZ") != 2):
+                raise AssertionError("an older renderer PUT replaced unload settings")
+
+            # The reader still names the earlier bytes; a changed source must be
+            # refused before an old display state can be applied or overwritten.
+            Path(source_path).write_bytes(b"changed source bytes")
+            changed = put_view_settings("view", request)
+            if not isinstance(changed, JSONResponse) or changed.status_code != 409:
+                raise AssertionError("a changed source revision accepted saved settings")
+
+            # Reset is intentionally path-scoped and remains available while the
+            # source is changed or temporarily unavailable.
+            reset = delete_view_settings("view")
+            if reset != {"deleted": True}:
+                raise AssertionError("reset did not delete the source's settings")
+            if _view_settings_store.get(
+                    source_path, source.identity, source.revision) != (None, "none"):
+                raise AssertionError("deleted settings came back through the store")
+    except Exception as e:
+        print(f"selftest FAILED: view settings API -> {type(e).__name__}: {e}", flush=True)
+        return 30
+    finally:
+        images, active_id, _lru = saved_images, saved_active, saved_lru
+        _view_settings_store = saved_store
+
+    print("selftest: view settings API OK (validated, revision-bound, resettable)",
+          flush=True)
+    return 0
 
 
 def _describe(e: BaseException) -> str:
@@ -546,6 +1248,7 @@ def _describe(e: BaseException) -> str:
 @app.get("/api/open")
 def open_file(path: str = Query(...)):
     """Open an image file by path."""
+    global active_id
     locks = _locks_for_targets([path])
     for lock in locks:
         lock.acquire()
@@ -553,10 +1256,25 @@ def open_file(path: str = Query(...)):
     try:
         process_locks = _acquire_process_target_locks([path])
         print(f"Opening {path}", flush=True)
+        source = snapshot_source(path)
+        existing = _open_image_with_source(
+            path, source.identity, source.revision,
+        )
+        if existing is not None:
+            img_id, r = existing
+            with _state_lock:
+                active_id = img_id
+                _touch(img_id)
+            _ensure_reader_ready_reserved(r, img_id)
+            _save_session()
+            return {**r.metadata.to_dict(), "id": img_id, "reused": True}
         r = ImageReader()
-        r.load_file(path)
-        img_id = add_image(r)
-        return {**r.metadata.to_dict(), "id": img_id}
+        # Target locks are taken first. No code may acquire a target lock while
+        # holding this reservation; projection releases it before publication.
+        with _memory_heavy_reservation():
+            r.load_file(path)
+            img_id = add_image(r)
+        return {**r.metadata.to_dict(), "id": img_id, "reused": False}
     except Exception as e:
         # str(e) alone is what the UI shows, and for a JVM or Bio-Formats
         # failure that is often a bare class name. The traceback goes to the
@@ -582,10 +1300,14 @@ def _safe_upload_name(raw: str | None) -> str:
 
 
 @app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...)):
+def upload_file(file: UploadFile = File(...)):
     """Upload an image file, save to the persistent uploads dir, and open it."""
     try:
-        content = await file.read()
+        # This endpoint can wait for the process-wide memory reservation below.
+        # Keep it synchronous so FastAPI runs it in a worker; blocking the event
+        # loop could prevent the volume response holding that reservation from
+        # finishing its send and releasing it.
+        content = file.file.read()
         # Save under a stable app dir (not /tmp) so the file survives restarts and
         # the session can be restored. On a name clash use a fresh SUBFOLDER rather
         # than renaming the file: a split .oir finds its `<base>_00001` siblings by
@@ -611,9 +1333,10 @@ async def upload_file(file: UploadFile = File(...)):
                 out.write(content)
 
             r = ImageReader()
-            r.load_file(dest)
-            r.metadata.filename = base
-            img_id = add_image(r)
+            with _memory_heavy_reservation():
+                r.load_file(dest)
+                r.metadata.filename = base
+                img_id = add_image(r)
             return {**r.metadata.to_dict(), "id": img_id}
         finally:
             _release_process_target_locks(process_locks)
@@ -639,11 +1362,10 @@ def get_metadata(id: str | None = Query(None)):
     try:
         image_id = id or active_id
         r = get_reader(image_id)
-        upgraded = r.ensure_metadata()
+        upgraded = _ensure_reader_ready_reserved(r, image_id, metadata_only=True)
         # An old placeholder currently has to open the image to discover its
-        # rich metadata. Admit exactly this image, then evict older pixels under
-        # the same budget used by activate/slice/volume paths.
-        _enforce_budget(keep=image_id)
+        # rich metadata. The reserved loader admits exactly this image and evicts
+        # older pixels before another multi-GB operation may begin.
         if upgraded:
             # Dimensions in an old session are a cache too. Persist the values
             # the reader just established so even the lightweight tab list is
@@ -664,12 +1386,14 @@ def get_image(
 ):
     """Get a single 2D slice."""
     try:
-        r = get_reader(id)
-        img = r.get_slice(c, z, t)
-        if format == "png":
-            png_bytes = to_png_bytes(img)
-            return Response(content=png_bytes, media_type="image/png")
-        else:
+        image_id = id or active_id
+        r = get_reader(image_id)
+        assert image_id is not None
+        with _reader_ready_reservation(r, image_id):
+            img = r.get_slice(c, z, t)
+            if format == "png":
+                png_bytes = to_png_bytes(img)
+                return Response(content=png_bytes, media_type="image/png")
             raw = img.astype(np.uint16).tobytes()
             return Response(
                 content=raw,
@@ -697,32 +1421,35 @@ def get_all_channels(
 ):
     """Get all channels as base64-encoded uint16 raw data in a single response."""
     try:
-        r = get_reader(id)
-        n_c = r.metadata.num_channels
-        # Default proj_z_to to last Z slice
-        if proj_z_to < 0:
-            proj_z_to = r.metadata.num_z - 1
-        channels = []
-        for c in range(n_c):
-            if proj:
-                img = r.get_projection(c, t, proj_z_from, proj_z_to, proj_method)
-            elif mip:
-                img = r.get_mip(c, t)
-            else:
-                img = r.get_slice(c, z, t)
-            raw_b64 = base64.b64encode(img.astype(np.uint16).tobytes()).decode("ascii")
-            low, high = auto_contrast(img)
-            channels.append({
-                "channel": c,
-                "data_b64": raw_b64,
-                "auto_min": low,
-                "auto_max": high,
-            })
-        return {
-            "width": r.metadata.width,
-            "height": r.metadata.height,
-            "channels": channels,
-        }
+        image_id = id or active_id
+        r = get_reader(image_id)
+        assert image_id is not None
+        with _reader_ready_reservation(r, image_id):
+            n_c = r.metadata.num_channels
+            # Default proj_z_to to last Z slice
+            if proj_z_to < 0:
+                proj_z_to = r.metadata.num_z - 1
+            channels = []
+            for c in range(n_c):
+                if proj:
+                    img = r.get_projection(c, t, proj_z_from, proj_z_to, proj_method)
+                elif mip:
+                    img = r.get_mip(c, t)
+                else:
+                    img = r.get_slice(c, z, t)
+                raw_b64 = base64.b64encode(img.astype(np.uint16).tobytes()).decode("ascii")
+                low, high = auto_contrast(img)
+                channels.append({
+                    "channel": c,
+                    "data_b64": raw_b64,
+                    "auto_min": low,
+                    "auto_max": high,
+                })
+            return {
+                "width": r.metadata.width,
+                "height": r.metadata.height,
+                "channels": channels,
+            }
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
 
@@ -750,31 +1477,34 @@ def get_all_channels_bin(
     Avoids base64 (+33% size) and per-byte JS decoding used by the JSON variant.
     """
     try:
-        r = get_reader(id)
-        n_c = r.metadata.num_channels
-        w, h = r.metadata.width, r.metadata.height
-        if proj_z_to < 0:
-            proj_z_to = r.metadata.num_z - 1
+        image_id = id or active_id
+        r = get_reader(image_id)
+        assert image_id is not None
+        with _reader_ready_reservation(r, image_id):
+            n_c = r.metadata.num_channels
+            w, h = r.metadata.width, r.metadata.height
+            if proj_z_to < 0:
+                proj_z_to = r.metadata.num_z - 1
 
-        planes: list[np.ndarray] = []
-        levels: list[tuple[int, int]] = []
-        for c in range(n_c):
-            if proj:
-                img = r.get_projection(c, t, proj_z_from, proj_z_to, proj_method)
-            elif mip:
-                img = r.get_mip(c, t)
-            else:
-                img = r.get_slice(c, z, t)
-            img = np.ascontiguousarray(img, dtype="<u2")
-            planes.append(img)
-            low, high = auto_contrast(img)
-            levels.append((int(low), int(high)))
+            planes: list[np.ndarray] = []
+            levels: list[tuple[int, int]] = []
+            for c in range(n_c):
+                if proj:
+                    img = r.get_projection(c, t, proj_z_from, proj_z_to, proj_method)
+                elif mip:
+                    img = r.get_mip(c, t)
+                else:
+                    img = r.get_slice(c, z, t)
+                img = np.ascontiguousarray(img, dtype="<u2")
+                planes.append(img)
+                low, high = auto_contrast(img)
+                levels.append((int(low), int(high)))
 
-        header = np.array([w, h, n_c], dtype="<u4").tobytes()
-        meta = np.array(levels, dtype="<i4").tobytes() if levels else b""
-        body = b"".join(p.tobytes() for p in planes)
-        payload = header + meta + body
-        return Response(content=payload, media_type="application/octet-stream")
+            header = np.array([w, h, n_c], dtype="<u4").tobytes()
+            meta = np.array(levels, dtype="<i4").tobytes() if levels else b""
+            body = b"".join(p.tobytes() for p in planes)
+            payload = header + meta + body
+            return Response(content=payload, media_type="application/octet-stream")
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
 
@@ -783,18 +1513,21 @@ def get_all_channels_bin(
 def get_mip(c: int = Query(0), t: int = Query(0), id: str | None = Query(None)):
     """Get Maximum Intensity Projection."""
     try:
-        r = get_reader(id)
-        img = r.get_mip(c, t)
-        raw = img.astype(np.uint16).tobytes()
-        return Response(
-            content=raw,
-            media_type="application/octet-stream",
-            headers={
-                "X-Width": str(img.shape[1]),
-                "X-Height": str(img.shape[0]),
-                "X-Dtype": "uint16",
-            },
-        )
+        image_id = id or active_id
+        r = get_reader(image_id)
+        assert image_id is not None
+        with _reader_ready_reservation(r, image_id):
+            img = r.get_mip(c, t)
+            raw = img.astype(np.uint16).tobytes()
+            return Response(
+                content=raw,
+                media_type="application/octet-stream",
+                headers={
+                    "X-Width": str(img.shape[1]),
+                    "X-Height": str(img.shape[0]),
+                    "X-Dtype": "uint16",
+                },
+            )
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
 
@@ -808,13 +1541,16 @@ def get_histogram(
 ):
     """Get intensity histogram for a slice."""
     try:
-        r = get_reader(id)
-        img = r.get_slice(c, z, t)
-        hist = compute_histogram(img)
-        low, high = auto_contrast(img)
-        hist["auto_min"] = low
-        hist["auto_max"] = high
-        return hist
+        image_id = id or active_id
+        r = get_reader(image_id)
+        assert image_id is not None
+        with _reader_ready_reservation(r, image_id):
+            img = r.get_slice(c, z, t)
+            hist = compute_histogram(img)
+            low, high = auto_contrast(img)
+            hist["auto_min"] = low
+            hist["auto_max"] = high
+            return hist
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
 
@@ -823,22 +1559,25 @@ def get_histogram(
 def roi_profile(body: dict):
     """Compute intensity profile along a line ROI."""
     try:
-        r = get_reader(body.get("id"))
+        image_id = body.get("id") or active_id
+        r = get_reader(image_id)
+        assert image_id is not None
         c = body.get("c", 0)
         z = body.get("z", 0)
         t = body.get("t", 0)
-        img = r.get_slice(c, z, t)
-        result = line_profile(
-            img,
-            int(body["x0"]), int(body["y0"]),
-            int(body["x1"]), int(body["y1"]),
-            width=int(body.get("width", 1)),
-        )
-        px_size = r.metadata.pixel_size_x
-        if px_size > 0:
-            result["distances"] = [d * px_size for d in result["distances"]]
-            result["distance_unit"] = "µm"
-        return result
+        with _reader_ready_reservation(r, image_id):
+            img = r.get_slice(c, z, t)
+            result = line_profile(
+                img,
+                int(body["x0"]), int(body["y0"]),
+                int(body["x1"]), int(body["y1"]),
+                width=int(body.get("width", 1)),
+            )
+            px_size = r.metadata.pixel_size_x
+            if px_size > 0:
+                result["distances"] = [d * px_size for d in result["distances"]]
+                result["distance_unit"] = "µm"
+            return result
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
 
@@ -847,19 +1586,22 @@ def roi_profile(body: dict):
 def roi_measure(body: dict):
     """Measure statistics within an ROI."""
     try:
-        r = get_reader(body.get("id"))
+        image_id = body.get("id") or active_id
+        r = get_reader(image_id)
+        assert image_id is not None
         c = body.get("c", 0)
         z = body.get("z", 0)
         t = body.get("t", 0)
-        img = r.get_slice(c, z, t)
-        result = measure_roi(
-            img,
-            roi_type=body["roi_type"],
-            params=body["params"],
-            pixel_size_x=r.metadata.pixel_size_x,
-            pixel_size_y=r.metadata.pixel_size_y,
-        )
-        return result
+        with _reader_ready_reservation(r, image_id):
+            img = r.get_slice(c, z, t)
+            result = measure_roi(
+                img,
+                roi_type=body["roi_type"],
+                params=body["params"],
+                pixel_size_x=r.metadata.pixel_size_x,
+                pixel_size_y=r.metadata.pixel_size_y,
+            )
+            return result
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
 
@@ -878,7 +1620,12 @@ def get_volume(
     """
     from scipy.ndimage import zoom as ndzoom
 
+    _MEMORY_HEAVY_LOCK.acquire()
     try:
+        # Legacy route retained for compatibility. It has no admission token,
+        # but it must still be one exclusive allocation phase and invalidate any
+        # newer /api/volume-plan approval made before it began.
+        _advance_memory_epoch()
         r = get_reader(id)
         vol = r.get_volume(t)  # (C, Z, Y, X)
         n_c, n_z, h, w = vol.shape
@@ -937,12 +1684,330 @@ def get_volume(
         import traceback
         traceback.print_exc()
         return JSONResponse(status_code=400, content={"error": str(e)})
+    finally:
+        _MEMORY_HEAVY_LOCK.release()
 
 
 #: Distinct values a uint16 pixel can take, which is the length of the histogram
 #: the streaming volume path accumulates instead of keeping the pixels. Every
 #: reader path ends at uint16 (reader._to_uint16), so this covers all of them.
 _U16_LEVELS = 65536
+
+# One response body can be 1.7 GB at the real acquisition's source resolution.
+# This alias documents the response-lifetime use while making it the same gate
+# as source decode, plate volume and projection work. It is held until the body
+# has been sent, not merely until it was built.
+_VOLUME_BUILD_LOCK = _MEMORY_HEAVY_LOCK
+
+
+class _VolumeResponse(Response):
+    """Release the build reservation even when the client disconnects mid-send."""
+
+    def __init__(self, *args, build_lock: threading.Semaphore, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._build_lock = build_lock
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._build_lock.release()
+
+
+def _volume_memory_plan(
+    *, image_id: str, source_revision: str, t: int, n_t: int,
+    n_c: int, n_z: int, h: int, w: int, max_dim: int, max_ch: int,
+    source_resident_bytes: int, memory_epoch: int,
+) -> dict:
+    """Exact output shape plus conservative allocation sizes for volume-bin."""
+    raw_values = (n_t, n_c, n_z, h, w)
+    # Bio-Formats returns JPype integer proxies. They deliberately behave like
+    # Python ints (including ``isinstance(value, int)``), but ``type(value) is
+    # int`` is false. Canonicalise trusted metadata dimensions before hashing or
+    # arithmetic so the packaged OIR path and the pure-Python selftest use the
+    # same plan contract. Booleans remain invalid even though bool subclasses
+    # int.
+    try:
+        if any(isinstance(value, (bool, np.bool_)) for value in raw_values):
+            raise TypeError("boolean dimension")
+        n_t, n_c, n_z, h, w = (operator.index(value) for value in raw_values)
+    except (TypeError, ValueError, OverflowError) as e:
+        raise ValueError(f"Invalid volume shape: {raw_values}") from e
+    values = (n_t, n_c, n_z, h, w)
+    if any(value <= 0 for value in values):
+        raise ValueError(f"Invalid volume shape: {raw_values}")
+    if not 0 <= t < n_t:
+        raise ValueError(f"T{t + 1} is outside this image (T1-T{n_t})")
+    if not 1 <= max_ch <= 4:
+        raise ValueError("3D volume channel limit must be between 1 and 4")
+    if type(memory_epoch) is not int or memory_epoch < 0:
+        raise ValueError("Invalid memory-plan epoch")
+
+    normalised_max_dim = 0
+    if max_dim <= 0:
+        scale_xy = 1.0
+        scale_z = 1.0
+    else:
+        normalised_max_dim = max(32, min(int(max_dim), 2048))
+        xy_max = max(h, w)
+        scale_xy = normalised_max_dim / xy_max if xy_max > normalised_max_dim else 1.0
+        scale_z = 128 / n_z if n_z > 128 else 1.0
+
+    out_h = int(round(h * scale_xy))
+    out_w = int(round(w * scale_xy))
+    out_z = int(round(n_z * scale_z))
+    send_c = min(n_c, max_ch)
+    channel_bytes = out_z * out_h * out_w
+    texture_bytes = send_c * channel_bytes
+    wire_bytes = 32 + 8 * send_c + texture_bytes
+    resized = (out_h, out_w, out_z) != (h, w, n_z)
+    # One uint16 output channel plus the uint16 histogram. Channels are processed
+    # serially, so this never multiplies by send_c.
+    server_stage_bytes = (_U16_LEVELS * np.dtype(np.int64).itemsize
+                          + (2 * channel_bytes if resized else 0))
+    # `_resize_plane` can hold float32 source/filter/output planes together;
+    # packing to uint8 holds one additional float32 output plane at full size.
+    plane_work_bytes = ((8 * h * w + 4 * out_h * out_w)
+                        if (out_h, out_w) != (h, w)
+                        else 4 * out_h * out_w)
+    source_bytes = n_t * n_c * n_z * h * w * np.dtype(np.uint16).itemsize
+    resident = max(0, min(int(source_resident_bytes), source_bytes))
+    key_payload = json.dumps({
+        "id": image_id, "revision": source_revision, "t": t,
+        "shape": values, "max_dim": normalised_max_dim, "max_ch": max_ch,
+        "output": [send_c, out_z, out_h, out_w],
+        # A plan approved while the source pixels are resident is not safe after
+        # budget eviction: reloading a real well adds another ~4.25 GB before
+        # the volume reply can be built. Bind that state into the token so the
+        # execution endpoint can refuse the changed plan before it reads pixels.
+        "source_resident_bytes": resident,
+        # Another source decode, projection, plate volume or interactive volume
+        # changes the process-wide allocation phase even if this reader's shape
+        # and residency happen to look identical afterward.
+        "memory_epoch": memory_epoch,
+    }, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(key_payload.encode("utf-8")).hexdigest()
+    return {
+        # The prefix is deliberately readable by the execution endpoint. The
+        # client treats the token as opaque, while the server can distinguish a
+        # harmless global allocation-phase drift from a changed source/shape.
+        "plan_key": f"{memory_epoch}:{digest}",
+        "memory_epoch": memory_epoch,
+        "source_bytes": int(source_bytes),
+        "source_resident_bytes": resident,
+        "source_increment_bytes": int(source_bytes - resident),
+        "num_t": n_t,
+        "num_channels": send_c,
+        "num_z": out_z,
+        "height": out_h,
+        "width": out_w,
+        "original_shape": [n_c, n_z, h, w],
+        "texture_bytes": int(texture_bytes),
+        "wire_bytes": int(wire_bytes),
+        "server_stage_bytes": int(server_stage_bytes),
+        "plane_work_bytes": int(plane_work_bytes),
+        "max_dim": normalised_max_dim,
+    }
+
+
+@app.get("/api/volume-plan")
+def get_volume_plan(
+    t: int = Query(0),
+    id: str | None = Query(None),
+    max_dim: int = Query(256),
+    max_ch: int = Query(4),
+):
+    """Plan one 3D load without allocating its response or touching pixels."""
+    try:
+        # Wait for any previous heavy response to finish, then freeze residency
+        # and epoch together. A later heavy phase advances the epoch and makes
+        # this exact token fail at /api/volume-bin before pixels are touched.
+        with _memory_heavy_reservation(advances_epoch=False):
+            image_id = id or active_id
+            if not image_id:
+                raise RuntimeError("No image loaded")
+            r = get_reader(image_id)
+            with r._pixels_lock:
+                meta = r.metadata
+                return _volume_memory_plan(
+                    image_id=image_id, source_revision=meta.source_revision, t=t,
+                    n_t=meta.num_t, n_c=meta.num_channels, n_z=meta.num_z,
+                    h=meta.height, w=meta.width, max_dim=max_dim, max_ch=max_ch,
+                    source_resident_bytes=r.loaded_bytes,
+                    memory_epoch=_memory_epoch_snapshot(),
+                )
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": _describe(e)})
+
+
+def _selftest_volume_memory_plan() -> int:
+    """Pin the real-data shape and the approval token to the execution plan."""
+    global images, active_id, _lru, _memory_epoch
+    try:
+        plan_epoch = _memory_epoch_snapshot()
+        # Bio-Formats dimensions are JPype integer proxies rather than exact
+        # built-in ints. A subclass pins that packaged OIR boundary without
+        # starting Java merely for this arithmetic test.
+        class _BioFormatsDimension(int):
+            pass
+
+        common = dict(
+            image_id="well", source_revision="source-rev", t=0,
+            n_t=_BioFormatsDimension(1), n_c=_BioFormatsDimension(5),
+            n_z=_BioFormatsDimension(50), h=_BioFormatsDimension(2929),
+            w=_BioFormatsDimension(2909), max_ch=4,
+            memory_epoch=plan_epoch,
+        )
+        capped = _volume_memory_plan(
+            **common, max_dim=2048, source_resident_bytes=4_260_230_500,
+        )
+        if ([capped["num_channels"], capped["num_z"],
+             capped["height"], capped["width"]] != [4, 50, 2048, 2034]
+                or capped["texture_bytes"] != 833_126_400
+                or capped["source_increment_bytes"] != 0):
+            raise AssertionError(f"real-well GPU plan drifted: {capped}")
+        original = _volume_memory_plan(
+            **common, max_dim=0, source_resident_bytes=0,
+        )
+        if (original["texture_bytes"] != 1_704_092_200
+                or original["source_increment_bytes"] != 4_260_230_500):
+            raise AssertionError(f"source-resolution plan drifted: {original}")
+
+        # Exercise the HTTP route with non-builtin integer dimensions, as the
+        # packaged Bio-Formats reader does. The first v1.5.5 App smoke reached
+        # this exact C5/Z50 shape and exposed a strict ``type(x) is int`` check
+        # that helper-only tests with Python literals had missed.
+        class _PlanReader:
+            def __init__(self):
+                self.metadata = ImageMetadata(
+                    source_revision="source-rev", num_t=np.int64(1),
+                    num_channels=np.int64(5), num_z=np.int64(50),
+                    height=np.int64(2923), width=np.int64(2900),
+                )
+                self._pixels_lock = threading.RLock()
+
+            @property
+            def loaded_bytes(self):
+                return 0
+
+        saved_images, saved_active, saved_lru = images, active_id, _lru
+        try:
+            images, active_id, _lru = {"jpype-shape": _PlanReader()}, "jpype-shape", ["jpype-shape"]
+            route_plan = get_volume_plan(
+                t=0, id="jpype-shape", max_dim=2048, max_ch=4,
+            )
+            if (isinstance(route_plan, JSONResponse)
+                    or route_plan.get("original_shape") != [5, 50, 2923, 2900]
+                    or [route_plan.get("num_channels"), route_plan.get("num_z"),
+                        route_plan.get("height"), route_plan.get("width")]
+                    != [4, 50, 2048, 2032]):
+                detail = (json.loads(route_plan.body)
+                          if isinstance(route_plan, JSONResponse) else route_plan)
+                raise AssertionError(f"Bio-Formats route plan drifted: {detail}")
+        finally:
+            images, active_id, _lru = saved_images, saved_active, saved_lru
+
+        deep = _volume_memory_plan(
+            image_id="deep", source_revision="rev", t=1,
+            n_t=2, n_c=2, n_z=200, h=100, w=200,
+            max_dim=512, max_ch=2, source_resident_bytes=0,
+            memory_epoch=plan_epoch,
+        )
+        if [deep["num_z"], deep["height"], deep["width"]] != [128, 100, 200]:
+            raise AssertionError(f"Z cap drifted: {deep}")
+        changed = _volume_memory_plan(
+            **{**common, "source_revision": "changed"},
+            max_dim=2048, source_resident_bytes=4_260_230_500,
+        )
+        if changed["plan_key"] == capped["plan_key"]:
+            raise AssertionError("source revision is not bound to the plan token")
+        evicted = _volume_memory_plan(
+            **common, max_dim=2048, source_resident_bytes=0,
+        )
+        if evicted["plan_key"] == capped["plan_key"]:
+            raise AssertionError("source residency is not bound to the plan token")
+        later_epoch = _volume_memory_plan(
+            **{**common, "memory_epoch": plan_epoch + 1},
+            max_dim=2048, source_resident_bytes=4_260_230_500,
+        )
+        if later_epoch["plan_key"] == capped["plan_key"]:
+            raise AssertionError("memory-heavy generation is not bound to the plan token")
+        invalid = {**common, "max_ch": 0}
+        try:
+            _volume_memory_plan(**invalid, max_dim=512, source_resident_bytes=0)
+            raise AssertionError("zero requested channels were accepted")
+        except ValueError:
+            pass
+
+        # A plan made while pixels were resident must be refused before an
+        # evicted reader is asked to reload them. This is the boundary that
+        # makes the displayed estimate an admission check rather than advice.
+        class _EvictedReader:
+            def __init__(self):
+                self.metadata = ImageMetadata(
+                    source_revision="source-rev", num_t=1, num_channels=5,
+                    num_z=50, height=2929, width=2909,
+                )
+                self._pixels_lock = threading.RLock()
+                self.calls = 0
+
+            @property
+            def loaded_bytes(self):
+                return 0
+
+            def get_volume(self, _t):
+                self.calls += 1
+                raise AssertionError("stale plan reached the pixel loader")
+
+        saved_images, saved_active, saved_lru = images, active_id, _lru
+        fake = _EvictedReader()
+        try:
+            images, active_id, _lru = {"well": fake}, "well", ["well"]
+            stale = get_volume_bin(
+                t=0, id="well", max_dim=2048, max_ch=4,
+                plan_key=capped["plan_key"],
+            )
+            stale_body = json.loads(stale.body)
+            if (getattr(stale, "status_code", None) != 409 or fake.calls != 0
+                    or stale_body.get("reason") != "source_or_plan_changed"):
+                raise AssertionError("stale resident plan was not rejected before pixels")
+        finally:
+            images, active_id, _lru = saved_images, saved_active, saved_lru
+
+        # Even if the same source is still resident with the same dimensions, a
+        # heavy operation that ran after approval starts a new allocation phase.
+        # Refuse that old approval before get_volume can retain a source snapshot.
+        class _ResidentReader(_EvictedReader):
+            @property
+            def loaded_bytes(self):
+                return 4_260_230_500
+
+        resident = _ResidentReader()
+        saved_images, saved_active, saved_lru = images, active_id, _lru
+        with _MEMORY_EPOCH_LOCK:
+            saved_epoch = _memory_epoch
+            _memory_epoch = plan_epoch + 1
+        try:
+            images, active_id, _lru = {"well": resident}, "well", ["well"]
+            stale_epoch = get_volume_bin(
+                t=0, id="well", max_dim=2048, max_ch=4,
+                plan_key=capped["plan_key"],
+            )
+            stale_epoch_body = json.loads(stale_epoch.body)
+            if (getattr(stale_epoch, "status_code", None) != 409
+                    or resident.calls != 0
+                    or stale_epoch_body.get("reason") != "memory_epoch_changed"):
+                raise AssertionError("stale memory epoch reached the pixel loader")
+        finally:
+            images, active_id, _lru = saved_images, saved_active, saved_lru
+            with _MEMORY_EPOCH_LOCK:
+                _memory_epoch = saved_epoch
+    except Exception as e:
+        print(f"selftest FAILED: volume memory plan -> {type(e).__name__}: {e}", flush=True)
+        return 26
+    print("selftest: volume memory plan OK (real shape, peak bytes, revision/epoch token)",
+          flush=True)
+    return 0
 
 
 @app.get("/api/volume-bin")
@@ -951,6 +2016,7 @@ def get_volume_bin(
     id: str | None = Query(None),
     max_dim: int = Query(256),
     max_ch: int = Query(4),
+    plan_key: str = Query(...),
 ):
     """Volume for 3D rendering as one binary blob (little-endian).
 
@@ -978,25 +2044,67 @@ def get_volume_bin(
 
     The wire layout is unchanged, so the renderer needs no change.
     """
+    release_lock = True
+    _VOLUME_BUILD_LOCK.acquire()
     try:
-        r = get_reader(id)
-        vol = r.get_volume(t)  # (C, Z, Y, X) uint16, a view — never copied here
+        image_id = id or active_id
+        if not image_id:
+            raise RuntimeError("No image loaded")
+        r = get_reader(image_id)
+        # Keep plan validation and the pixel snapshot under the reader's one
+        # residency lock. Otherwise another request could evict the source in
+        # the few instructions between them, turning a zero-increment approval
+        # into an unapproved multi-gigabyte reload.
+        with r._pixels_lock:
+            meta = r.metadata
+            if not 0 <= t < max(1, meta.num_t):
+                raise ValueError(
+                    f"T{t + 1} is outside this image (T1-T{max(1, meta.num_t)})"
+                )
+            # Validate the exact plan before ensure_loaded/get_volume can
+            # allocate a previously evicted source. ImageReader then checks the
+            # source revision around any necessary disk read.
+            current_epoch = _memory_epoch_snapshot()
+            try:
+                token_epoch = int(plan_key.split(":", 1)[0])
+            except (AttributeError, TypeError, ValueError):
+                return JSONResponse(status_code=409, content={
+                    "error": "3D表示のメモリ計画を確認できません。もう一度確認してください。",
+                    "reason": "source_or_plan_changed",
+                })
+            if token_epoch != current_epoch:
+                return JSONResponse(status_code=409, content={
+                    "error": "別の画像処理が完了したため、3D表示のメモリをもう一度確認します。",
+                    "reason": "memory_epoch_changed",
+                })
+            plan = _volume_memory_plan(
+                image_id=image_id, source_revision=meta.source_revision, t=t,
+                n_t=meta.num_t, n_c=meta.num_channels, n_z=meta.num_z,
+                h=meta.height, w=meta.width,
+                max_dim=max_dim, max_ch=max_ch,
+                source_resident_bytes=r.loaded_bytes,
+                memory_epoch=current_epoch,
+            )
+            if plan_key != plan["plan_key"]:
+                return JSONResponse(status_code=409, content={
+                    "error": "3D表示の元画像またはメモリ計画が変わりました。もう一度確認してください。",
+                    "reason": "source_or_plan_changed",
+                })
+            # Only a validated request advances the phase. Invalid requests did
+            # not allocate anything and must not invalidate a fresh plan merely
+            # by arriving late.
+            _advance_memory_epoch()
+            # (C, Z, Y, X) uint16; a numpy snapshot, never copied here.
+            vol = r.get_volume(t)
         n_c, n_z, h, w = vol.shape
-
-        full_res = max_dim <= 0
-        if full_res:
-            scale_xy = 1.0
-            scale_z = 1.0
-        else:
-            xy_max = max(h, w)
-            max_dim = max(32, min(max_dim, 2048))
-            scale_xy = max_dim / xy_max if xy_max > max_dim else 1.0
-            scale_z = 128 / n_z if n_z > 128 else 1.0
-
-        out_h = int(round(h * scale_xy))
-        out_w = int(round(w * scale_xy))
-        out_z = int(round(n_z * scale_z))
-        send_c = max(1, min(n_c, max_ch))
+        if [n_c, n_z, h, w] != plan["original_shape"]:
+            raise RuntimeError(
+                "3D表示の元画像形状がメモリ計算後に変わりました。再度開いてください。"
+            )
+        out_h = plan["height"]
+        out_w = plan["width"]
+        out_z = plan["num_z"]
+        send_c = plan["num_channels"]
 
         # One buffer for the whole reply, filled in place. Collecting per-channel
         # bytes and joining them holds the entire payload twice at the moment of
@@ -1084,11 +2192,20 @@ def get_volume_bin(
 
         # memoryview, not bytes(): Response.render passes it straight through,
         # where bytes() would copy the finished payload one more time.
-        return Response(content=mv, media_type="application/octet-stream")
+        response = _VolumeResponse(
+            content=mv,
+            media_type="application/octet-stream",
+            build_lock=_VOLUME_BUILD_LOCK,
+        )
+        release_lock = False
+        return response
     except Exception as e:
         import traceback
         traceback.print_exc()
         return JSONResponse(status_code=400, content={"error": str(e)})
+    finally:
+        if release_lock:
+            _VOLUME_BUILD_LOCK.release()
 
 
 def _no_dialog_here() -> JSONResponse:
@@ -1212,6 +2329,11 @@ class ProjectionRequest(BaseModel):
     #: Identity of each file the user actually approved replacing. A bare
     #: overwrite flag is not enough when rendering can take minutes.
     expected_revisions: dict[str, str] = {}
+
+
+@app.post("/api/projection/jobs")
+def start_projection_job(req: ProjectionRequest):
+    return {"job_id": _start_export_job("projection", lambda: apply_projection(req))}
 
 
 def _image_stem(name: str) -> str:
@@ -1387,6 +2509,38 @@ def _require_stable_target_parent(path: str | Path) -> None:
         )
 
 
+def _existing_output_dir(raw: str) -> tuple[str, str]:
+    """Resolve an already-existing destination and pin its filesystem identity.
+
+    Never create the selected base path. If an external drive disappears,
+    recursively recreating its mount path would silently save to the system disk.
+    """
+    if not raw.strip():
+        raise ValueError("保存先を指定してください。")
+    out_dir = os.path.abspath(os.path.expanduser(raw))
+    if not os.path.isdir(out_dir):
+        raise ValueError(
+            f"保存先が見つかりません: {out_dir}。"
+            "外付けドライブを確認し、保存先を選び直してください。"
+        )
+    identity = _target_parent_identity(os.path.join(out_dir, ".oir-dir-probe"))
+    if identity == "invalid":
+        raise ValueError(
+            f"保存先の同一性を確認できません: {out_dir}。"
+            "外付けドライブを確認し、保存先を選び直してください。"
+        )
+    return out_dir, identity
+
+
+def _assert_output_dir_identity(out_dir: str, expected: str) -> None:
+    current = _target_parent_identity(os.path.join(out_dir, ".oir-dir-probe"))
+    if current != expected:
+        raise ValueError(
+            f"保存先のドライブまたはフォルダが途中で変わりました: {out_dir}。"
+            "別の場所への誤保存を防ぐため、保存先を選び直してください。"
+        )
+
+
 _export_locks_guard = threading.Lock()
 _export_locks: dict[str, threading.Lock] = {}
 
@@ -1528,15 +2682,16 @@ def _same_existing_file(a: str | Path, b: str | Path) -> bool:
         return False
 
 
-def _projection_source_conflicts(targets: list[str]) -> list[str]:
-    """Projection targets that alias any source in an open tab."""
+def _open_source_conflicts(targets: list[str | Path]) -> list[str]:
+    """Export targets that alias any source in an open tab."""
     with _state_lock:
         sources = [
             r.metadata.source_path for r in images.values()
             if r.metadata.source_path
         ]
     out: list[str] = []
-    for target in targets:
+    for raw in targets:
+        target = os.path.abspath(str(raw))
         if any(
             _path_key(target) == _path_key(source)
             or _same_existing_file(target, source)
@@ -1544,6 +2699,17 @@ def _projection_source_conflicts(targets: list[str]) -> list[str]:
         ):
             out.append(target)
     return out
+
+
+def _assert_targets_not_open_sources(targets: list[str | Path]) -> None:
+    """Refuse replacing source bytes with a derived export."""
+    conflicts = _open_source_conflicts(targets)
+    if conflicts:
+        names = ", ".join(os.path.basename(path) for path in conflicts[:3])
+        raise ValueError(
+            f"保存先が開いている元画像と同じファイルです: {names}。"
+            "元画像の破損を防ぐため、別の名前または保存先を指定してください。"
+        )
 
 
 def _unload_other_projection_sources(keep_id: str) -> None:
@@ -1989,7 +3155,13 @@ def plate_volume_bin(req: PlateVolumeRequest):
     and calls auto_contrast — which plate export must never do. This route opens
     the file directly, closes it in `finally`, and bakes in the caller's window.
     """
+    release_lock = True
+    _MEMORY_HEAVY_LOCK.acquire()
     try:
+        # Invalidate any interactive 3D approval made before this well started.
+        # Keep the same reservation until its possibly source-resolution payload
+        # has left uvicorn, just as /api/volume-bin does.
+        _advance_memory_epoch()
         spec = plate.VolumeSpec(
             path=req.path,
             source_identity=req.source_identity,
@@ -2000,16 +3172,82 @@ def plate_volume_bin(req: PlateVolumeRequest):
             max_xy=int(req.max_xy),
         )
         info, payload = plate.read_low_volume(spec)
-        return Response(
+        response = _VolumeResponse(
             content=payload,
             media_type="application/octet-stream",
             headers={"X-Plate-Volume": json.dumps(info)},
+            build_lock=_MEMORY_HEAVY_LOCK,
         )
+        release_lock = False
+        return response
     except ValueError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
     except Exception as e:
         traceback.print_exc()
         return JSONResponse(status_code=400, content={"error": _describe(e)})
+    finally:
+        if release_lock:
+            _MEMORY_HEAVY_LOCK.release()
+
+
+def _selftest_plate_volume_reservation() -> int:
+    """Prove a plate payload owns the shared gate until ASGI sends it."""
+    global _memory_epoch
+    import asyncio
+
+    saved_reader = plate.read_low_volume
+    with _MEMORY_EPOCH_LOCK:
+        saved_epoch = _memory_epoch
+    gate_probe_owned = False
+    try:
+        plate.read_low_volume = lambda _spec: ({"test": True}, b"plate-bytes")
+        response = plate_volume_bin(PlateVolumeRequest(
+            path="unused.oir",
+            source_identity="identity",
+            source_revision="revision",
+            channels=[0],
+            levels=[[0.0, 1.0]],
+        ))
+        if not isinstance(response, _VolumeResponse):
+            raise AssertionError(f"plate success did not return reserved response: {response}")
+        if _MEMORY_HEAVY_LOCK.acquire(blocking=False):
+            gate_probe_owned = True
+            raise AssertionError("plate response released reservation before send")
+
+        sent: list[dict] = []
+
+        async def receive() -> dict:
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message: dict) -> None:
+            sent.append(message)
+
+        asyncio.run(response(
+            {"type": "http", "method": "POST", "path": "/api/plate/volume-bin",
+             "headers": []},
+            receive,
+            send,
+        ))
+        if (not sent or sent[-1].get("body") != b"plate-bytes"
+                or _memory_epoch_snapshot() != saved_epoch + 1):
+            raise AssertionError("plate response send or epoch advance drifted")
+        if not _MEMORY_HEAVY_LOCK.acquire(blocking=False):
+            raise AssertionError("plate response did not release reservation after send")
+        gate_probe_owned = True
+    except Exception as e:
+        print(f"selftest FAILED: plate volume reservation -> {type(e).__name__}: {e}",
+              flush=True)
+        return 32
+    finally:
+        plate.read_low_volume = saved_reader
+        if gate_probe_owned:
+            _MEMORY_HEAVY_LOCK.release()
+        with _MEMORY_EPOCH_LOCK:
+            _memory_epoch = saved_epoch
+
+    print("selftest: plate volume reservation OK (shared epoch, held through send)",
+          flush=True)
+    return 0
 
 
 class PlateFrame(BaseModel):
@@ -2257,6 +3495,11 @@ def apply_projection(req: ProjectionRequest):
         # refusal therefore leaves both the source data and output folder intact.
         for img_id in req.image_ids:
             r = get_reader(img_id)
+            # A restored session initially has only cached dimensions. Upgrade
+            # metadata without pixels so channel counts — and therefore the
+            # progress denominator — are authoritative before work begins.
+            if not getattr(r, "_metadata_authoritative", True):
+                _ensure_reader_ready_reserved(r, img_id, metadata_only=True)
             meta = r.metadata
             out_path = _projection_target(req, meta, batch)
             pending.append((img_id, r, meta, out_path))
@@ -2268,7 +3511,7 @@ def apply_projection(req: ProjectionRequest):
             )
 
         targets = [item[3] for item in pending]
-        if _projection_source_conflicts(targets):
+        if _open_source_conflicts(targets):
             raise ValueError(
                 "投影の保存先を開いている元画像と同じファイルにはできません。"
                 "別の名前を指定するか、その画像タブを閉じてください。"
@@ -2291,23 +3534,45 @@ def apply_projection(req: ProjectionRequest):
         for target in targets:
             commit_expected.setdefault(os.path.abspath(target), _target_state(target))
 
-        for img_id, r, _cached_meta, out_path in pending:
+        total_units = sum(max(1, item[2].num_channels) for item in pending) + len(pending) + 1
+        completed_units = 0
+        _export_progress(
+            "projecting", completed_units, total_units,
+            f"Z投影を保存中（0/{len(pending)}画像）…",
+        )
+
+        for image_index, (img_id, r, _cached_meta, out_path) in enumerate(pending):
             # A restored session deliberately carries dimensions only. Loading
             # can replace them with authoritative channel names, pixel sizes,
             # channel count and ranges; use those for both pixels and OME-XML.
             # Real wells are ~4.25 GB decoded. Evict even the active source before
             # loading the next batch item; tabs remain and reload transparently.
-            _unload_other_projection_sources(img_id)
-            meta, z_from, z_to, t = _projection_runtime_plan(r, req, out_path, batch)
-            runtime_sources.append(meta)
+            # Reserve only pixel loading/projection. The completed 2D stack no
+            # longer references the 5D source, so release the shared gate before
+            # staged-file I/O and, critically, before publication target locks.
+            # Open takes target locks before this gate; reversing that order here
+            # would deadlock an open against projection publication.
+            with _memory_heavy_reservation():
+                _unload_other_projection_sources(img_id)
+                meta, z_from, z_to, t = _projection_runtime_plan(
+                    r, req, out_path, batch,
+                )
+                runtime_sources.append(meta)
 
-            # Project all channels: result shape (C, Y, X)
-            projected = []
-            for c in range(meta.num_channels):
-                proj = r.get_projection(c, t, z_from, z_to, req.method)
-                projected.append(proj)
-            proj_stack = np.stack(projected, axis=0)  # (C, Y, X)
-            h, w = proj_stack.shape[1], proj_stack.shape[2]
+                # Project all channels: result shape (C, Y, X)
+                projected = []
+                for c in range(meta.num_channels):
+                    proj = r.get_projection(c, t, z_from, z_to, req.method)
+                    projected.append(proj)
+                    completed_units += 1
+                    _export_progress(
+                        "projecting", completed_units, total_units,
+                        f"{meta.filename}: チャンネルを投影中（{c + 1}/{meta.num_channels}）…",
+                    )
+                proj_stack = np.stack(projected, axis=0)  # (C, Y, X)
+                h, w = proj_stack.shape[1], proj_stack.shape[2]
+                # The copied 2D stack is independent of the multi-GB source.
+                r.unload()
 
             # Build OME-XML
             ome_xml = _build_ome_xml(
@@ -2353,9 +3618,11 @@ def apply_projection(req: ProjectionRequest):
             staged_reader = ImageReader()
             staged_reader.load_file(staged)
             staged_readers.append(staged_reader)
-            # The staged projection is now independent of the 5D source. Free it
-            # before the next well rather than peaking at two decoded wells.
-            r.unload()
+            completed_units += 1
+            _export_progress(
+                "verifying", completed_units, total_units,
+                f"{meta.filename}: 保存結果を確認済み（{image_index + 1}/{len(pending)}画像）",
+            )
 
         # Recheck every source after all staged files are complete. A source that
         # changed during another batch member must not acquire valid-looking
@@ -2365,13 +3632,17 @@ def apply_projection(req: ProjectionRequest):
 
         # Validate every target together under stable locks, then publish each
         # completed file with an atomic same-filesystem replace.
+        _export_progress(
+            "publishing", completed_units, total_units,
+            "検証済みOME-TIFFを公開中…",
+        )
         locks = _locks_for_targets(targets)
         for lock in locks:
             lock.acquire()
         process_locks: list[object] = []
         try:
             process_locks = _acquire_process_target_locks(targets)
-            if _projection_source_conflicts(targets):
+            if _open_source_conflicts(targets):
                 raise ValueError(
                     "投影中に保存先と同じ元画像が開かれました。"
                     "その画像タブを閉じて、もう一度実行してください。"
@@ -2393,7 +3664,7 @@ def apply_projection(req: ProjectionRequest):
                 )
             try:
                 def validate_projection_sources() -> None:
-                    if _projection_source_conflicts(targets):
+                    if _open_source_conflicts(targets):
                         raise ValueError(
                             "投影中に保存先と同じ元画像が開かれました。"
                             "その画像タブを閉じて、もう一度実行してください。"
@@ -2423,17 +3694,20 @@ def apply_projection(req: ProjectionRequest):
             for lock in reversed(locks):
                 lock.release()
 
-        for ((source_image_id, _reader, _meta, _planned), out_path,
-             new_reader) in zip(pending, targets, staged_readers):
-            new_id = add_image(new_reader)
+        # Registration may evict an older reader. Do that under the shared gate
+        # too, but after all publication locks are gone.
+        with _memory_heavy_reservation(advances_epoch=False):
+            for ((source_image_id, _reader, _meta, _planned), out_path,
+                 new_reader) in zip(pending, targets, staged_readers):
+                new_id = add_image(new_reader)
 
-            results.append({
-                "id": new_id,
-                "source_image_id": source_image_id,
-                "path": out_path,
-                "filename": os.path.basename(out_path),
-                "metadata": new_reader.metadata.to_dict(),
-            })
+                results.append({
+                    "id": new_id,
+                    "source_image_id": source_image_id,
+                    "path": out_path,
+                    "filename": os.path.basename(out_path),
+                    "metadata": new_reader.metadata.to_dict(),
+                })
 
         return {"results": results}
     except Exception as e:
@@ -2471,6 +3745,18 @@ def _selftest_export_targets() -> int:
             self.metadata = self.actual
             self.loaded = True
 
+    class _CountingReader(ImageReader):
+        def __init__(self, meta: ImageMetadata):
+            super().__init__()
+            self.metadata = meta
+            self.data = np.array([[[[[0, 1], [2, 3]]]]], dtype=np.uint16)
+            self._metadata_authoritative = True
+            self.slice_calls = 0
+
+        def get_slice(self, c: int, z: int, t: int) -> np.ndarray:
+            self.slice_calls += 1
+            return super().get_slice(c, z, t)
+
     saved_images, saved_active, saved_lru, saved_app_dir = images, active_id, _lru, APP_DIR
     try:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2492,6 +3778,331 @@ def _selftest_export_targets() -> int:
             plate_target = Path(tmp, "same.pdf")
             sentinel = b"do not replace"
             plate_target.write_bytes(sentinel)
+
+            # Save endpoints must not recreate a detached external-drive path.
+            absent_2d = os.path.join(tmp, "missing-drive", "2d")
+            missing_2d = save_images(SaveRequest(
+                output_dir=absent_2d, image_ids=["not-open"],
+            ))
+            if (not isinstance(missing_2d, JSONResponse)
+                    or missing_2d.status_code != 400 or os.path.exists(absent_2d)):
+                raise AssertionError("2D save recreated a missing output directory")
+            absent_3d = os.path.join(tmp, "missing-drive", "3d")
+            missing_3d = save_render(SaveRenderRequest(
+                output_dir=absent_3d, basename="missing", format="png",
+                images=[RenderImage(name="merge", width=1, height=1, data_b64="bad")],
+            ))
+            if (not isinstance(missing_3d, JSONResponse)
+                    or missing_3d.status_code != 400 or os.path.exists(absent_3d)):
+                raise AssertionError("3D save recreated a missing output directory")
+
+            duplicate_render = save_render(SaveRenderRequest(
+                output_dir=tmp, basename="duplicate", format="png",
+                images=[
+                    RenderImage(name="merge", width=1, height=1, data_b64="bad"),
+                    RenderImage(name="merge", width=1, height=1, data_b64="bad"),
+                ],
+            ))
+            if (not isinstance(duplicate_render, JSONResponse)
+                    or duplicate_render.status_code != 400
+                    or Path(tmp, "duplicate_3D_merge.png").exists()):
+                raise AssertionError("duplicate 3D targets reached pixel decoding or publication")
+
+            def source_meta(path: Path, *, channel: str = "signal") -> ImageMetadata:
+                state = snapshot_source(path)
+                return ImageMetadata(
+                    filename=path.name, source_path=str(path),
+                    source_identity=state.identity, source_revision=state.revision,
+                    num_channels=1, num_z=1, num_t=1, width=2, height=2,
+                    channel_names=[channel],
+                )
+
+            def sha256_file(path: Path) -> str:
+                return hashlib.sha256(path.read_bytes()).hexdigest()
+
+            @contextmanager
+            def count_export_io(counter: dict[str, int]):
+                original_save_image = globals()["_save_image_file"]
+                original_decode = base64.b64decode
+
+                def tracked_save_image(*args, **kwargs):
+                    counter["write"] += 1
+                    return original_save_image(*args, **kwargs)
+
+                def tracked_decode(*args, **kwargs):
+                    counter["decode"] += 1
+                    return original_decode(*args, **kwargs)
+
+                globals()["_save_image_file"] = tracked_save_image
+                base64.b64decode = tracked_decode
+                try:
+                    yield
+                finally:
+                    globals()["_save_image_file"] = original_save_image
+                    base64.b64decode = original_decode
+
+            # A non-empty image_ids list is the user's exact selection. If one
+            # id was closed before the worker bound its reader, do not substitute
+            # the active tab or save the surviving prefix of a batch.
+            stale_active_source = Path(tmp, "stale-active.oir")
+            stale_active_source.write_bytes(b"active image must not be substituted")
+            stale_active_reader = _CountingReader(source_meta(stale_active_source))
+            images, active_id, _lru = {
+                "active": stale_active_reader,
+            }, "active", []
+            for requested_ids in (["closed"], ["active", "closed"]):
+                stale_io = {"decode": 0, "write": 0}
+                with count_export_io(stale_io):
+                    stale_refused = save_images(SaveRequest(
+                        output_dir=tmp, image_ids=requested_ids, basename="wrong-image",
+                        channels=[0], channel_colors=[[255, 255, 255]],
+                        channel_mins=[0], channel_maxs=[3], save_separate=False,
+                        save_merge=True, z_mode="current", format="png",
+                    ))
+                stale_error = (
+                    json.loads(stale_refused.body).get("error", "")
+                    if isinstance(stale_refused, JSONResponse) else ""
+                )
+                if (not isinstance(stale_refused, JSONResponse)
+                        or stale_refused.status_code != 400
+                        or "開かれていません" not in stale_error
+                        or stale_active_reader.slice_calls or any(stale_io.values())
+                        or Path(tmp, "wrong-image_merge.png").exists()
+                        or Path(tmp, "stale-active").exists()
+                        or list(Path(tmp).glob(".oirimg-*"))):
+                    raise AssertionError(
+                        "stale explicit image ids fell back or saved a partial batch"
+                    )
+
+            # A derived image must never replace the source bytes behind any
+            # open tab, even after an explicit overwrite confirmation. Check the
+            # selected source itself before a slice is decoded.
+            self_source = Path(tmp, "self_merge.tif")
+            self_source.write_bytes(b"selected source must survive")
+            self_reader = _CountingReader(source_meta(self_source))
+            images, active_id, _lru = {"self": self_reader}, "self", []
+            self_hash = sha256_file(self_source)
+            self_mtime = self_source.stat().st_mtime_ns
+            self_io = {"decode": 0, "write": 0}
+            with count_export_io(self_io):
+                self_refused = save_images(SaveRequest(
+                    output_dir=tmp, image_ids=["self"], basename="self",
+                    channels=[0], channel_colors=[[255, 255, 255]],
+                    channel_mins=[0], channel_maxs=[3], save_separate=False,
+                    save_merge=True, z_mode="current", format="tiff", overwrite=True,
+                    expected_revisions={
+                        os.path.abspath(self_source): _target_state(self_source),
+                    },
+                ))
+            self_error = (
+                json.loads(self_refused.body).get("error", "")
+                if isinstance(self_refused, JSONResponse) else ""
+            )
+            if (not isinstance(self_refused, JSONResponse)
+                    or self_refused.status_code != 400 or "元画像" not in self_error
+                    or self_reader.slice_calls or any(self_io.values())
+                    or sha256_file(self_source) != self_hash
+                    or self_source.stat().st_mtime_ns != self_mtime
+                    or list(Path(tmp).glob(".oirimg-*"))):
+                raise AssertionError("2D save replaced or decoded its selected source")
+
+            # Also catch a different open tab reached through a hardlink. Path
+            # spelling alone is insufficient: both names address one inode.
+            selected_source = Path(tmp, "selected-input.oir")
+            selected_source.write_bytes(b"selected input")
+            other_source = Path(tmp, "unselected-source.tif")
+            other_source.write_bytes(b"unselected source must survive")
+            hardlink_target = Path(tmp, "alias_merge.tif")
+            os.link(other_source, hardlink_target)
+            selected_reader = _CountingReader(source_meta(selected_source))
+            other_reader = _CountingReader(source_meta(other_source))
+            images, active_id, _lru = {
+                "selected": selected_reader, "other": other_reader,
+            }, "selected", []
+            other_hash = sha256_file(other_source)
+            other_mtime = other_source.stat().st_mtime_ns
+            hardlink_io = {"decode": 0, "write": 0}
+            with count_export_io(hardlink_io):
+                hardlink_refused = save_images(SaveRequest(
+                    output_dir=tmp, image_ids=["selected"], basename="alias",
+                    channels=[0], channel_colors=[[255, 255, 255]],
+                    channel_mins=[0], channel_maxs=[3], save_separate=False,
+                    save_merge=True, z_mode="current", format="tiff", overwrite=True,
+                    expected_revisions={
+                        os.path.abspath(hardlink_target): _target_state(hardlink_target),
+                    },
+                ))
+            hardlink_error = (
+                json.loads(hardlink_refused.body).get("error", "")
+                if isinstance(hardlink_refused, JSONResponse) else ""
+            )
+            if (not isinstance(hardlink_refused, JSONResponse)
+                    or hardlink_refused.status_code != 400
+                    or "元画像" not in hardlink_error or selected_reader.slice_calls
+                    or any(hardlink_io.values())
+                    or sha256_file(other_source) != other_hash
+                    or sha256_file(hardlink_target) != other_hash
+                    or other_source.stat().st_mtime_ns != other_mtime
+                    or hardlink_target.stat().st_mtime_ns != other_mtime
+                    or list(Path(tmp).glob(".oirimg-*"))):
+                raise AssertionError("2D save replaced an unselected hardlinked source")
+
+            # Save-render receives pixels rather than an image id, but its target
+            # still must not replace either the active source or another open
+            # source. Invalid base64 proves the refusal happened before decoding.
+            render_source = Path(tmp, "render_3D_merge.png")
+            render_source.write_bytes(b"3D source must survive")
+            images, active_id, _lru = {
+                "render": _CountingReader(source_meta(render_source)),
+            }, "render", []
+            render_hash = sha256_file(render_source)
+            render_mtime = render_source.stat().st_mtime_ns
+            render_io = {"decode": 0, "write": 0}
+            with count_export_io(render_io):
+                render_refused = save_render(SaveRenderRequest(
+                    output_dir=tmp, basename="render", format="png", overwrite=True,
+                    expected_revisions={
+                        os.path.abspath(render_source): _target_state(render_source),
+                    },
+                    images=[RenderImage(
+                        name="merge", width=1, height=1, data_b64="not-base64",
+                    )],
+                ))
+            render_error = (
+                json.loads(render_refused.body).get("error", "")
+                if isinstance(render_refused, JSONResponse) else ""
+            )
+            if (not isinstance(render_refused, JSONResponse)
+                    or render_refused.status_code != 400 or "元画像" not in render_error
+                    or any(render_io.values())
+                    or sha256_file(render_source) != render_hash
+                    or render_source.stat().st_mtime_ns != render_mtime
+                    or list(Path(tmp).glob(".oirimg-*"))):
+                raise AssertionError("3D save-render decoded or replaced its source")
+
+            render_other = Path(tmp, "render-unselected-source.png")
+            render_other.write_bytes(b"3D unselected source must survive")
+            render_alias = Path(tmp, "alias3d_3D_merge.png")
+            os.link(render_other, render_alias)
+            images, active_id, _lru = {
+                "render-other": _CountingReader(source_meta(render_other)),
+            }, "render-other", []
+            render_other_hash = sha256_file(render_other)
+            render_other_mtime = render_other.stat().st_mtime_ns
+            render_alias_io = {"decode": 0, "write": 0}
+            with count_export_io(render_alias_io):
+                render_alias_refused = save_render(SaveRenderRequest(
+                    output_dir=tmp, basename="alias3d", format="png", overwrite=True,
+                    expected_revisions={
+                        os.path.abspath(render_alias): _target_state(render_alias),
+                    },
+                    images=[RenderImage(
+                        name="merge", width=1, height=1, data_b64="not-base64",
+                    )],
+                ))
+            render_alias_error = (
+                json.loads(render_alias_refused.body).get("error", "")
+                if isinstance(render_alias_refused, JSONResponse) else ""
+            )
+            if (not isinstance(render_alias_refused, JSONResponse)
+                    or render_alias_refused.status_code != 400
+                    or "元画像" not in render_alias_error
+                    or any(render_alias_io.values())
+                    or sha256_file(render_other) != render_other_hash
+                    or sha256_file(render_alias) != render_other_hash
+                    or render_other.stat().st_mtime_ns != render_other_mtime
+                    or render_alias.stat().st_mtime_ns != render_other_mtime
+                    or list(Path(tmp).glob(".oirimg-*"))):
+                raise AssertionError("3D save-render replaced an unselected hardlinked source")
+
+            # A late decode failure leaves every confirmed existing target and
+            # all public names untouched; the first valid frame is only staged.
+            rgba = base64.b64encode(bytes([1, 2, 3, 255])).decode("ascii")
+            staged_targets = [
+                Path(tmp, "stage-failure_3D_merge.png"),
+                Path(tmp, "stage-failure_3D_signal.png"),
+            ]
+            for path in staged_targets:
+                path.write_bytes(sentinel)
+            staged_revisions = {
+                os.path.abspath(path): _target_state(path) for path in staged_targets
+            }
+            stage_failure = save_render(SaveRenderRequest(
+                output_dir=tmp, basename="stage-failure", format="png",
+                overwrite=True, expected_revisions=staged_revisions,
+                images=[
+                    RenderImage(name="merge", width=1, height=1, data_b64=rgba),
+                    RenderImage(name="signal", width=1, height=1, data_b64="bad"),
+                ],
+            ))
+            if (not isinstance(stage_failure, JSONResponse)
+                    or stage_failure.status_code != 400
+                    or any(path.read_bytes() != sentinel for path in staged_targets)
+                    or list(Path(tmp).glob(".oirimg-*"))):
+                raise AssertionError("3D staging failure changed a public target")
+
+            # If publication fails after the first rename, the common publisher
+            # restores that target before returning an error.
+            rollback_targets = [
+                Path(tmp, "rollback_3D_merge.png"),
+                Path(tmp, "rollback_3D_signal.png"),
+            ]
+            originals = [b"old merge", b"old signal"]
+            for path, old in zip(rollback_targets, originals):
+                path.write_bytes(old)
+            rollback_revisions = {
+                os.path.abspath(path): _target_state(path) for path in rollback_targets
+            }
+            original_replace = os.replace
+
+            def fail_second_publication(src, dst):
+                if (os.path.basename(str(src)).startswith(".oirimg-")
+                        and _path_key(str(dst)) == _path_key(str(rollback_targets[1]))):
+                    raise OSError("injected second-target publish failure")
+                return original_replace(src, dst)
+
+            os.replace = fail_second_publication
+            try:
+                rollback = save_render(SaveRenderRequest(
+                    output_dir=tmp, basename="rollback", format="png",
+                    overwrite=True, expected_revisions=rollback_revisions,
+                    images=[
+                        RenderImage(name="merge", width=1, height=1, data_b64=rgba),
+                        RenderImage(name="signal", width=1, height=1, data_b64=rgba),
+                    ],
+                ))
+            finally:
+                os.replace = original_replace
+            if (not isinstance(rollback, JSONResponse)
+                    or rollback.status_code != 400
+                    or [path.read_bytes() for path in rollback_targets] != originals
+                    or list(Path(tmp).glob(".oirrollback-*"))
+                    or list(Path(tmp).glob(".oirimg-*"))):
+                raise AssertionError("multi-target publish failure did not roll back")
+
+            # An overwrite approval is for the exact target revision observed in
+            # the conflict. Replacing it before retry must fail before decoding.
+            revision_target = Path(tmp, "revision_3D_merge.png")
+            revision_target.write_bytes(b"first")
+            revision_conflict = save_render(SaveRenderRequest(
+                output_dir=tmp, basename="revision", format="png",
+                images=[RenderImage(name="merge", width=1, height=1, data_b64="bad")],
+            ))
+            revision_body = (
+                json.loads(revision_conflict.body)
+                if isinstance(revision_conflict, JSONResponse) else {}
+            )
+            revision_target.write_bytes(b"changed")
+            stale_overwrite = save_render(SaveRenderRequest(
+                output_dir=tmp, basename="revision", format="png", overwrite=True,
+                expected_revisions=revision_body.get("revisions", {}),
+                images=[RenderImage(name="merge", width=1, height=1, data_b64="bad")],
+            ))
+            if (not isinstance(stale_overwrite, JSONResponse)
+                    or stale_overwrite.status_code != 409
+                    or revision_target.read_bytes() != b"changed"):
+                raise AssertionError("changed 3D overwrite target was decoded or replaced")
+
             plate_req = PlatePdfTargetRequest(
                 plate_name="test", output_dir=tmp, filename="same",
             )
@@ -2666,11 +4277,122 @@ def _selftest_export_targets() -> int:
             Path(source).write_bytes(b"source")
             meta = ImageMetadata(
                 filename="source.oir", source_path=source, num_channels=1,
-                num_z=2, num_t=1, width=2, height=2,
+                num_z=2, num_t=1, width=2, height=2, channel_names=["merge"],
             )
             reader = _NoPixelReader(meta)
             target = os.path.join(tmp, "chosen.ome.tif")
             Path(target).write_bytes(sentinel)
+            images, active_id, _lru = {"one": reader}, "one", []
+
+            duplicate_2d = save_images(SaveRequest(
+                output_dir=tmp, image_ids=["one"], basename="duplicate-2d",
+                channels=[0], channel_colors=[[255, 255, 255]],
+                channel_mins=[0], channel_maxs=[1], save_separate=True,
+                save_merge=True, z_mode="current", format="png",
+            ))
+            if (not isinstance(duplicate_2d, JSONResponse)
+                    or duplicate_2d.status_code != 400
+                    or reader.calls
+                    or Path(tmp, "duplicate-2d_merge.png").exists()):
+                raise AssertionError("duplicate 2D targets reached pixels or publication")
+
+            # Simulate an external base disappearing after planning but before
+            # the first batch child directory is created. The original mount
+            # path must stay absent; os.mkdir cannot recreate its ancestors.
+            batch_base = Path(tmp, "batch-drive")
+            batch_base.mkdir()
+            detached_base = Path(tmp, "batch-drive-detached")
+            batch_readers = {
+                key: _NoPixelReader(ImageMetadata(
+                    filename=f"{key}.oir", source_path=os.path.join(tmp, f"{key}.oir"),
+                    num_channels=1, num_z=1, num_t=1, width=2, height=2,
+                    channel_names=["signal"],
+                ))
+                for key in ("batch-a", "batch-b")
+            }
+            images, active_id, _lru = batch_readers, "batch-a", []
+            original_assert_output = _assert_output_dir_identity
+            detached = False
+
+            def detach_before_child(out_dir: str, expected: str) -> None:
+                nonlocal detached
+                if not detached:
+                    os.rename(batch_base, detached_base)
+                    detached = True
+                original_assert_output(out_dir, expected)
+
+            globals()["_assert_output_dir_identity"] = detach_before_child
+            try:
+                detached_batch = save_images(SaveRequest(
+                    output_dir=str(batch_base), image_ids=list(batch_readers),
+                    channels=[0], channel_colors=[[255, 255, 255]],
+                    channel_mins=[0], channel_maxs=[1], save_separate=False,
+                    save_merge=True, z_mode="current", format="png",
+                ))
+            finally:
+                globals()["_assert_output_dir_identity"] = original_assert_output
+            if (not isinstance(detached_batch, JSONResponse)
+                    or detached_batch.status_code != 400 or batch_base.exists()
+                    or any(item.calls for item in batch_readers.values())):
+                raise AssertionError("batch save recreated or read after detached base")
+            os.rename(detached_base, batch_base)
+
+            source_state = snapshot_source(source)
+            numeric_meta = ImageMetadata(
+                filename="numeric.oir", source_path=source,
+                source_identity=source_state.identity,
+                source_revision=source_state.revision,
+                num_channels=1, num_z=1, num_t=1, width=2, height=2,
+                channel_names=["signal"],
+            )
+            numeric_reader = _CountingReader(numeric_meta)
+            images, active_id, _lru = {"numeric": numeric_reader}, "numeric", []
+            numeric_target = Path(tmp, "numeric_merge.png")
+            numeric_target.write_bytes(b"old numeric")
+            numeric_conflict = save_images(SaveRequest(
+                output_dir=tmp, image_ids=["numeric"], basename="numeric",
+                channels=[0], channel_colors=[[255, 255, 255]],
+                channel_mins=[0], channel_maxs=[3], save_separate=False,
+                save_merge=True, z_mode="current", format="png",
+            ))
+            numeric_body = (
+                json.loads(numeric_conflict.body)
+                if isinstance(numeric_conflict, JSONResponse) else {}
+            )
+            numeric_target.write_bytes(b"changed numeric")
+            numeric_reader.slice_calls = 0
+            stale_2d = save_images(SaveRequest(
+                output_dir=tmp, image_ids=["numeric"], basename="numeric",
+                channels=[0], channel_colors=[[255, 255, 255]],
+                channel_mins=[0], channel_maxs=[3], save_separate=False,
+                save_merge=True, z_mode="current", format="png", overwrite=True,
+                expected_revisions=numeric_body.get("revisions", {}),
+            ))
+            if (not isinstance(stale_2d, JSONResponse)
+                    or stale_2d.status_code != 409 or numeric_reader.slice_calls
+                    or numeric_target.read_bytes() != b"changed numeric"):
+                raise AssertionError("changed 2D overwrite target reached pixels or publication")
+
+            # Exercise the successful staged/reopened 2D path as a numeric test.
+            numeric_target.unlink()
+            numeric_reader.slice_calls = 0
+            numeric_saved = save_images(SaveRequest(
+                output_dir=tmp, image_ids=["numeric"], basename="numeric",
+                channels=[0], channel_colors=[[255, 255, 255]],
+                channel_mins=[0], channel_maxs=[3], save_separate=False,
+                save_merge=True, z_mode="current", format="png",
+            ))
+            from PIL import Image as PILImage
+            with PILImage.open(numeric_target) as saved_image:
+                numeric_pixels = np.asarray(saved_image.convert("RGB"))
+            if (not isinstance(numeric_saved, dict) or numeric_reader.slice_calls != 1
+                    or numeric_pixels.shape != (2, 2, 3)
+                    or not np.array_equal(
+                        numeric_pixels[..., 0],
+                        np.array([[0, 85], [170, 255]], dtype=np.uint8),
+                    )):
+                raise AssertionError("2D staged save did not preserve verified pixels")
+
             images, active_id, _lru = {"one": reader}, "one", []
 
             conflict = apply_projection(ProjectionRequest(
@@ -2845,7 +4567,7 @@ def _selftest_export_targets() -> int:
         images, active_id, _lru = saved_images, saved_active, saved_lru
         APP_DIR = saved_app_dir
 
-    print("selftest: export targets OK (projection pixels/plate frames skipped on conflict)",
+    print("selftest: export targets OK (open sources immutable; conflicts skip pixels)",
           flush=True)
     return 0
 
@@ -2887,7 +4609,14 @@ class SaveRequest(BaseModel):
     #: Replace files that are already there. Without it, a collision is reported
     #: with the names involved and nothing at all is written.
     overwrite: bool = False
+    #: Exact target states returned by the conflict response the user approved.
+    expected_revisions: dict[str, str] = {}
     bit_depth_output: str = "16"   # "8" or "16" (16 only for TIFF)
+
+
+@app.post("/api/save/jobs")
+def start_save_job(req: SaveRequest):
+    return {"job_id": _start_export_job("image-save", lambda: save_images(req))}
 
 
 def _apply_contrast_u8(data: np.ndarray, cmin: float, cmax: float) -> np.ndarray:
@@ -3084,6 +4813,27 @@ def _save_image_file(img_rgb: np.ndarray, fmt: str, filepath: str) -> str:
     return filepath
 
 
+def _assert_saved_image(path: str, expected: np.ndarray, fmt: str) -> None:
+    """Reopen a staged export before its public filename can change."""
+    if fmt == "tiff":
+        import tifffile
+        actual = np.asarray(tifffile.imread(path))
+    else:
+        from PIL import Image as PILImage
+        with PILImage.open(path) as image:
+            image.load()
+            actual = np.asarray(image.convert("RGB"))
+    if actual.shape != expected.shape:
+        raise ValueError(
+            f"保存画像の形状検証に失敗しました: {actual.shape} != {expected.shape}"
+        )
+    if fmt != "jpeg":
+        if actual.dtype != expected.dtype or not np.array_equal(actual, expected):
+            raise ValueError("保存画像の数値検証に失敗しました。元の保存先は変更していません。")
+    elif actual.dtype != np.uint8 or actual.size == 0:
+        raise ValueError("JPEG保存画像を再読込できませんでした。元の保存先は変更していません。")
+
+
 class RenderImage(BaseModel):
     name: str          # filename suffix, e.g. "merge" or a channel name
     width: int
@@ -3099,6 +4849,8 @@ class SaveRenderRequest(BaseModel):
     #: Replace files that are already there. Without it a collision is reported
     #: and nothing is written, so the user gets to decide.
     overwrite: bool = False
+    #: Exact target states returned by the conflict response the user approved.
+    expected_revisions: dict[str, str] = {}
 
 
 @app.post("/api/save-render")
@@ -3108,16 +4860,16 @@ def save_render(req: SaveRenderRequest):
     The client sends what it drew, so the file matches the on-screen result
     exactly; the alpha channel is dropped since these are composited on black.
     """
+    staged_paths: list[str] = []
     try:
         if req.format not in ("png", "tiff"):
             raise RuntimeError(f"Unsupported format: {req.format}")
         if not req.images:
             raise RuntimeError("No images to save")
+        if any(img.width <= 0 or img.height <= 0 for img in req.images):
+            raise RuntimeError("保存画像の幅または高さが不正です。")
 
-        out_dir = os.path.expanduser(req.output_dir)
-        if not out_dir:
-            raise RuntimeError("No output folder specified")
-        os.makedirs(out_dir, exist_ok=True)
+        out_dir, out_dir_identity = _existing_output_dir(req.output_dir)
 
         ext = ".tif" if req.format == "tiff" else ".png"
         stem = _safe_name_part(os.path.splitext(req.basename or "render")[0])
@@ -3125,69 +4877,149 @@ def save_render(req: SaveRenderRequest):
         # Every destination is known from the names alone, so the collision
         # check happens before any pixels are decoded or written — a refusal
         # leaves the folder exactly as it was.
-        usable = [i for i in req.images if i.width > 0 and i.height > 0]
         targets = [
             os.path.join(out_dir, f"{stem}_3D_{_safe_name_part(i.name)}{ext}")
-            for i in usable
+            for i in req.images
         ]
-        if not req.overwrite:
-            clash = _conflicts(targets)
-            if clash:
-                return _conflict_response(clash, out_dir)
+        target_keys = [_path_key(path) for path in targets]
+        if len(set(target_keys)) != len(target_keys):
+            raise RuntimeError(
+                "MERGEとチャンネル名が同じ保存先になります。"
+                "重複しないチャンネル名に変更してください。"
+            )
+        _assert_targets_not_open_sources(targets)
+        expected = dict(req.expected_revisions)
+        changed_parent = _targets_with_changed_parent(targets, expected)
+        if changed_parent:
+            return _changed_parent_response(changed_parent)
+        missing = _confirmed_targets_missing(targets, expected)
+        if req.overwrite and missing:
+            return _missing_target_response(missing)
+        clash = _target_write_conflicts(targets, req.overwrite, expected)
+        if clash:
+            return _conflict_response(clash, out_dir, revision_paths=targets)
+        for target in targets:
+            expected.setdefault(os.path.abspath(target), _target_state(target))
 
-        saved: list[str] = []
-        for img in usable:
-            raw = base64.b64decode(img.data_b64)
-            expected = img.width * img.height * 4
-            if len(raw) != expected:
+        # Encode into same-directory temporary files and reopen every one before
+        # any public filename changes. A bad frame or a full/detached drive thus
+        # cannot leave a partially updated multi-channel export.
+        for img, target in zip(req.images, targets):
+            _assert_output_dir_identity(out_dir, out_dir_identity)
+            raw = base64.b64decode(img.data_b64, validate=True)
+            expected_bytes = img.width * img.height * 4
+            if len(raw) != expected_bytes:
                 raise RuntimeError(
-                    f"{img.name}: expected {expected} bytes of RGBA, got {len(raw)}"
+                    f"{img.name}: expected {expected_bytes} bytes of RGBA, got {len(raw)}"
                 )
             rgba = np.frombuffer(raw, dtype=np.uint8).reshape(img.height, img.width, 4)
             rgb = np.ascontiguousarray(rgba[..., :3])
-            fname = f"{stem}_3D_{_safe_name_part(img.name)}{ext}"
-            saved.append(_save_image_file(rgb, req.format, os.path.join(out_dir, fname)))
+            with tempfile.NamedTemporaryFile(
+                dir=out_dir, prefix=".oirimg-", suffix=ext, delete=False,
+            ) as handle:
+                staged = handle.name
+            staged_paths.append(staged)
+            _save_image_file(rgb, req.format, staged)
+            _fsync_file(staged)
+            _assert_saved_image(staged, rgb, req.format)
 
-        if not saved:
-            raise RuntimeError("Nothing was written")
-        return {"saved": saved, "output_dir": out_dir}
+        locks = _locks_for_targets(targets)
+        for lock in locks:
+            lock.acquire()
+        process_locks: list[object] = []
+        try:
+            process_locks = _acquire_process_target_locks(targets)
+            _assert_output_dir_identity(out_dir, out_dir_identity)
+            _assert_targets_not_open_sources(targets)
+            changed_parent = _targets_with_changed_parent(targets, expected)
+            if changed_parent:
+                return _changed_parent_response(changed_parent)
+            missing = _confirmed_targets_missing(targets, expected)
+            if req.overwrite and missing:
+                return _missing_target_response(missing)
+            clash = _target_write_conflicts(targets, req.overwrite, expected)
+            if clash:
+                return _conflict_response(clash, out_dir, revision_paths=targets)
+            try:
+                _publish_staged_files(
+                    staged_paths, targets, req.overwrite, expected,
+                    pre_publish=lambda: (
+                        _assert_output_dir_identity(out_dir, out_dir_identity),
+                        _assert_targets_not_open_sources(targets),
+                    ),
+                )
+            except _TargetParentChangedDuringPublish as exc:
+                return _changed_parent_response(exc.paths)
+            except _TargetChangedDuringPublish as exc:
+                return _conflict_response(exc.paths, out_dir, revision_paths=targets)
+            staged_paths.clear()
+        finally:
+            _release_process_target_locks(process_locks)
+            for lock in reversed(locks):
+                lock.release()
+
+        return {"saved": targets, "output_dir": out_dir}
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
+    finally:
+        for staged in staged_paths:
+            if os.path.lexists(staged):
+                try:
+                    os.unlink(staged)
+                except OSError:
+                    pass
 
 
 @app.post("/api/save")
 def save_images(req: SaveRequest):
-    """Save images directly to the specified output folder."""
+    """Stage, verify and atomically publish a 2D image export batch."""
+    staged_paths: list[str] = []
     try:
         ext = {"tiff": ".tif", "png": ".png", "jpeg": ".jpg"}[req.format]
         as_16 = req.format == "tiff" and req.bit_depth_output == "16"
 
-        # Validate output directory
-        out_dir = os.path.expanduser(req.output_dir)
-        os.makedirs(out_dir, exist_ok=True)
+        # The selected base must already exist. In particular, never recreate a
+        # vanished external-drive mount path on the internal system disk.
+        out_dir, out_dir_identity = _existing_output_dir(req.output_dir)
 
-        # Fallback: if no valid IDs, use active image
-        image_ids = req.image_ids
-        if not image_ids or all(i not in images for i in image_ids):
-            if active_id:
-                image_ids = [active_id]
+        # An explicit selection is an all-or-nothing identity contract. Falling
+        # back to the active tab when those ids were closed can silently save a
+        # different image under the requested name. The active fallback exists
+        # only for legacy callers that send no ids at all.
+        with _state_lock:
+            if req.image_ids:
+                missing_ids = [
+                    image_id for image_id in req.image_ids if image_id not in images
+                ]
+                if missing_ids:
+                    shown = ", ".join(missing_ids[:3])
+                    raise ValueError(
+                        f"選択した画像が開かれていません: {shown}。"
+                        "保存画面を開き直して、画像を選択し直してください。"
+                    )
+                image_entries = [
+                    (image_id, images[image_id]) for image_id in req.image_ids
+                ]
+            elif active_id and active_id in images:
+                image_entries = [(active_id, images[active_id])]
             else:
                 raise RuntimeError("No image loaded")
+            for image_id, _reader in image_entries:
+                _touch(image_id)
+        image_ids = [image_id for image_id, _reader in image_entries]
 
-        saved_files: list[str] = []
         skipped: list[str] = []
         #: Every destination this request will write, gathered before any of it
         #: happens so the whole export can be refused as one.
         planned: list[str] = []
         #: Per-image state carried from the planning pass to the writing pass.
         pending: list[tuple] = []
-        for img_id in image_ids:
-            # A stale id (image closed while the dialog was open) must not abort
-            # the batch after some files have already been written.
-            if img_id not in images:
-                skipped.append(f"{img_id}: image is no longer open")
-                continue
-            r = get_reader(img_id)
+        for img_id, r in image_entries:
+            # File count and channel names must come from authoritative source
+            # metadata. This metadata-only upgrade reads no image plane and
+            # keeps both duplicate rejection and progress planning pre-pixel.
+            if not getattr(r, "_metadata_authoritative", True):
+                _ensure_reader_ready_reserved(r, img_id, metadata_only=True)
             meta = r.metadata
             # A typed name replaces the file's own, but only when saving one
             # image: across a batch it would collapse every image onto the same
@@ -3212,7 +5044,6 @@ def save_images(req: SaveRequest):
             # For batch: create subfolder per image
             if len(image_ids) > 1:
                 img_dir = os.path.join(out_dir, basename)
-                os.makedirs(img_dir, exist_ok=True)
             else:
                 img_dir = out_dir
 
@@ -3261,70 +5092,204 @@ def save_images(req: SaveRequest):
             pending.append((img_id, r, meta, settings, basename, img_dir,
                             z_list, t_list, img_z_from, img_z_to))
 
-        if not req.overwrite:
-            clash = _conflicts(planned)
-            if clash:
-                return _conflict_response(clash, out_dir)
+        if not planned:
+            raise ValueError("保存する画像がありません。チャンネルとZ/T範囲を確認してください。")
+        planned_keys = [_path_key(path) for path in planned]
+        if len(set(planned_keys)) != len(planned_keys):
+            raise ValueError(
+                "チャンネル名またはMERGE名が同じ保存先になります。"
+                "重複しないチャンネル名に変更してから保存してください。"
+            )
+        _assert_targets_not_open_sources(planned)
+
+        # Batch subfolders are direct children of the selected base. Create
+        # them one level at a time only while that exact base directory still
+        # exists; recursive makedirs could recreate a detached mount path.
+        for img_dir in dict.fromkeys(item[5] for item in pending):
+            if _path_key(img_dir) == _path_key(out_dir):
+                continue
+            _assert_output_dir_identity(out_dir, out_dir_identity)
+            try:
+                os.mkdir(img_dir)
+            except FileExistsError:
+                if not os.path.isdir(img_dir):
+                    raise ValueError(f"保存先と同名のファイルがあります: {img_dir}")
+            _assert_output_dir_identity(out_dir, out_dir_identity)
+
+        expected = dict(req.expected_revisions)
+        changed_parent = _targets_with_changed_parent(planned, expected)
+        if changed_parent:
+            return _changed_parent_response(changed_parent)
+        missing = _confirmed_targets_missing(planned, expected)
+        if req.overwrite and missing:
+            return _missing_target_response(missing)
+        clash = _target_write_conflicts(planned, req.overwrite, expected)
+        if clash:
+            return _conflict_response(clash, out_dir, revision_paths=planned)
+        for target in planned:
+            expected.setdefault(os.path.abspath(target), _target_state(target))
+
+        def assert_sources_unchanged() -> None:
+            for _img_id, _reader, meta, *_rest in pending:
+                if not (meta.source_path and meta.source_identity and meta.source_revision):
+                    continue
+                try:
+                    current = snapshot_source(meta.source_path)
+                except OSError as exc:
+                    raise ValueError(
+                        f"{meta.filename}: 保存中に元画像が見つからなくなりました。何も公開していません。"
+                    ) from exc
+                if (current.identity != meta.source_identity
+                        or current.revision != meta.source_revision):
+                    raise ValueError(
+                        f"{meta.filename}: 保存中に元画像または分割OIRが変更されました。"
+                        "何も公開していません。画像を開き直してください。"
+                    )
+
+        total_units = len(planned) + 1
+        completed_units = 0
+        targets: list[str] = []
+        _export_progress(
+            "rendering", 0, total_units,
+            f"画像を保存中（0/{len(planned)}ファイル）…",
+        )
 
         for (img_id, r, meta, settings, basename, img_dir,
              z_list, t_list, img_z_from, img_z_to) in pending:
+            # A batch may reach an evicted reader without activating its tab.
+            # Keep its decode and every derived frame in one reservation so a
+            # concurrent open cannot force another multi-GB source into memory.
+            with _reader_ready_reservation(r, img_id):
+                def write(img_rgb: np.ndarray, name: str, _dir: str = img_dir) -> None:
+                    """Stage and reopen one image; no public target changes here."""
+                    nonlocal completed_units
+                    target = os.path.join(_dir, name)
+                    _assert_output_dir_identity(out_dir, out_dir_identity)
+                    with tempfile.NamedTemporaryFile(
+                        dir=_dir, prefix=".oirimg-", suffix=ext, delete=False,
+                    ) as handle:
+                        staged = handle.name
+                    # Register before encoding so finally removes a partial file.
+                    staged_paths.append(staged)
+                    _save_image_file(img_rgb, req.format, staged)
+                    _fsync_file(staged)
+                    _assert_saved_image(staged, img_rgb, req.format)
+                    targets.append(target)
+                    completed_units += 1
+                    _export_progress(
+                        "verifying", completed_units, total_units,
+                        f"保存結果を確認済み（{completed_units}/{len(planned)}ファイル）",
+                    )
 
-            def write(img_rgb: np.ndarray, name: str, _dir: str = img_dir) -> None:
-                """Save into this image's folder at exactly the planned name."""
-                path = os.path.join(_dir, name)
-                saved_files.append(_save_image_file(img_rgb, req.format, path))
+                for t_val in t_list:
+                    for z_val in z_list:
+                        is_proj = z_val == "proj"
+                        z_idx = 0 if is_proj else z_val
 
-            for t_val in t_list:
-                for z_val in z_list:
-                    is_proj = z_val == "proj"
-                    z_idx = 0 if is_proj else z_val
+                        zt_suffix = _zt_suffix(z_val, t_val, is_proj,
+                                               z_list, t_list, req.projection_method)
 
-                    zt_suffix = _zt_suffix(z_val, t_val, is_proj,
-                                           z_list, t_list, req.projection_method)
+                        # Get slice data and contrast for each selected channel
+                        ch_slices: list[np.ndarray] = []
+                        ch_colors: list[list[int]] = []
+                        ch_mins: list[float] = []
+                        ch_maxs: list[float] = []
+                        for s in settings:
+                            if is_proj:
+                                sl = r.get_projection(
+                                    s.channel, t_val, img_z_from, img_z_to,
+                                    req.projection_method,
+                                )
+                            else:
+                                sl = r.get_slice(s.channel, z_idx, t_val)
+                            cmin, cmax = s.min, s.max
+                            if cmin is None or cmax is None:
+                                auto_lo, auto_hi = auto_contrast(sl)
+                                cmin = auto_lo if cmin is None else cmin
+                                cmax = auto_hi if cmax is None else cmax
+                            ch_slices.append(sl)
+                            ch_colors.append(s.color or _DEFAULT_CHANNEL_COLOR)
+                            ch_mins.append(float(cmin))
+                            ch_maxs.append(float(cmax))
 
-                    # Get slice data and contrast for each selected channel
-                    ch_slices: list[np.ndarray] = []
-                    ch_colors: list[list[int]] = []
-                    ch_mins: list[float] = []
-                    ch_maxs: list[float] = []
-                    for s in settings:
-                        if is_proj:
-                            sl = r.get_projection(s.channel, t_val, img_z_from, img_z_to,
-                                                  req.projection_method)
-                        else:
-                            sl = r.get_slice(s.channel, z_idx, t_val)
-                        cmin, cmax = s.min, s.max
-                        if cmin is None or cmax is None:
-                            auto_lo, auto_hi = auto_contrast(sl)
-                            cmin = auto_lo if cmin is None else cmin
-                            cmax = auto_hi if cmax is None else cmax
-                        ch_slices.append(sl)
-                        ch_colors.append(s.color or _DEFAULT_CHANNEL_COLOR)
-                        ch_mins.append(float(cmin))
-                        ch_maxs.append(float(cmax))
+                        # Save separate channel images
+                        if req.save_separate:
+                            for idx, s in enumerate(settings):
+                                c = s.channel
+                                raw_name = (meta.channel_names[c]
+                                            if c < len(meta.channel_names) else f"Ch{c}")
+                                ch_name = _safe_name_part(raw_name)
+                                rgb = _render_single(
+                                    ch_slices[idx], ch_colors[idx],
+                                    ch_mins[idx], ch_maxs[idx], as_16,
+                                )
+                                write(rgb, f"{basename}_{ch_name}{zt_suffix}{ext}")
 
-                    # Save separate channel images
-                    if req.save_separate:
-                        for idx, s in enumerate(settings):
-                            c = s.channel
-                            raw_name = meta.channel_names[c] if c < len(meta.channel_names) else f"Ch{c}"
-                            ch_name = _safe_name_part(raw_name)
-                            rgb = _render_single(ch_slices[idx], ch_colors[idx],
-                                                 ch_mins[idx], ch_maxs[idx], as_16)
-                            write(rgb, f"{basename}_{ch_name}{zt_suffix}{ext}")
+                        # Save merged image
+                        if req.save_merge and len(ch_slices) > 0:
+                            merged = _render_merge(
+                                ch_slices, ch_colors, ch_mins, ch_maxs, as_16,
+                            )
+                            write(merged, f"{basename}_merge{zt_suffix}{ext}")
 
-                    # Save merged image
-                    if req.save_merge and len(ch_slices) > 0:
-                        merged = _render_merge(ch_slices, ch_colors, ch_mins, ch_maxs, as_16)
-                        write(merged, f"{basename}_merge{zt_suffix}{ext}")
+        if [_path_key(path) for path in targets] != planned_keys:
+            raise ValueError("検証済み画像と保存計画の対応が一致しません。何も公開していません。")
+        assert_sources_unchanged()
+        _assert_output_dir_identity(out_dir, out_dir_identity)
+
+        _export_progress(
+            "publishing", completed_units, total_units,
+            "検証済み画像をまとめて公開中…",
+        )
+        locks = _locks_for_targets(targets)
+        for lock in locks:
+            lock.acquire()
+        process_locks: list[object] = []
+        try:
+            process_locks = _acquire_process_target_locks(targets)
+            _assert_targets_not_open_sources(targets)
+            changed_parent = _targets_with_changed_parent(targets, expected)
+            if changed_parent:
+                return _changed_parent_response(changed_parent)
+            missing = _confirmed_targets_missing(targets, expected)
+            if req.overwrite and missing:
+                return _missing_target_response(missing)
+            clash = _target_write_conflicts(targets, req.overwrite, expected)
+            if clash:
+                return _conflict_response(clash, out_dir, revision_paths=targets)
+            try:
+                _publish_staged_files(
+                    staged_paths, targets, req.overwrite, expected,
+                    pre_publish=lambda: (
+                        _assert_output_dir_identity(out_dir, out_dir_identity),
+                        _assert_targets_not_open_sources(targets),
+                        assert_sources_unchanged(),
+                    ),
+                )
+            except _TargetParentChangedDuringPublish as e:
+                return _changed_parent_response(e.paths)
+            except _TargetChangedDuringPublish as e:
+                return _conflict_response(e.paths, out_dir, revision_paths=targets)
+            staged_paths.clear()
+        finally:
+            _release_process_target_locks(process_locks)
+            for lock in reversed(locks):
+                lock.release()
 
         return {
-            "saved": saved_files,
+            "saved": targets,
             "output_dir": out_dir,
             "skipped": skipped,
         }
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
+    finally:
+        for staged in staged_paths:
+            if os.path.exists(staged):
+                try:
+                    os.unlink(staged)
+                except OSError:
+                    pass
 
 
 def _pick_port(preferred: int) -> int:

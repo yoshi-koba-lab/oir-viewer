@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
 import { useImageStore, type ProjectionMethod } from '../stores/imageStore';
-import { applyProjection, chooseFolder, OverwriteConflict } from '../utils/api';
+import {
+  applyProjection, chooseFolder, OverwriteConflict, type ExportJobProgress,
+} from '../utils/api';
 import { switchToImage, refreshImageList } from '../hooks/useImageLoader';
 import { dirnameOf, filenameProblem, stemOf } from '../utils/paths';
 import { OverwriteConfirm } from './SaveDialog';
@@ -41,6 +43,7 @@ export function ProjectionDialog({ open, onClose }: Props) {
   >(null);
   const [browsing, setBrowsing] = useState(false);
   const [processing, setProcessing] = useState(false);
+  const [progress, setProgress] = useState<ExportJobProgress | null>(null);
   const projectionRun = useRef(0);
   const [error, setError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
@@ -73,6 +76,7 @@ export function ProjectionDialog({ open, onClose }: Props) {
     setConflict(null);
     setError('');
     setSuccessMsg('');
+    setProgress(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
@@ -184,6 +188,10 @@ export function ProjectionDialog({ open, onClose }: Props) {
     // the stale confirmation sheet covering a save that is already running.
     setConflict(null);
     setProcessing(true);
+    setProgress({
+      phase: 'planning', completed: 0, total: 0, percent: 0,
+      label: '保存内容を確認中…',
+    });
 
     try {
       // Freeze each source tab's own view. Reusing the active tab's LUT for a
@@ -201,9 +209,13 @@ export function ProjectionDialog({ open, onClose }: Props) {
         filename: selectedImages.size === 1 ? projectionInputStem(baseName) : '',
         overwrite,
         expected_revisions: expectedRevisions,
-      });
+      }, setProgress);
 
       // Refresh image list
+      setProgress({
+        phase: 'result-check', completed: 1, total: 1, percent: 100,
+        label: '保存完了。保存結果を確認中…',
+      });
       await refreshImageList();
 
       // Restore only the matching source's view, then switch to the last output.
@@ -482,6 +494,21 @@ export function ProjectionDialog({ open, onClose }: Props) {
         {error && <p className="text-xs text-red-400 mb-3">{error}</p>}
         {successMsg && <p className="text-xs text-green-400 mb-3">{successMsg}</p>}
 
+        {processing && progress && (
+          <div className="mb-3 rounded border border-[var(--border)] bg-[var(--bg-primary)] p-3" aria-live="polite">
+            <div className="mb-1 flex justify-between gap-3 text-xs">
+              <span>{progress.label}</span>
+              <span className="font-mono tabular-nums">{progress.percent}%</span>
+            </div>
+            <progress
+              value={progress.percent}
+              max={100}
+              aria-label={`Z投影保存進捗 ${progress.percent}%`}
+              className="h-2 w-full accent-[var(--accent)]"
+            />
+          </div>
+        )}
+
         {/* Actions */}
         <div className="flex justify-end gap-2">
           <button
@@ -489,7 +516,7 @@ export function ProjectionDialog({ open, onClose }: Props) {
             disabled={processing}
             className="px-4 py-2 rounded text-xs bg-[var(--border)] text-[var(--text-secondary)] hover:text-white transition"
           >
-            {processing ? 'Processing…' : 'Cancel'}
+            {processing ? '保存中…' : 'Cancel'}
           </button>
           <button
             onClick={() => handleApply(false)}
@@ -498,7 +525,7 @@ export function ProjectionDialog({ open, onClose }: Props) {
                         && !!filenameProblem(projectionInputStem(baseName)))}
             className="px-4 py-2 rounded text-xs bg-[var(--accent)] text-white hover:opacity-90 transition disabled:opacity-50"
           >
-            {processing ? 'Processing...' : 'Apply & Save'}
+            {processing ? `保存中 ${progress?.percent ?? 0}%` : 'Apply & Save'}
           </button>
         </div>
 

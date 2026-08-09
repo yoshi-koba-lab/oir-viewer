@@ -21,6 +21,8 @@ export function Viewport() {
   const { render } = useCanvasRenderer();
   const { zoom, panX, panY, setZoom, setPan, roiTool, scalebarUm } = useViewStore();
   const metadata = useImageStore((s) => s.metadata);
+  const showMIP = useImageStore((s) => s.showMIP);
+  const projectionActive = useImageStore((s) => s.projection.active);
   // Snapshot, used only to detect "the pixels changed" below. The readout itself
   // always reads the live store. Viewport already re-renders on channel changes
   // (useCanvasRenderer subscribes to them), so this adds no extra renders.
@@ -173,7 +175,7 @@ export function Viewport() {
         onMouseLeave={handleMouseLeave}
         onDoubleClick={handleDoubleClick}
       />
-      {metadata && (
+      {metadata && !showMIP && !projectionActive && (
         <ROIOverlay
           width={metadata.width}
           height={metadata.height}

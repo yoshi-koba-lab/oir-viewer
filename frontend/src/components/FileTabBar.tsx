@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { useImageStore } from '../stores/imageStore';
+import { threeDSaveIsBusy, useOperationStore } from '../stores/operationStore';
 import { switchToImage, closeImageById } from '../hooks/useImageLoader';
 
 /**
@@ -19,6 +20,7 @@ function shortenName(name: string, max = 34): string {
 export function FileTabBar() {
   const imageList = useImageStore((s) => s.imageList);
   const activeImageId = useImageStore((s) => s.activeImageId);
+  const threeDSaveBusy = useOperationStore((s) => !!s.threeDSave);
   const activeRef = useRef<HTMLDivElement>(null);
 
   // Keep the active tab visible: with many files open it can otherwise sit
@@ -42,15 +44,16 @@ export function FileTabBar() {
                 ? 'bg-[var(--bg-secondary)] text-[var(--text-primary)] border-b-2 border-b-[var(--accent)]'
                 : 'text-[var(--text-secondary)] hover:bg-[var(--bg-secondary)] hover:text-[var(--text-primary)]'
             }`}
-            onClick={() => switchToImage(img.id)}
+            onClick={() => { if (!threeDSaveIsBusy()) void switchToImage(img.id); }}
             title={`${img.filename} (${img.width}×${img.height}, ${img.num_channels}ch, Z${img.num_z}${img.num_t > 1 ? `, T${img.num_t}` : ''})`}
           >
             <span className="font-mono whitespace-nowrap">{shortenName(img.filename)}</span>
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                closeImageById(img.id);
+                if (!threeDSaveIsBusy()) void closeImageById(img.id);
               }}
+              disabled={threeDSaveBusy}
               className="w-4 h-4 rounded flex items-center justify-center text-[10px] opacity-0 group-hover:opacity-100 focus:opacity-100 hover:bg-red-500/30 hover:text-red-300 transition-all"
               title={`Close ${img.filename}`}
               aria-label={`Close ${img.filename}`}

@@ -1,11 +1,16 @@
-import { useRef, useEffect, useCallback, useMemo, useState } from 'react';
+import { useRef, useEffect, useCallback, useState } from 'react';
 import * as THREE from 'three';
 import { useImageStore } from '../stores/imageStore';
+import { useOperationStore } from '../stores/operationStore';
 import { useViewStore } from '../stores/viewStore';
 import {
-  fetchVolumeBin, chooseFolder, saveRender, OverwriteConflict,
+  fetchVolumeBin, fetchVolumeMemoryPlan,
+  chooseFolder, saveRender, OverwriteConflict,
+  VolumeMemoryEpochChangedError,
   type RenderImagePayload,
 } from '../utils/api';
+import { imageOperationIsBusy, reloadActiveChannelData } from '../hooks/useImageLoader';
+import { resetSettings } from '../utils/settingsStore';
 import { stemOf, filenameProblem } from '../utils/paths';
 import { OverwriteConfirm } from './SaveDialog';
 import {
@@ -21,6 +26,20 @@ import { ScalebarSettings } from './ScalebarSettings';
 import {
   VOLUME_CAMERA_FOV_DEG, vertexShader, fragmentShader,
 } from '../utils/volumeShader';
+import {
+  volume3DCameraForMount,
+  volume3DForResampledVolume,
+} from '../utils/volume3DState';
+import {
+  MIN_VOLUME_ZOOM_PERCENT,
+  resolveVolumeCameraZoom,
+  volumePhysicalGeometry,
+} from '../utils/threeDCamera';
+import {
+  completedSavePercent,
+  ThreeDSaveGuard,
+  type ThreeDSaveSnapshot,
+} from '../utils/threeDSave';
 
 /** Vertex shader (GLSL3): pass position to fragment for ray-marching. */
 
@@ -30,16 +49,38 @@ const CENTER = 0.5;
 /** Fixed ray-march sample count. Exposing it as a slider changed nothing a user
  *  could see on these stacks, so it is no longer a control. */
 const RAY_STEPS = 200;
-// Open looking straight down the optical axis — the same orientation as the 2D
-// view, so switching to 3D starts from something the user already recognises.
-const DEFAULT_AZ = 0;    // horizontal orbit angle, degrees
-const DEFAULT_EL = 0;    // vertical angle above the equator, degrees
 /** Sentinel for the "Maximum" quality option — resolved against the GPU's limit. */
 const MAX_QUALITY = -1;
-/** Ask before loading a volume bigger than this; a GB-scale 3D texture can wedge the tab. */
-const HEAVY_VOLUME_MB = 400;
 /** The shader samples at most four channels, so only four are ever uploaded. */
 const MAX_TEX_CHANNELS = 4;
+
+/** Read every queued WebGL error without risking an infinite driver loop. */
+function drainWebGLErrors(gl: WebGL2RenderingContext): number[] {
+  const errors: number[] = [];
+  for (let i = 0; i < 32; i++) {
+    const error = gl.getError();
+    if (error === gl.NO_ERROR) break;
+    errors.push(error);
+  }
+  return errors;
+}
+
+interface LoadedVolumeProvenance {
+  runId: number;
+  imageId: string;
+  sourceIdentity: string;
+  sourceRevision: string;
+  currentT: number;
+  selectedResolution: number;
+  planKey: string;
+  numChannels: number;
+  numZ: number;
+}
+
+interface SaveProgress {
+  percent: number;
+  label: string;
+}
 
 /** Wrap an azimuth into 0..360 for display. */
 const wrapAz = (deg: number) => ((deg % 360) + 360) % 360;
@@ -55,6 +96,9 @@ function bytesToBase64(bytes: Uint8Array): string {
   }
   return btoa(parts.join(''));
 }
+
+/** Let React paint a completed save phase before starting the next one. */
+const nextPaint = () => new Promise<void>((resolve) => window.setTimeout(resolve, 0));
 
 /** Round to a 1/2/5 × 10ⁿ length so the bar reads as a round number. */
 /**
@@ -95,10 +139,15 @@ export function Volume3DViewer() {
   const channels = useImageStore((s) => s.channels);
   const currentT = useImageStore((s) => s.currentT);
   const activeImageId = useImageStore((s) => s.activeImageId);
-
+  const sourceViewDefaults = useImageStore((s) => s.sourceViewDefaults);
+  const resetActiveImageToSource = useImageStore((s) => s.resetActiveImageToSource);
+  const setGlobalLoadError = useImageStore((s) => s.setLoadError);
+  const hasPhysicalScale = !!metadata
+    && [metadata.pixel_size_x, metadata.pixel_size_y, metadata.pixel_size_z]
+      .every((value) => Number.isFinite(value) && value > 0);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState('');
-  const [resolution, setResolution] = useState(512); // max XY dim; 0 = original size
+  const [resolution, setResolution] = useState(MAX_QUALITY);
   const [volInfo, setVolInfo] = useState('');
   // maxDimUm is how many µm one world unit spans, which is what turns the
   // perspective projection into a physical scale bar.
@@ -124,32 +173,50 @@ export function Volume3DViewer() {
   const [saveFormat, setSaveFormat] = useState<'png' | 'tiff'>('png');
   const [saveMerge, setSaveMerge] = useState(true);
   const [savePerChannel, setSavePerChannel] = useState(false);
+  const [saveIncludeScalebar, setSaveIncludeScalebar] = useState(true);
   // null = follow whatever is currently visible; a Set = explicit override.
   const [saveChannels, setSaveChannels] = useState<Set<number> | null>(null);
   const [saveDir, setSaveDir] = useState('');
   /** Name to save under; seeded from the image, always editable. */
   const [saveName, setSaveName] = useState('');
   const [conflict, setConflict] = useState<
-    { files: string[]; count: number; more: number } | null
+    { files: string[]; count: number; more: number; revisions: Record<string, string> } | null
   >(null);
   const [saving, setSaving] = useState(false);
+  const [saveProgress, setSaveProgress] = useState<SaveProgress | null>(null);
   const [saveMsg, setSaveMsg] = useState('');
   const [saveErr, setSaveErr] = useState('');
   // Z planes present in the loaded volume, and the sub-range being shown.
   const [volZ, setVolZ] = useState(0);
   const [zRange, setZRange] = useState({ start: 1, end: 1 });
-  // A very large request waits for an explicit OK instead of loading straight away.
-  const [pendingHeavy, setPendingHeavy] = useState<{ mb: number; dim: number } | null>(null);
-  const [approvedRes, setApprovedRes] = useState<number | null>(null);
+  const [retryNonce, setRetryNonce] = useState(0);
+  const [resetting, setResetting] = useState(false);
+  const volumeRunRef = useRef(0);
+  const loadedVolumeRef = useRef<LoadedVolumeProvenance | null>(null);
+  const viewRevisionRef = useRef(0);
+  const saveGuardRef = useRef(new ThreeDSaveGuard());
 
   // Mouse interaction state
   const isDragging = useRef(false);
   const lastMouse = useRef({ x: 0, y: 0 });
+  // App keys this component by image id. Snapshot the store during that mount,
+  // before the scene effect can resolve fit and write the camera back. Initialising
+  // with hard-coded angles here erased the per-image state that tab restore had
+  // installed immediately before React mounted us.
+  const initialCameraRef = useRef(
+    volume3DCameraForMount(useImageStore.getState().volume3D),
+  );
   // Orbit state in degrees. az spins around the image's vertical axis, el lifts
   // the camera above the image plane.
-  const orbit = useRef({ az: DEFAULT_AZ, el: DEFAULT_EL, radius: 2.5 });
+  const orbit = useRef({ ...initialCameraRef.current });
   // Mirror of the orbit angles, so they can also be typed in.
-  const [angles, setAngles] = useState({ az: DEFAULT_AZ, el: DEFAULT_EL });
+  const [angles, setAngles] = useState({
+    az: initialCameraRef.current.az,
+    el: initialCameraRef.current.el,
+  });
+  const [zoomPercent, setZoomPercent] = useState(initialCameraRef.current.zoomPercent);
+  const [zoomDraft, setZoomDraft] = useState<string | null>(null);
+  const [maxZoomPercent, setMaxZoomPercent] = useState(1000);
 
   /**
    * Size the scale bar for the current camera distance.
@@ -179,6 +246,26 @@ export function Volume3DViewer() {
     const cam = cameraRef.current;
     const mesh = meshRef.current;
     if (!cam) return;
+    const { scaleX, scaleY, scaleZ } = volumeInfoRef.current;
+    const resolved = resolveVolumeCameraZoom({
+      scaleX,
+      scaleY,
+      scaleZ,
+      azDeg: orbit.current.az,
+      elDeg: orbit.current.el,
+      fovDeg: cam.fov,
+      aspect: cam.aspect,
+      near: cam.near,
+    }, orbit.current.zoomPercent);
+    orbit.current.radius = resolved.radius;
+    orbit.current.zoomPercent = resolved.zoomPercent;
+    const displayedMaximum = Math.floor(resolved.maxZoomPercent * 10) / 10;
+    setZoomPercent(Math.min(
+      displayedMaximum,
+      Math.round(resolved.zoomPercent * 10) / 10,
+    ));
+    setMaxZoomPercent(displayedMaximum);
+
     const { az, el, radius } = orbit.current;
     const a = az * DEG;
     const e = el * DEG;
@@ -205,8 +292,43 @@ export function Volume3DViewer() {
       }
       materialRef.current.uniforms.cameraPos.value.copy(camLocal);
     }
+    useImageStore.getState().setVolume3D({
+      az,
+      el,
+      radius,
+      zoomPercent: orbit.current.zoomPercent,
+    });
+    viewRevisionRef.current += 1;
     recomputeScalebar(); // depends on the camera distance
   }, [recomputeScalebar]);
+
+  /** Apply a typed zoom percentage; 100% always means fit for the live geometry. */
+  const applyZoomPercent = useCallback((requested: number) => {
+    if (saveGuardRef.current.isLocked) return;
+    if (!Number.isFinite(requested) || requested <= 0) {
+      setZoomDraft(null);
+      return;
+    }
+    orbit.current.zoomPercent = requested;
+    setZoomDraft(null);
+    updateCamera();
+  }, [updateCamera]);
+
+  const invalidateLoadedVolume = useCallback((message: string) => {
+    // Invalidate the async run as well as the save provenance. A context-loss
+    // event does not necessarily make Three.js throw, so relying on catch would
+    // leave a black/stale preserveDrawingBuffer canvas looking saveable.
+    volumeRunRef.current += 1;
+    loadedVolumeRef.current = null;
+    texturesRef.current.forEach((texture) => texture.dispose());
+    texturesRef.current = [];
+    if (materialRef.current) materialRef.current.uniforms.uNumChannels.value = 0;
+    setVolInfo('');
+    setVolZ(0);
+    setLoading(false);
+    setLoadError(message);
+    setVolumeEpoch((value) => value + 1);
+  }, []);
 
   // A typed-in bar length must take effect without waiting for a camera move.
   useEffect(() => { recomputeScalebar(); }, [scalebarUm, recomputeScalebar]);
@@ -227,6 +349,19 @@ export function Volume3DViewer() {
     renderer.setClearColor(0x000000, 1);
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
+
+    const handleContextLost = (event: Event) => {
+      event.preventDefault();
+      invalidateLoadedVolume(
+        'WebGLコンテキストが失われたため3D表示と保存を停止しました。復旧後にボリュームを再読み込みします',
+      );
+    };
+    const handleContextRestored = () => {
+      setLoadError('');
+      setRetryNonce((value) => value + 1);
+    };
+    renderer.domElement.addEventListener('webglcontextlost', handleContextLost);
+    renderer.domElement.addEventListener('webglcontextrestored', handleContextRestored);
 
     const scene = new THREE.Scene();
     sceneRef.current = scene;
@@ -275,7 +410,9 @@ export function Volume3DViewer() {
       renderer.setSize(w, h);
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
-      recomputeScalebar(); // px-per-µm depends on the viewport height
+      // A percentage is relative to fit, so resize changes the radius while the
+      // displayed percentage stays fixed.
+      updateCamera();
     };
     const observer = new ResizeObserver(handleResize);
     observer.observe(container);
@@ -294,6 +431,8 @@ export function Volume3DViewer() {
     return () => {
       cancelAnimationFrame(animIdRef.current);
       observer.disconnect();
+      renderer.domElement.removeEventListener('webglcontextlost', handleContextLost);
+      renderer.domElement.removeEventListener('webglcontextrestored', handleContextRestored);
       renderer.dispose();
       geometry.dispose();
       material.dispose();
@@ -302,14 +441,30 @@ export function Volume3DViewer() {
       texturesRef.current.forEach(t => t.dispose());
       texturesRef.current = [];
     };
-  }, [updateCamera, recomputeScalebar]);
+  }, [updateCamera, invalidateLoadedVolume]);
 
   // Load volume data when image or resolution changes
   useEffect(() => {
     if (!metadata || !activeImageId) return;
     if (metadata.num_z <= 1) return;
 
+    const runId = ++volumeRunRef.current;
+    const controller = new AbortController();
     let cancelled = false;
+    const isCurrent = () => !cancelled && runId === volumeRunRef.current;
+
+    // Never leave pixels from a previous image/T/quality visible under the new
+    // filename while the exact backend request is being planned.
+    texturesRef.current.forEach((texture) => texture.dispose());
+    texturesRef.current = [];
+    loadedVolumeRef.current = null;
+    bakedLevelsRef.current = [];
+    if (materialRef.current) materialRef.current.uniforms.uNumChannels.value = 0;
+    setVolInfo('');
+    setVolZ(0);
+    setZRange({ start: 1, end: 1 });
+    volumeInfoRef.current = { scaleX: 1, scaleY: 1, scaleZ: 1, maxDimUm: 0 };
+    setScalebar(null);
     setLoading(true);
     setLoadError('');
 
@@ -321,33 +476,34 @@ export function Volume3DViewer() {
         let requested = resolution;
         const gl = rendererRef.current?.getContext() as WebGL2RenderingContext | undefined;
         const glMax3D = gl ? gl.getParameter(gl.MAX_3D_TEXTURE_SIZE) as number : 2048;
-        const biggestXY = Math.max(metadata.width, metadata.height);
+        const biggestSourceDimension = Math.max(
+          metadata.width, metadata.height, metadata.num_z,
+        );
         if (requested === MAX_QUALITY) {
-          requested = biggestXY > glMax3D ? glMax3D : 0; // 0 = no downsampling
+          requested = biggestSourceDimension > glMax3D ? glMax3D : 0;
         }
 
-        // Estimate the upload before committing to it.
-        const outXY = requested === 0 ? biggestXY : Math.min(requested, biggestXY);
-        const shrink = outXY / biggestXY;
-        const outZ = requested === 0 ? metadata.num_z : Math.min(metadata.num_z, 128);
-        const chCount = Math.min(metadata.num_channels, MAX_TEX_CHANNELS);
-        const estMB = (metadata.width * shrink) * (metadata.height * shrink) * outZ * chCount / 1048576;
+        // Keep the exact plan/token handshake even though opening no longer asks
+        // for a local-RAM confirmation. It prevents a stale source/T/shape from
+        // being silently paired with the returned bytes.
+        const plan = await fetchVolumeMemoryPlan(
+          currentT, activeImageId, requested, MAX_TEX_CHANNELS,
+        );
+        if (!isCurrent()) return;
 
-        if (estMB > HEAVY_VOLUME_MB && approvedRes !== resolution) {
-          setPendingHeavy({ mb: Math.round(estMB), dim: outXY });
-          setLoading(false);
-          return;
-        }
-        setPendingHeavy(null);
-
-        const vol = await fetchVolumeBin(currentT, activeImageId, requested, MAX_TEX_CHANNELS);
-        if (cancelled) return;
+        const vol = await fetchVolumeBin(
+          currentT, activeImageId, requested, MAX_TEX_CHANNELS,
+          plan.planKey, controller.signal,
+        );
+        if (!isCurrent()) return;
 
         const { numZ: num_z, height, width, channels: volChannels, originalShape: original_shape } = vol;
-
-        // Dispose old textures
-        texturesRef.current.forEach(t => t.dispose());
-        texturesRef.current = [];
+        const shapeMismatch = vol.numChannels !== plan.numChannels
+          || num_z !== plan.numZ || height !== plan.height || width !== plan.width
+          || original_shape.some((value, index) => value !== plan.originalShape[index]);
+        if (shapeMismatch) {
+          throw new Error('3D表示を中止しました: メモリ計算と受信画像の形状が一致しません');
+        }
 
         const mat = materialRef.current;
         if (!mat) return;
@@ -361,7 +517,6 @@ export function Volume3DViewer() {
         bakedLevelsRef.current = volChannels
           .slice(0, MAX_TEX_CHANNELS)
           .map((c) => [c.autoMin, c.autoMax] as [number, number]);
-        setVolumeEpoch((n) => n + 1);
         for (let c = 0; c < numCh; c++) {
           const u8 = volChannels[c].data;
 
@@ -386,18 +541,22 @@ export function Volume3DViewer() {
         const origZ = original_shape[1];
         const origH = original_shape[2];
         const origW = original_shape[3];
-        const px = metadata.pixel_size_x || 1;
-        const py = metadata.pixel_size_y || 1;
-        const pz = metadata.pixel_size_z || 1;
-        const physW = origW * px;
-        const physH = origH * py;
-        const physZ = origZ * pz;
-        const maxDim = Math.max(physW, physH, physZ);
-        const scaleX = physW / maxDim;
-        const scaleY = physH / maxDim;
-        const scaleZ = physZ / maxDim;
+        const physical = volumePhysicalGeometry(
+          origW,
+          origH,
+          origZ,
+          metadata.pixel_size_x,
+          metadata.pixel_size_y,
+          metadata.pixel_size_z,
+        );
+        const { scaleX, scaleY, scaleZ } = physical;
 
-        volumeInfoRef.current = { scaleX, scaleY, scaleZ, maxDimUm: maxDim };
+        volumeInfoRef.current = {
+          scaleX,
+          scaleY,
+          scaleZ,
+          maxDimUm: physical.maxDimUm,
+        };
 
         // Physical proportions only — the Z exaggeration slider is gone.
         if (meshRef.current) {
@@ -412,46 +571,88 @@ export function Volume3DViewer() {
         updateCamera(); // model-space camera depends on the mesh matrix
 
         setVolZ(num_z);
-        // A slab this image was already set up with wins over the default; only
-        // an image being seen for the first time gets the whole stack. Without
-        // this, coming back to a well to check it silently widened its Z range
-        // and the export no longer matched what had been decided.
+        // Preserve the selected physical fraction when quality/T changes the
+        // sampled Z count. Clamping the old slice numbers would silently turn
+        // the back half of 128 planes into the middle third of 200 planes.
         {
           const store = useImageStore.getState();
-          const saved = store.activeImageId
-            ? store.imageViewStates[store.activeImageId]?.volume3D
-            : undefined;
-          const range = saved
-            ? {
-                start: Math.max(1, Math.min(num_z, saved.zStart)),
-                end: Math.max(1, Math.min(num_z, saved.zEnd)),
-              }
-            : { start: 1, end: num_z };
-          if (range.end < range.start) range.end = range.start;
+          // Camera/slab controls remain live while a slow volume is built. Use
+          // their current values at completion: writing the request-start
+          // snapshot here made Plate Save export an old angle even though the
+          // WebGL camera visibly showed the user's newer drag position.
+          const resampled = volume3DForResampledVolume(store.volume3D, num_z);
+          const range = { start: resampled.zStart, end: resampled.zEnd };
           setZRange(range);
-          store.setVolume3D({ zStart: range.start, zEnd: range.end, zTotal: num_z });
+          store.setVolume3D(resampled);
         }
 
         // Info string
         const mb = ((numCh * num_z * height * width) / 1048576).toFixed(1);
-        const full = width >= original_shape[3] ? ' 原寸' : '';
-        setVolInfo(`${width}x${height}x${num_z} (${mb} MB)${full}`);
-        setLoading(false);
+        const sizeNote = width >= original_shape[3] && height >= original_shape[2]
+          ? ' 原寸'
+          : resolution === MAX_QUALITY ? ' GPU上限' : '';
+        // needsUpdate only queues a Data3DTexture upload. Force one render and
+        // verify the driver before publishing save provenance; GPU OOM/context
+        // loss otherwise produces a valid-looking black capture without throw.
+        const renderer = rendererRef.current;
+        const scene = sceneRef.current;
+        const camera = cameraRef.current;
+        if (!renderer || !scene || !camera) {
+          throw new Error('3D描画コンテキストを確認できません');
+        }
+        const uploadGl = renderer.getContext() as WebGL2RenderingContext;
+        drainWebGLErrors(uploadGl);
+        renderer.render(scene, camera);
+        const glErrors = drainWebGLErrors(uploadGl);
+        if (uploadGl.isContextLost() || glErrors.length > 0) {
+          throw new Error(
+            uploadGl.isContextLost()
+              ? 'WebGLコンテキストが失われ、3Dテクスチャを作成できませんでした'
+              : `GPUへの3Dテクスチャ転送に失敗しました (WebGL ${glErrors.map((e) => `0x${e.toString(16)}`).join(', ')})`,
+          );
+        }
+        loadedVolumeRef.current = {
+          runId,
+          imageId: activeImageId,
+          sourceIdentity: metadata.source_identity,
+          sourceRevision: metadata.source_revision,
+          currentT,
+          selectedResolution: resolution,
+          planKey: plan.planKey,
+          numChannels: numCh,
+          numZ: num_z,
+        };
+        // Publish readiness only after textures, shader channel count, physical
+        // scale and provenance all describe the same completed request.
+        setVolumeEpoch((n) => n + 1);
+        setVolInfo(`${width}x${height}x${num_z} (${mb} MB)${sizeNote}`);
+        if (isCurrent()) setLoading(false);
       } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') return;
+        if (err instanceof VolumeMemoryEpochChangedError) {
+          // Another source decode/Plate volume completed after this plan was
+          // measured. Re-read the exact plan instead of executing stale source,
+          // T or shape provenance.
+          if (isCurrent()) setRetryNonce((value) => value + 1);
+          return;
+        }
         console.error('Failed to load volume:', err);
-        if (!cancelled) {
+        if (isCurrent()) {
           setLoadError(err instanceof Error ? err.message : 'Failed to load volume');
           setLoading(false);
         }
       }
     })();
 
-    return () => { cancelled = true; };
-  }, [metadata, activeImageId, currentT, resolution, approvedRes]);
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [metadata, activeImageId, currentT, resolution, retryNonce, updateCamera]);
 
-  // Update channel colors/visibility uniforms
-  // Note: volume data is pre-contrasted to uint8 on backend, so min=0 max=1
-  useEffect(() => {
+  // Update channel colors/visibility uniforms. This can also be forced at the
+  // save boundary so a just-edited React state cannot lag one frame behind.
+  const syncChannelUniforms = useCallback(() => {
     const mat = materialRef.current;
     if (!mat) return;
 
@@ -491,29 +692,46 @@ export function Volume3DViewer() {
     mat.uniforms.uMins.value = mins;
     mat.uniforms.uMaxs.value = maxs;
     mat.uniforms.uVisible.value = visible;
+    viewRevisionRef.current += 1;
+  }, [channels]);
+
+  // Note: volume data is pre-contrasted to uint8 on backend, so min=0 max=1.
+  useEffect(() => {
+    // ChannelPanel sits outside this component's overlay. Keep its edits in the
+    // store, but do not let them split one MERGE+CH save across visual states.
+    if (saving || saveGuardRef.current.isLocked) return;
+    syncChannelUniforms();
     // volumeEpoch: a freshly loaded volume brings new baked levels, and the
     // uniforms have to be recomputed against them even if `channels` did not
     // change.
-  }, [channels, volumeEpoch]);
+  }, [saving, syncChannelUniforms, volumeEpoch]);
 
   // Push the visible Z slab to the shader. Plane n covers [n-1, n]/volZ in
   // normalised texture Z, so the selected 1-based inclusive range maps to
   // (start-1)/volZ .. end/volZ.
-  useEffect(() => {
+  const syncZUniforms = useCallback(() => {
     const mat = materialRef.current;
     if (!mat || volZ <= 0) return;
     mat.uniforms.uZMin.value = Math.max(0, (zRange.start - 1) / volZ);
     mat.uniforms.uZMax.value = Math.min(1, zRange.end / volZ);
+    viewRevisionRef.current += 1;
   }, [zRange, volZ]);
+
+  useEffect(() => {
+    if (saving || saveGuardRef.current.isLocked) return;
+    syncZUniforms();
+  }, [saving, syncZUniforms]);
 
   // Mouse handlers for orbit control
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    if (saveGuardRef.current.isLocked) return;
     isDragging.current = true;
     lastMouse.current = { x: e.clientX, y: e.clientY };
   }, []);
 
   // Keep the slab non-empty: moving one end past the other drags the other with it.
   const setZStart = useCallback((v: number) => {
+    if (saveGuardRef.current.isLocked) return;
     if (Number.isNaN(v)) return;
     setZRange((r) => {
       const start = Math.max(1, Math.min(volZ, Math.round(v)));
@@ -524,6 +742,7 @@ export function Volume3DViewer() {
   }, [volZ]);
 
   const setZEnd = useCallback((v: number) => {
+    if (saveGuardRef.current.isLocked) return;
     if (Number.isNaN(v)) return;
     setZRange((r) => {
       const end = Math.max(1, Math.min(volZ, Math.round(v)));
@@ -535,20 +754,19 @@ export function Volume3DViewer() {
 
   /** Point the camera at the given angles (degrees) and keep the inputs in step. */
   const applyAngles = useCallback((az: number, el: number) => {
+    if (saveGuardRef.current.isLocked) return;
     const a = wrapAz(az);
     const e = clampEl(el);
     orbit.current.az = a;
     orbit.current.el = e;
     setAngles({ az: Math.round(a * 10) / 10, el: Math.round(e * 10) / 10 });
-    // Recorded per image, so the angle survives switching wells and the plate
-    // export renders the view that was actually set up. Written on every change
-    // rather than on gesture end: a zustand set is cheap next to the re-render
-    // this already does, and there is no "gesture end" for a typed angle.
-    useImageStore.getState().setVolume3D({ az: a, el: e, radius: orbit.current.radius });
+    // updateCamera records the angle, fit-relative zoom and resolved radius as
+    // one coherent camera state for tab restore and Plate Save.
     updateCamera();
   }, [updateCamera]);
 
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
+    if (saveGuardRef.current.isLocked) return;
     if (!isDragging.current) return;
       // End the gesture when the button is no longer held, not on mouseleave:
       // the scale bar overlays the canvas, so crossing it fires mouseleave and
@@ -566,25 +784,59 @@ export function Volume3DViewer() {
     isDragging.current = false;
   }, []);
 
+  /** The canvas may be saved only when it names the currently requested volume. */
+  const loadedVolumeIsCurrent = useCallback((): boolean => {
+    const loaded = loadedVolumeRef.current;
+    const state = useImageStore.getState();
+    const renderer = rendererRef.current;
+    const mat = materialRef.current;
+    const gl = renderer?.getContext() as WebGL2RenderingContext | undefined;
+    return !loading
+      && !!loaded
+      && loaded.runId === volumeRunRef.current
+      && loaded.imageId === activeImageId
+      && loaded.sourceIdentity === metadata?.source_identity
+      && loaded.sourceRevision === metadata?.source_revision
+      && loaded.currentT === currentT
+      && loaded.selectedResolution === resolution
+      && state.activeImageId === loaded.imageId
+      && state.metadata?.source_revision === loaded.sourceRevision
+      && !!gl && !gl.isContextLost()
+      && texturesRef.current.length === loaded.numChannels
+      && (mat?.uniforms.uNumChannels.value as number) === loaded.numChannels
+      && volZ === loaded.numZ;
+  }, [activeImageId, currentT, loading, metadata, resolution, volZ]);
+
   /**
    * Grab one frame as raw RGBA at the canvas's device resolution.
    *
    * Renders synchronously with the requested channel mask so the capture is not
-   * at the mercy of the animation loop, burns in the scale bar when it is shown,
+   * at the mercy of the animation loop, optionally burns in the exact scale bar,
    * then restores the mask and re-renders so the live view is untouched.
    */
-  const captureFrame = useCallback((name: string, mask: boolean[] | null): RenderImagePayload | null => {
+  const captureFrame = useCallback((
+    name: string,
+    mask: boolean[] | null,
+    saveSnapshot: ThreeDSaveSnapshot,
+  ): RenderImagePayload | null => {
+    if (!saveGuardRef.current.owns(saveSnapshot, viewRevisionRef.current)
+        || !loadedVolumeIsCurrent()) return null;
     const renderer = rendererRef.current;
     const scene = sceneRef.current;
     const cam = cameraRef.current;
     const mat = materialRef.current;
     if (!renderer || !scene || !cam || !mat) return null;
+    const gl = renderer.getContext() as WebGL2RenderingContext;
+    if (gl.isContextLost()) return null;
 
     const uVisible = mat.uniforms.uVisible.value as boolean[];
     const prev = uVisible.slice();
     if (mask) mat.uniforms.uVisible.value = mask;
     try {
       renderer.render(scene, cam);
+      const glErrors = drainWebGLErrors(gl);
+      if (!saveGuardRef.current.owns(saveSnapshot, viewRevisionRef.current)
+          || gl.isContextLost() || glErrors.length > 0) return null;
       const src = renderer.domElement;
       const w = src.width;
       const h = src.height;
@@ -599,7 +851,7 @@ export function Volume3DViewer() {
       ctx.fillStyle = '#000000';
       ctx.fillRect(0, 0, w, h);
       ctx.drawImage(src, 0, 0);
-      if (showScalebar && scalebar) {
+      if (saveIncludeScalebar && hasPhysicalScale && scalebar) {
         drawScalebar(ctx, scalebar, w, h, scalebarColor, scalebarPos, src.clientWidth > 0 ? w / src.clientWidth : 1);
       }
       const bytes = new Uint8Array(ctx.getImageData(0, 0, w, h).data.buffer);
@@ -608,21 +860,31 @@ export function Volume3DViewer() {
       mat.uniforms.uVisible.value = prev;
       renderer.render(scene, cam);
     }
-  }, [showScalebar, scalebar, scalebarColor, scalebarPos]);
+  }, [
+    hasPhysicalScale, loadedVolumeIsCurrent, saveIncludeScalebar,
+    scalebar, scalebarColor, scalebarPos,
+  ]);
 
   /** Channels the save will use: an explicit pick, else whatever is visible now. */
-  const saveChannelIndices = useMemo(() => {
+  const saveChannelIndices = (() => {
     const mat = materialRef.current;
     const limit = Math.min(channels.length, (mat?.uniforms.uNumChannels.value as number) || channels.length, 4);
     const pool = Array.from({ length: limit }, (_, i) => i);
     if (saveChannels) return pool.filter((i) => saveChannels.has(i));
     return pool.filter((i) => channels[i]?.visible);
-  }, [channels, saveChannels, volInfo]); // volInfo changes when a volume finishes loading
+  })();
 
   const handleSave = useCallback(async (overwrite = false) => {
+    const expectedRevisions = overwrite ? conflict?.revisions ?? {} : {};
     setSaveErr('');
     setSaveMsg('');
+    setSaveProgress(null);
+    if (overwrite) setConflict(null);
     if (!metadata) return;
+    if (!loadedVolumeIsCurrent()) {
+      setSaveErr('現在の画像・T・Qualityの3Dボリュームが読み込み完了するまで保存できません');
+      return;
+    }
     // Refused here, not silently sanitised by the backend: a name the user did
     // not type is the exact failure 1.5.0 exists to prevent.
     const nameProblem = filenameProblem(saveName.trim() || stemOf(metadata.filename));
@@ -639,57 +901,144 @@ export function Volume3DViewer() {
       setSaveErr('保存するチャンネルがありません');
       return;
     }
+    if (imageOperationIsBusy()) {
+      setSaveErr('画像を開く・切り替える処理が完了してから保存してください');
+      return;
+    }
+
+    // Freeze the actual shader state synchronously before the first await. The
+    // ChannelPanel and Toolbar live outside this component, and the App overlay
+    // is painted asynchronously, so React state alone is not a save lock.
+    if (saveGuardRef.current.isLocked) return;
+    syncChannelUniforms();
+    syncZUniforms();
+    const saveSnapshot = saveGuardRef.current.begin(viewRevisionRef.current);
+    if (!saveSnapshot) return;
+
+    const firstProgress = {
+      percent: 0,
+      label: saveDir ? '保存を準備中…' : '保存先を選択中…',
+    };
+    // This owner outlives the keyed viewer. It prevents navigation from
+    // unmounting our local guard while /api/save-render is still writing.
+    const operationStore = useOperationStore.getState();
+    const globalSaveToken = operationStore.beginThreeDSave(firstProgress);
+    if (globalSaveToken === null) {
+      saveGuardRef.current.finish(saveSnapshot);
+      setSaveErr('別の3D保存が完了するまでお待ちください');
+      return;
+    }
+    const reportProgress = (progress: SaveProgress | null) => {
+      setSaveProgress(progress);
+      if (progress) {
+        useOperationStore.getState().updateThreeDSave(globalSaveToken, progress);
+      }
+    };
 
     setSaving(true);
+    reportProgress(firstProgress);
     try {
+      await nextPaint();
       let dir = saveDir;
       if (!dir) {
         const chosen = await chooseFolder();
-        if (chosen.cancelled || !chosen.path) { setSaving(false); return; }
+        if (chosen.cancelled || !chosen.path) {
+          reportProgress(null);
+          return;
+        }
         dir = chosen.path;
         setSaveDir(dir);
+      }
+      // The folder picker and overwrite dialog can stay open while T/Quality is
+      // changed. Recheck immediately before touching the canvas.
+      if (!saveGuardRef.current.owns(saveSnapshot, viewRevisionRef.current)
+          || !loadedVolumeIsCurrent()) {
+        throw new Error('3Dボリュームが変更されたため保存を中止しました。読み込み完了後に再実行してください');
       }
 
       const limit = 4;
       const images: RenderImagePayload[] = [];
+      const expectedImages = (saveMerge ? 1 : 0) + (savePerChannel ? picks.length : 0);
+      const totalTasks = expectedImages + 1;
+      const captured = async (label: string) => {
+        reportProgress({
+          percent: completedSavePercent(images.length, totalTasks),
+          label: `${label}を取得しました（${images.length}/${expectedImages}画像）`,
+        });
+        await nextPaint();
+      };
+      reportProgress({ percent: 0, label: `保存画像を取得中（0/${expectedImages}画像）` });
+      await nextPaint();
       if (saveMerge) {
         const mask = Array.from({ length: limit }, (_, i) => picks.includes(i));
-        const f = captureFrame('merge', mask);
-        if (f) images.push(f);
+        const f = captureFrame('merge', mask, saveSnapshot);
+        if (!f) throw new Error('MERGE画面の取得に失敗したため、何も保存していません');
+        images.push(f);
+        await captured('MERGE画像');
       }
       if (savePerChannel) {
         for (const i of picks) {
           const mask = Array.from({ length: limit }, (_, k) => k === i);
           const label = metadata.channel_names[i] || `Ch${i + 1}`;
-          const f = captureFrame(label, mask);
-          if (f) images.push(f);
+          const f = captureFrame(label, mask, saveSnapshot);
+          if (!f) {
+            throw new Error(`${label}画面の取得に失敗したため、何も保存していません`);
+          }
+          images.push(f);
+          await captured(`${label}画像`);
         }
       }
-      if (images.length === 0) throw new Error('画面の取得に失敗しました');
+      if (images.length !== expectedImages) {
+        throw new Error(
+          `保存画像数が一致しないため中止しました（予定 ${expectedImages}、取得 ${images.length}）`,
+        );
+      }
+      if (!saveGuardRef.current.owns(saveSnapshot, viewRevisionRef.current)
+          || !loadedVolumeIsCurrent()) {
+        throw new Error('保存中に3D表示が変更されたため、何も保存していません');
+      }
 
+      reportProgress({
+        percent: completedSavePercent(expectedImages, totalTasks),
+        label: 'ファイルに保存中…',
+      });
+      await nextPaint();
+      if (!saveGuardRef.current.owns(saveSnapshot, viewRevisionRef.current)
+          || !loadedVolumeIsCurrent()) {
+        throw new Error('ファイル保存の直前に3D表示が変更されたため、何も保存していません');
+      }
       const res = await saveRender({
         output_dir: dir,
         basename: saveName.trim() || stemOf(metadata.filename),
         format: saveFormat,
         images,
         overwrite,
+        expected_revisions: expectedRevisions,
       });
+      reportProgress({ percent: 100, label: '保存完了' });
       setSaveMsg(`${res.saved.length} 件保存: ${res.output_dir}`);
+      await nextPaint();
     } catch (e) {
+      reportProgress(null);
       // Nothing was written; this is a question about replacing files.
       if (e instanceof OverwriteConflict) {
-        setConflict({ files: e.files, count: e.count, more: e.more });
+        setConflict({
+          files: e.files, count: e.count, more: e.more, revisions: e.revisions,
+        });
       } else {
         setSaveErr(e instanceof Error ? e.message : '保存に失敗しました');
       }
     } finally {
+      saveGuardRef.current.finish(saveSnapshot);
+      useOperationStore.getState().finishThreeDSave(globalSaveToken);
       setSaving(false);
     }
     // saveName belongs here: without it this closure keeps the name from the
     // render it was created in, so typing one and pressing save wrote the old
     // one — the exact thing the field exists to control.
   }, [metadata, saveMerge, savePerChannel, saveChannelIndices, saveDir, saveFormat,
-      saveName, captureFrame]);
+      saveName, conflict, captureFrame, loadedVolumeIsCurrent,
+      syncChannelUniforms, syncZUniforms]);
 
   // Wheel zoom is bound natively with { passive: false }: React routes onWheel
   // through a passive root listener, so preventDefault() there is ignored and the
@@ -702,21 +1051,75 @@ export function Volume3DViewer() {
     const el = rootRef.current;
     if (!el) return;
     const onWheel = (e: WheelEvent) => {
-      if ((e.target as HTMLElement | null)?.closest('[data-3d-controls]')) return;
+      if (saveGuardRef.current.isLocked) {
+        e.preventDefault();
+        return;
+      }
+      const target = e.target as HTMLElement | null;
+      if (target?.closest('[data-saving-overlay]')) {
+        e.preventDefault();
+        return;
+      }
+      if (target?.closest('[data-3d-controls]')) return;
       e.preventDefault();
-      const r = orbit.current.radius * (e.deltaY > 0 ? 1.1 : 0.9);
-      orbit.current.radius = Math.max(0.5, Math.min(10, r));
-      useImageStore.getState().setVolume3D({ radius: orbit.current.radius });
+      orbit.current.zoomPercent *= e.deltaY > 0 ? 1 / 1.1 : 1 / 0.9;
+      setZoomDraft(null);
       updateCamera();
     };
     el.addEventListener('wheel', onWheel, { passive: false });
     return () => el.removeEventListener('wheel', onWheel);
   }, [updateCamera]);
 
-  const resetCamera = useCallback(() => {
-    orbit.current.radius = 2.5;
-    applyAngles(DEFAULT_AZ, DEFAULT_EL);   // also records the reset radius
-  }, [applyAngles]);
+  const resetToSource = useCallback(async () => {
+    if (saveGuardRef.current.isLocked) return;
+    if (!activeImageId || !metadata || !sourceViewDefaults[activeImageId]) return;
+    const resetId = activeImageId;
+    const resetIdentity = metadata.source_identity;
+    const resetRevision = metadata.source_revision;
+    if (!window.confirm(
+      'このファイルの色・表示チャンネル・Min/Max・Z/T・MIP/投影・3Dカメラ・Z範囲・Qualityを、元ファイルを開いた直後の設定に戻します。\n保存済みの調整内容は元に戻せません。続行しますか？',
+    )) return;
+
+    setResetting(true);
+    setGlobalLoadError(null);
+    try {
+      if (!resetActiveImageToSource(true)) {
+        throw new Error('元ファイルの初期設定を取得できません');
+      }
+      const store = useImageStore.getState();
+      const restored = store.volume3D;
+      const fullZ = Math.max(1, volZ || metadata.num_z);
+      store.setVolume3D({ zStart: 1, zEnd: fullZ, zTotal: fullZ });
+      setZRange({ start: 1, end: fullZ });
+      orbit.current.az = restored.az;
+      orbit.current.el = restored.el;
+      orbit.current.zoomPercent = restored.zoomPercent;
+      setAngles({
+        az: Math.round(restored.az * 10) / 10,
+        el: Math.round(restored.el * 10) / 10,
+      });
+      updateCamera();
+      setResolution(MAX_QUALITY);
+      await Promise.all([
+        resetSettings(activeImageId),
+        reloadActiveChannelData(activeImageId),
+      ]);
+    } catch (error) {
+      const current = useImageStore.getState();
+      if (current.activeImageId === resetId
+          && current.metadata?.source_identity === resetIdentity
+          && current.metadata?.source_revision === resetRevision) {
+        setGlobalLoadError(
+          `表示設定をリセットできません: ${error instanceof Error ? error.message : error}`,
+        );
+      }
+    } finally {
+      setResetting(false);
+    }
+  }, [
+    activeImageId, metadata, resetActiveImageToSource, setGlobalLoadError,
+    sourceViewDefaults, updateCamera, volZ,
+  ]);
 
   /**
    * Adopt this image's stored angle when the active image changes.
@@ -731,7 +1134,10 @@ export function Volume3DViewer() {
     const v = useImageStore.getState().volume3D;
     orbit.current.az = v.az;
     orbit.current.el = v.el;
-    orbit.current.radius = v.radius;
+    orbit.current.zoomPercent = Number.isFinite(v.zoomPercent) && v.zoomPercent > 0
+      ? v.zoomPercent
+      : 100;
+    setZoomDraft(null);
     setAngles({ az: Math.round(v.az * 10) / 10, el: Math.round(v.el * 10) / 10 });
     updateCamera();
     // updateCamera is intentionally not a dependency: including it re-runs this
@@ -747,21 +1153,33 @@ export function Volume3DViewer() {
     );
   }
 
+  const retryResolution = resolution === MAX_QUALITY
+    ? 512
+    : resolution > 384 ? 384 : resolution > 256 ? 256 : 128;
+  const canSaveVolume = loadedVolumeIsCurrent();
+
   return (
     <div ref={rootRef} className="relative flex-1 overflow-hidden bg-black">
-      {/* 3D Canvas */}
-      <div
-        ref={containerRef}
-        className="w-full h-full cursor-grab active:cursor-grabbing"
-        onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-      />
+      {/* Keep the render viewport beside the controls. Fitting against the full
+          root would put the volume's right edge underneath the 230 px panel. */}
+      <div className="absolute inset-y-0 left-0 right-[238px] min-w-0 overflow-hidden">
+        <div
+          ref={containerRef}
+          className="w-full h-full cursor-grab active:cursor-grabbing"
+          onMouseDown={handleMouseDown}
+          onMouseMove={handleMouseMove}
+          onMouseUp={handleMouseUp}
+        />
+
+        {/* The overlay shares the exact unobscured viewport used by the camera
+            and export, so its default is genuinely inside the image at left-bottom. */}
+        <ScalebarOverlay metrics={scalebar} pad={14} />
+      </div>
 
       {/* Loading overlay */}
       {loading && (
         <div className="absolute inset-0 flex items-center justify-center bg-black/60 pointer-events-none">
-          <div className="text-white text-sm animate-pulse">Loading 3D volume...</div>
+          <div className="text-white text-sm animate-pulse">3D画像を読み込み中…</div>
         </div>
       )}
 
@@ -772,17 +1190,21 @@ export function Volume3DViewer() {
             <p className="text-white text-sm font-bold mb-2">3D Loading Error</p>
             <p className="text-white/80 text-xs mb-3">{loadError}</p>
             <button
-              onClick={() => { setLoadError(''); setResolution(Math.max(64, resolution - 64)); }}
+              onClick={() => {
+                setLoadError('');
+                setResolution(retryResolution);
+                setRetryNonce((value) => value + 1);
+              }}
               className="px-3 py-1 rounded bg-[var(--accent)] text-white text-xs hover:opacity-90"
             >
-              Retry with lower resolution ({Math.max(64, resolution - 64)}px)
+              Retry with lower resolution ({retryResolution}px)
             </button>
           </div>
         </div>
       )}
 
       {/* 3D Controls Panel */}
-      <div data-3d-controls className="absolute top-12 right-2 bg-black/70 rounded-lg p-3 flex flex-col gap-2 text-xs text-white/80 w-[230px]">
+      <div data-3d-controls className="absolute top-12 right-2 max-h-[calc(100%-3.5rem)] overflow-y-auto bg-black/70 rounded-lg p-3 flex flex-col gap-2 text-xs text-white/80 w-[230px]">
         <div className="font-bold text-white text-center mb-1">3D Controls</div>
 
         {/* Resolution */}
@@ -790,31 +1212,24 @@ export function Volume3DViewer() {
           <span className="w-16">Quality:</span>
           <select
             value={resolution}
-            onChange={(e) => setResolution(Number(e.target.value))}
+            onChange={(e) => {
+              if (saveGuardRef.current.isLocked) return;
+              setResolution(Number(e.target.value));
+            }}
             className="flex-1 bg-black/60 border border-white/20 rounded px-1 py-0.5 text-xs"
           >
             <option value={128}>Low (128)</option>
             <option value={256}>Medium (256)</option>
             <option value={384}>High (384)</option>
             <option value={512}>Ultra (512)</option>
-            <option value={MAX_QUALITY}>Maximum (原寸)</option>
+            <option value={MAX_QUALITY}>Maximum (利用可能な最大)</option>
           </select>
         </div>
 
-        {/* Guard for GB-scale volumes: confirm before uploading to the GPU */}
-        {pendingHeavy && (
-          <div className="rounded border border-amber-500/60 bg-amber-500/10 p-2 space-y-1.5">
-            <p className="text-[10px] leading-relaxed text-amber-200">
-              約 {pendingHeavy.mb} MB（{pendingHeavy.dim}px 相当）になります。
-              GPU の 3D テクスチャ上限に合わせて縮小済みですが、読み込みに時間がかかります。
-            </p>
-            <button
-              onClick={() => setApprovedRes(resolution)}
-              className="w-full px-2 py-1 rounded bg-amber-500 text-black text-[10px] font-bold hover:opacity-90 transition"
-            >
-              この容量で読み込む
-            </button>
-          </div>
+        {metadata.num_channels > MAX_TEX_CHANNELS && (
+          <p className="rounded border border-amber-500/50 bg-amber-500/10 p-2 text-[10px] leading-relaxed text-amber-200">
+            3D表示は先頭4チャンネルまでです。5番目以降は3Dに表示されないため、2Dに切り替えて確認してください。
+          </p>
         )}
 
         {/* Z sub-range: clipped in the shader, so it applies instantly with no refetch */}
@@ -866,6 +1281,7 @@ export function Volume3DViewer() {
             </div>
             <button
               onClick={() => {
+                if (saveGuardRef.current.isLocked) return;
                 setZRange({ start: 1, end: volZ });
                 useImageStore.getState().setVolume3D({ zStart: 1, zEnd: volZ, zTotal: volZ });
               }}
@@ -878,6 +1294,41 @@ export function Volume3DViewer() {
 
         {/* Orbit angles — typeable, and kept in step with mouse dragging */}
         <div className="pt-1 border-t border-white/10 space-y-1.5">
+          <div className="flex items-center gap-2">
+            <span className="w-16">拡大率:</span>
+            <input
+              type="number"
+              min={MIN_VOLUME_ZOOM_PERCENT}
+              max={maxZoomPercent}
+              step={5}
+              value={zoomDraft ?? zoomPercent}
+              onFocus={() => setZoomDraft(String(zoomPercent))}
+              onChange={(e) => setZoomDraft(e.target.value)}
+              onBlur={(e) => applyZoomPercent(Number(e.currentTarget.value))}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') e.currentTarget.blur();
+                if (e.key === 'Escape') {
+                  setZoomDraft(null);
+                  e.currentTarget.value = String(zoomPercent);
+                  e.currentTarget.blur();
+                }
+              }}
+              aria-label="3D拡大率"
+              className="w-16 bg-black/60 border border-white/20 rounded px-1 py-0.5 text-xs text-right tabular-nums"
+              title={`100%で画面に合わせます（最大 ${maxZoomPercent}%）`}
+            />
+            <span className="text-white/40">%</span>
+            <button
+              onClick={() => applyZoomPercent(100)}
+              className="ml-auto rounded bg-white/10 px-1.5 py-0.5 text-[10px] hover:bg-white/20 transition"
+              title="画像全体を画面に合わせる"
+            >
+              全体
+            </button>
+          </div>
+          <div className="text-right text-[9px] text-white/40">
+            入力範囲: {MIN_VOLUME_ZOOM_PERCENT}–{maxZoomPercent}%（100%=全体表示）
+          </div>
           <div className="flex items-center gap-2">
             <span className="w-16">横 (Y軸):</span>
             <input
@@ -949,9 +1400,15 @@ export function Volume3DViewer() {
         {/* Scale bar: on/off, length, colour — the same controls as the 2D view */}
         <div className="pt-1 border-t border-white/10">
           <ScalebarSettings compact />
-          {showScalebar && (
-            <div className="text-right text-white/40 font-mono text-[10px] mt-1">
-              現在: {scalebar ? formatUm(scalebar.um) : '—'}
+          {!hasPhysicalScale && (
+            <div className="mt-1 rounded border border-amber-500/50 bg-amber-500/10 p-1.5 text-[10px] leading-relaxed text-amber-200">
+              物理サイズ情報がないためスケールバーを表示できません
+            </div>
+          )}
+          {showScalebar && hasPhysicalScale && (
+            <div className="text-right text-white/40 text-[10px] mt-1">
+              現在: <span className="font-mono">{scalebar ? formatUm(scalebar.um) : '—'}</span>
+              （中心深度換算）
             </div>
           )}
         </div>
@@ -992,6 +1449,24 @@ export function Volume3DViewer() {
               <span>CH別</span>
             </label>
           </div>
+
+          <label className="flex items-center gap-1.5 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={saveIncludeScalebar && hasPhysicalScale}
+              onChange={(e) => setSaveIncludeScalebar(e.target.checked)}
+              disabled={!hasPhysicalScale}
+              className="accent-[var(--accent)]"
+            />
+            <span className={!hasPhysicalScale ? 'text-white/40' : ''}>
+              保存画像にスケールバーを入れる（中心深度換算）
+            </span>
+          </label>
+          {!hasPhysicalScale && (
+            <div className="text-[10px] leading-relaxed text-amber-300">
+              物理サイズ情報がないためスケールバーを入れられません
+            </div>
+          )}
 
           {/* Channel picker. Untouched, it follows the channels currently shown. */}
           <div className="space-y-0.5">
@@ -1055,11 +1530,28 @@ export function Volume3DViewer() {
 
           <button
             onClick={() => handleSave(false)}
-            disabled={saving || !!conflict}
+            disabled={saving || !!conflict || !canSaveVolume}
+            title={canSaveVolume
+              ? '現在の3D表示を保存'
+              : '現在の画像・T・Qualityの3D読込が完了するまで保存できません'}
             className="w-full px-2 py-1 rounded bg-[var(--accent)] text-white text-xs hover:opacity-90 disabled:opacity-50 transition"
           >
-            {saving ? '保存中…' : '名前を付けて保存'}
+            {saving ? '保存中…' : canSaveVolume ? '名前を付けて保存' : '3D読込完了後に保存できます'}
           </button>
+          {saveProgress && (
+            <div className="space-y-0.5" aria-live="polite">
+              <div className="flex justify-between text-[10px] text-white/60">
+                <span>{saveProgress.label}</span>
+                <span className="font-mono tabular-nums">{saveProgress.percent}%</span>
+              </div>
+              <progress
+                value={saveProgress.percent}
+                max={100}
+                aria-label={`保存進捗 ${saveProgress.percent}%`}
+                className="h-1.5 w-full accent-[var(--accent)]"
+              />
+            </div>
+          )}
           {saveDir && (
             <button
               onClick={() => setSaveDir('')}
@@ -1077,31 +1569,26 @@ export function Volume3DViewer() {
           <div className="text-[10px] text-white/40 text-center">{volInfo}</div>
         )}
 
-        {/* Reset Camera */}
+        {/* Reset every per-file display choice, including the 3D camera/slab. */}
         <button
-          onClick={resetCamera}
-          className="mt-1 px-2 py-1 rounded bg-[var(--accent)] text-white text-xs hover:opacity-90 transition"
+          onClick={resetToSource}
+          disabled={resetting || !activeImageId || !sourceViewDefaults[activeImageId]}
+          className="mt-1 px-2 py-1 rounded bg-[var(--accent)] text-white text-xs hover:opacity-90 disabled:opacity-40 transition"
         >
-          Reset View
+          {resetting ? '戻しています…' : '元ファイルの設定に全て戻す'}
         </button>
       </div>
 
       {/* Info overlay */}
       <div className="absolute top-2 left-2 text-xs font-mono text-white/60 bg-black/40 px-2 py-1 rounded pointer-events-none">
         {metadata.filename} | 3D Volume | {metadata.width}&times;{metadata.height}&times;{metadata.num_z}
-        {metadata.pixel_size_z > 0 && ` | Z step: ${metadata.pixel_size_z.toFixed(2)} um`}
+        {metadata.pixel_size_z > 0 && ` | Z step: ${metadata.pixel_size_z.toFixed(2)} µm`}
       </div>
 
       {/* Help */}
-      <div className="absolute bottom-2 left-2 text-[10px] text-white/40 pointer-events-none">
-        Drag: rotate | Scroll: zoom | Double-click: reset
+      <div className="absolute bottom-2 right-[240px] text-[10px] text-white/40 pointer-events-none">
+        Drag: rotate | Scroll: zoom
       </div>
-
-      {/* Scale bar (burned into saved images by captureFrame at the same spot).
-          No geometry: the volume render fills the canvas, so the canvas is the
-          image here. Rendered after the readouts so a bar dragged into a corner
-          stays visible and grabbable instead of disappearing under them. */}
-      <ScalebarOverlay metrics={scalebar} pad={14} />
 
       {conflict && (
         <OverwriteConfirm
