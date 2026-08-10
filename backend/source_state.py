@@ -54,6 +54,17 @@ if os.name == "nt":
     _FSCTL_READ_FILE_USN_DATA = 0x000900EB
     _INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
 
+    # Errors that mean "this filesystem has no per-file USN", as opposed to
+    # "this read failed". exFAT and FAT have no change journal at all, so the
+    # FSCTL is rejected by the driver rather than failing on the file. Anything
+    # outside this set is a real I/O problem and still fails closed.
+    _USN_UNSUPPORTED_ERRORS = frozenset({
+        1,     # ERROR_INVALID_FUNCTION — the usual answer from exFAT/FAT
+        50,    # ERROR_NOT_SUPPORTED
+        87,    # ERROR_INVALID_PARAMETER — some third-party drivers
+        1179,  # ERROR_JOURNAL_NOT_ACTIVE
+    })
+
 
 @dataclass(frozen=True)
 class SourceState:
@@ -181,6 +192,66 @@ def _selftest_windows_usn_parser() -> None:
             raise AssertionError("invalid Windows USN record was accepted")
 
 
+def _revision_fields(usn: str | None) -> dict[str, str | bool]:
+    """The revision fields that record how this file's change is detected.
+
+    Split out so the selftest exercises the same code the snapshot uses, rather
+    than a hand-built copy of it: a test that assembles its own dicts cannot
+    notice this rule changing.
+    """
+    if usn is None:
+        # A distinct key rather than an empty "usn": a stat-only revision must
+        # never digest to the same token as a USN-backed one, and the record
+        # should say which guarantee it carries. Present only on filesystems
+        # without a journal, so NTFS revisions recorded by earlier versions
+        # still compare equal and are not invalidated.
+        return {"usn_unavailable": True}
+    return {"usn": usn}
+
+
+def _selftest_usn_fallback() -> None:
+    """Pin the exFAT fallback: it must engage, stay distinct, and not invalidate.
+
+    Runs on every platform, because what is checked is how the revision record
+    is built rather than a Win32 call. Three properties have to hold at once,
+    and the third is the one easy to break by accident: a filesystem without a
+    journal must still produce a token, that token must never equal a USN-backed
+    one for the same bytes, and an NTFS record must digest exactly as it did
+    before the fallback existed — otherwise upgrading would report every source
+    on every NTFS drive as changed.
+    """
+    stat_part = {
+        "name": "Stitch_B02_G001.oir", "dev": 3, "ino": 0, "mode": 33206,
+        "nlink": 1, "size": 4096, "mtime_ns": 1_700_000_000_000_000_000,
+        "ctime_ns": 1_600_000_000_000_000_000,
+    }
+    # Both records come from the production helper, so a change to its rule is
+    # caught here instead of passing because the test rebuilt the old shape.
+    journalled = {**stat_part, **_revision_fields("v2:12345")}
+    fallback = {**stat_part, **_revision_fields(None)}
+
+    if _digest("source-rev:v2", [journalled]) == _digest("source-rev:v2", [fallback]):
+        raise AssertionError("stat-only revision collided with a USN-backed one")
+    # Byte-for-byte the record an NTFS host produced before the fallback existed.
+    legacy = dict(stat_part); legacy["usn"] = "v2:12345"
+    if _digest("source-rev:v2", [journalled]) != _digest("source-rev:v2", [legacy]):
+        raise AssertionError("USN-backed revision token changed shape")
+    if "usn" in fallback:
+        raise AssertionError("stat-only revision still claims a USN")
+    # It also has to say that it is stat-only. Recording nothing would leave the
+    # record indistinguishable from a plain POSIX one, so a stored revision could
+    # no longer tell anyone which guarantee produced it.
+    if not _revision_fields(None):
+        raise AssertionError("stat-only revision does not record how it was taken")
+    # A stat-only revision must still notice everything stat can see.
+    for field, value in (("size", 4097), ("mtime_ns", 1), ("ino", 9), ("nlink", 2)):
+        if _digest("source-rev:v2", [fallback]) == _digest(
+                "source-rev:v2", [{**fallback, field: value}]):
+            raise AssertionError(f"stat-only revision ignored a change in {field}")
+    if os.name == "nt" and not _USN_UNSUPPORTED_ERRORS:
+        raise AssertionError("no error code maps to a journal-less filesystem")
+
+
 def _open_windows_source_handle(path: Path):
     """Open a read handle that refuses concurrent write/delete access."""
     if os.name != "nt":
@@ -228,15 +299,22 @@ def _selftest_windows_writer_exclusion(path: Path) -> None:
         _CLOSE_HANDLE(writer)
 
 
-def _windows_file_usn(handle, path: Path) -> str:
-    """Return the last NTFS/ReFS journal sequence number for one open file.
+def _windows_file_usn(handle, path: Path) -> str | None:
+    """The last NTFS/ReFS journal sequence number for one open file.
 
     Windows exposes creation time as ``st_ctime`` and FAT write time can be as
     coarse as two seconds.  A same-size in-place rewrite can therefore leave
     every portable ``stat`` field unchanged.  The per-file USN is advanced when
-    a write handle closes and closes that silent-wrong gap on supported local
-    filesystems.  Unsupported filesystems are rejected instead of falling back
-    to an ambiguous revision token.
+    a write handle closes and closes that silent-wrong gap.
+
+    Returns ``None`` when the filesystem has no per-file USN — exFAT and FAT have
+    no change journal, so the FSCTL is rejected by the driver.  This used to be a
+    hard refusal, which made an exFAT drive unusable for reading source images;
+    that matters because exFAT is the only filesystem a drive shared between
+    macOS and Windows can practically use, and refusing it blocked the ordinary
+    workflow to close a narrow gap.  The caller falls back to a stat-only
+    revision and marks it as such, so the weaker token can never be mistaken for
+    a USN-backed one.  A genuine read failure still raises.
     """
     if os.name != "nt":
         raise RuntimeError("Windows USN requested on a non-Windows host")
@@ -252,10 +330,12 @@ def _windows_file_usn(handle, path: Path) -> str:
         output, ctypes.sizeof(output), ctypes.byref(returned), None,
     ):
         error = ctypes.get_last_error()
+        if error in _USN_UNSUPPORTED_ERRORS:
+            return None
         raise OSError(
             error,
-            "このWindowsファイルシステムでは元画像の変更を確実に検出できません。"
-            "USN change journalが有効なNTFS/ReFSへ撮影データをコピーしてください。",
+            "元画像の変更履歴を読み取れませんでした。"
+            "ドライブの接続を確認してから、もう一度開いてください。",
             os.fspath(path),
         )
 
@@ -263,7 +343,7 @@ def _windows_file_usn(handle, path: Path) -> str:
     return _parse_windows_usn_record(raw, path)
 
 
-def _stat_record(path: Path, label: str) -> dict[str, int | str]:
+def _stat_record(path: Path, label: str) -> dict[str, int | str | bool]:
     if os.name == "nt":
         handle = _open_windows_source_handle(path)
         try:
@@ -289,7 +369,7 @@ def _stat_record(path: Path, label: str) -> dict[str, int | str]:
         after_usn = ""
     if not stat.S_ISREG(st.st_mode):
         raise OSError(f"Source is not a regular file: {path}")
-    record: dict[str, int | str] = {
+    record: dict[str, int | str | bool] = {
         "name": label,
         "dev": int(st.st_dev),
         "ino": int(st.st_ino),
@@ -300,7 +380,7 @@ def _stat_record(path: Path, label: str) -> dict[str, int | str]:
         "ctime_ns": int(st.st_ctime_ns),
     }
     if os.name == "nt":
-        record["usn"] = after_usn
+        record.update(_revision_fields(after_usn))
     return record
 
 

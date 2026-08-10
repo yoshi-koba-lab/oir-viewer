@@ -27,6 +27,7 @@ from pathlib import Path
 import numpy as np
 
 from source_state import (
+    _selftest_usn_fallback,
     _selftest_windows_usn_parser,
     _selftest_windows_writer_exclusion,
     snapshot_source,
@@ -1291,6 +1292,7 @@ def _selftest_source_state() -> int:
 
     try:
         _selftest_windows_usn_parser()
+        _selftest_usn_fallback()
         with tempfile.TemporaryDirectory() as tmp:
             left_dir, right_dir = Path(tmp, "left"), Path(tmp, "right")
             left_dir.mkdir()

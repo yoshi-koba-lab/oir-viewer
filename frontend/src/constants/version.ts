@@ -5,6 +5,31 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.5.8 — 2026-08-09 — exFAT source drives are usable again. Reading a source on
+//     Windows required NTFS/ReFS, because the per-file revision came from
+//     FSCTL_READ_FILE_USN_DATA and the code refused to fall back rather than
+//     issue an ambiguous token. exFAT and FAT have no change journal at all, so
+//     the FSCTL is rejected by the driver and every open failed — and exFAT is
+//     the only filesystem a drive shared between macOS and Windows can
+//     practically use, so this blocked the ordinary workflow to close a narrow
+//     gap.
+//     A journal-less filesystem now yields a stat-only revision (size, mtime,
+//     ctime, inode, nlink, compared twice) marked with `usn_unavailable`, so the
+//     weaker token can never digest equal to a USN-backed one and a stored
+//     revision still says which method produced it. NTFS records are byte-for-
+//     byte unchanged, which matters: altering their shape would have reported
+//     every source on every NTFS drive as changed after the upgrade.
+//     Only "this filesystem has no journal" falls back (ERROR_INVALID_FUNCTION,
+//     NOT_SUPPORTED, INVALID_PARAMETER, JOURNAL_NOT_ACTIVE). A disconnected
+//     drive or an I/O error still fails closed, which is the case that matters
+//     here — the drive holding this data has dropped mid-read repeatedly.
+//     What is genuinely weaker: a same-size in-place rewrite landing inside the
+//     filesystem's timestamp granularity is undetectable. NTFS closed that; the
+//     alternative was refusing to open the file at all.
+//     The selftest exercises the production helper rather than a rebuilt copy of
+//     its output, and was verified by reintroducing four plausible regressions —
+//     an empty `usn`, a faked one, a reshaped NTFS token, and recording nothing
+//     — each of which it catches.
 //   1.5.7 — 2026-08-10 — A fresh 3D view now starts at 0 degrees elevation
 //     instead of 20 degrees. Previously saved per-file camera angles are kept.
 //     Plate Save now defaults both volume and PDF image resolution to Max, and
@@ -675,4 +700,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.5.7';
+export const VERSION = '1.5.8';
