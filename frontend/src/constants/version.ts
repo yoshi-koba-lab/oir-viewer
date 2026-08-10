@@ -5,6 +5,27 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.5.9 — 2026-08-09 — Conditions move out of the image. The columns marked 図
+//     were printed inside each cell in stroked white, over the sample: it hid
+//     whatever was beneath it, and nothing distinguished an annotation from
+//     signal. They now sit in their own band above each image, plain black on
+//     the page, so no pixel from the microscope has text on it.
+//     One slash-separated line — `B02 / DMSO / 0 h` — rather than one line per
+//     column, because the band costs height the images would otherwise get.
+//     Wrapped only when it does not fit and capped at two lines: the first
+//     attempt sized a uniform band from the longest label on the plate, and one
+//     verbose condition turned the whole page into whitespace. Beyond two lines
+//     the tail is marked with an ellipsis; the conditions page always carries
+//     the full value.
+//     The row's separation is spent above the band and only a hairline below it,
+//     so a label reads as belonging to the image under it rather than as a
+//     footer for the row above — with equal gaps it read as the latter.
+//     Two defects were found by rendering it and looking, not by testing: the
+//     band inflated as described, and Japanese wrapped one character per line
+//     because a missing-separator search added 2 to rfind's -1 and so always
+//     "found" a break at position 1.
+//     Empty cells keep their well ID and state inside, since there is no image
+//     there to obscure.
 //   1.5.8 — 2026-08-09 — exFAT source drives are usable again. Reading a source on
 //     Windows required NTFS/ReFS, because the per-file revision came from
 //     FSCTL_READ_FILE_USN_DATA and the code refused to fall back rather than
@@ -700,4 +721,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.5.8';
+export const VERSION = '1.5.9';

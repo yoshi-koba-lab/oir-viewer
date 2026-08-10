@@ -597,6 +597,11 @@ PDF_CELL_CHOICES = {"draft": 300, "normal": 600, "high": 1200, "max": 2000}
 #: Page furniture, as a fraction of the cell so every choice stays proportionate.
 _PAD_F, _LABEL_F, _TITLE_F, _MARGIN_F = 0.04, 0.09, 0.16, 0.10
 
+#: Lines a cell's label may occupy above its image. The band is uniform across
+#: the plate so the columns line up, which means one long label would otherwise
+#: set the height for every row and squeeze out the images.
+_CAPTION_MAX_LINES = 2
+
 #: What an empty cell says, by the state the caller reports for that well. These
 #: are printed on a figure, so they have to be true: "Not acquired" over a well
 #: the microscope did image would misdescribe the experiment to anyone reading it.
@@ -973,7 +978,91 @@ def compose_pdf(
     cell_box = f_cell.getbbox("Ag")
     footer_line_h = max(label_h, cell_box[3] - cell_box[1] + 2)
     axis_label_h = 0 if hide_empty_wells else label_h
-    grid_bottom = margin + title_h + axis_label_h + layout_rows * (cell_px + pad)
+
+    # Conditions belong beside the data, not on top of it. Printing them inside
+    # the cell put text over the sample — it obscured whatever was under it, and
+    # a reader could not tell an annotation from signal. They now occupy their own
+    # band above each image, in black on the page, so nothing is drawn over a
+    # pixel that came from the microscope.
+    caption_line_h = max(label_h, cell_box[3] - cell_box[1] + 2)
+    caption_width = cell_px - 2
+
+    def caption_lines_for(frame: WellFrame) -> list[str]:
+        """This cell's label, as at most two lines fitted to the cell width.
+
+        One slash-separated line, wrapped only if it does not fit, and capped:
+        a label long enough to need a third line is not a figure label, and
+        letting it grow the band steals the height from every image on the page
+        — the first attempt at this turned a plate into mostly whitespace. The
+        full value is always on the conditions page, so the tail is marked with
+        an ellipsis rather than silently dropped.
+        """
+        parts = [normalize_text(line) for line in frame.caption]
+        parts = [part for part in parts if part]
+        if frame.well_id not in parts:
+            parts.insert(0, frame.well_id)
+        text = " / ".join(parts)
+
+        def width(value: str) -> float:
+            return probe.textlength(value, font=f_cell)
+
+        if width(text) <= caption_width:
+            return [text]
+
+        # Break after a separator when there is one. Japanese has no spaces, so
+        # a missing separator must fall through to a character break — an earlier
+        # version added 2 to rfind's -1 and "found" a break at position 1, which
+        # printed one character per line.
+        def break_at(value: str) -> int:
+            for marker, offset in (("/ ", 2), (" ", 1), ("、", 1), (",", 1)):
+                found = value.rfind(marker)
+                if found > 0:
+                    return found + offset
+            return 0
+
+        lines: list[str] = []
+        current = ""
+        for char in text:
+            candidate = current + char
+            if current and width(candidate) > caption_width:
+                cut = break_at(current)
+                if cut > 0:
+                    lines.append(current[:cut].rstrip())
+                    current = current[cut:].lstrip() + char
+                else:
+                    lines.append(current)
+                    current = char
+                if len(lines) == _CAPTION_MAX_LINES - 1:
+                    break
+            else:
+                current = candidate
+        remainder = text[sum(len(line) for line in lines):].lstrip() if lines else text
+        # Whatever is left goes on the final line, shortened until it fits.
+        while remainder and width(remainder + "…") > caption_width:
+            remainder = remainder[:-1]
+        tail = text[sum(len(line) for line in lines):].lstrip() if lines else text
+        lines.append(remainder + "…" if remainder != tail else tail)
+        return [line for line in lines if line] or [frame.well_id]
+
+    # One uniform band, not a per-row height: a plate is read as a grid, and rows
+    # of different heights stop the columns lining up.
+    cell_captions = {}
+    caption_rows = 0
+    for index, frame in enumerate(ordered_frames):
+        key = ((index // layout_cols, index % layout_cols) if hide_empty_wells
+               else (frame.row, frame.col))
+        drawn = caption_lines_for(frame)
+        cell_captions[key] = drawn
+        caption_rows = max(caption_rows, len(drawn))
+    # Bind the label to the image it describes by spacing, not by proximity
+    # alone: an equal gap above and below made it read as a footer for the cell
+    # in the row above. The row's whole separation is spent above the band, and
+    # only a hairline is left between the band and its own image.
+    caption_gap = max(2, pad // 4) if caption_rows else 0
+    caption_h = caption_rows * caption_line_h + caption_gap
+    row_pitch = pad + caption_h + cell_px
+
+    grid_bottom = margin + title_h + axis_label_h + layout_rows * row_pitch
     footer_gap = max(3, margin // 3)
     footer_top = grid_bottom + footer_gap
     page_h = (footer_top + len(footer_lines) * footer_line_h + footer_gap
@@ -992,7 +1081,7 @@ def compose_pdf(
             draw.text((x + cell_px // 2, grid_y - label_h), f"{c + 1:02d}",
                       fill="black", font=f_label, anchor="mb")
         for r in range(rows):
-            y = grid_y + r * (cell_px + pad)
+            y = grid_y + r * row_pitch + pad + caption_h
             draw.text((grid_x - pad, y + cell_px // 2), chr(65 + r),
                       fill="black", font=f_label, anchor="rm")
 
@@ -1003,30 +1092,31 @@ def compose_pdf(
     )
     for r in range(layout_rows):
         for c in range(layout_cols):
-            x, y = grid_x + c * (cell_px + pad), grid_y + r * (cell_px + pad)
+            x = grid_x + c * (cell_px + pad)
+            band_y = grid_y + r * row_pitch + pad
+            y = band_y + caption_h
             box = (x, y, x + cell_px, y + cell_px)
             f = placed.get((r, c))
             if f is not None:
+                # The label band, above the image and outside it. Plain black on
+                # white: there is no signal behind it, so the stroked white text
+                # this replaced has nothing left to survive against.
+                ty = band_y
+                for line in cell_captions.get((r, c), []):
+                    bounds = draw.textbbox((x, ty), line, font=f_cell, anchor="lt")
+                    if bounds[2] > x + cell_px + 1 or bounds[3] > y + 1:
+                        raise ValueError(
+                            f"{f.well_id}: 条件表の文字が画像の外枠に収まりません。"
+                            "PDF は作成していません。"
+                        )
+                    draw.text((x, ty), line, fill="black", font=f_cell, anchor="lt")
+                    ty += caption_line_h
                 page.paste(Image.new("RGB", (cell_px, cell_px), "black"), (x, y))
                 import io
                 im = Image.open(io.BytesIO(f.png)).convert("RGB")
                 im.thumbnail((cell_px, cell_px), Image.LANCZOS)   # never stretched
                 page.paste(im, (x + (cell_px - im.width) // 2, y + (cell_px - im.height) // 2))
                 draw.rectangle(box, outline="black", width=1)
-                # Over the image, not beside it, so a cell stays one square and
-                # the plate keeps its shape. Stroked rather than shadowed: a
-                # blurred glow around light text on bright signal is a smear,
-                # which is what made the scale bar unreadable on dark colours.
-                lines = list(f.caption)
-                if hide_empty_wells:
-                    lines = [f.well_id, *(line for line in lines if line != f.well_id)]
-                if not lines:
-                    lines = [f.well_id]
-                ty = y + pad
-                for line in lines:
-                    draw.text((x + pad, ty), normalize_text(line), fill="white", font=f_cell,
-                              stroke_width=max(1, cell_px // 300), stroke_fill="black")
-                    ty += int(label_h * 0.85)
             else:
                 if hide_empty_wells:
                     continue
