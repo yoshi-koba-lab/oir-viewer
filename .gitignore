@@ -25,15 +25,3 @@ src-tauri/target/
 
 # macOS
 .DS_Store
-
-# Agent handoff notes and local working folders — local only.
-#
-# HANDOFF.md names the real experiment folders, external drive paths and the
-# researcher's own work; it was published here by mistake and must not return.
-# AGENTS.md / CLAUDE.md are instructions to the agents, not part of the product.
-# `non-sharable/` is the holding area for anything else in that category, and
-# `sharable/` is tracked but kept empty of anything personal.
-AGENTS.md
-CLAUDE.md
-HANDOFF.md
-non-sharable/
