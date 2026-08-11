@@ -72,9 +72,19 @@ export function ChannelPanel() {
           <button
             onClick={resetToSource}
             disabled={resetting || !activeImageId || !sourceViewDefaults[activeImageId]}
+            aria-busy={resetting}
             className="w-full text-xs px-2 py-1.5 rounded bg-[var(--border)] text-[var(--text-primary)] hover:bg-[var(--accent)] hover:text-white disabled:opacity-40 disabled:hover:bg-[var(--border)] transition"
           >
-            {resetting ? '戻しています…' : '元ファイルの設定に全て戻す'}
+            {resetting ? (
+              <span className="flex w-full flex-col items-center gap-1">
+                <span>戻しています…</span>
+                <progress
+                  max={100}
+                  aria-label="2D表示設定のリセット待ち"
+                  className="h-1 w-full accent-[var(--accent)]"
+                />
+              </span>
+            ) : '元ファイルの設定に全て戻す'}
           </button>
         </div>
       )}

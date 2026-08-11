@@ -822,7 +822,7 @@ export function PlateSaveDialog({
                       開いているウェルをプレート順に詰めて並べます（元の空位置は保持しません）
                     </span>
                   </div>
-                  <label className="text-[10px] text-[var(--text-secondary)] flex-1 min-w-[15rem]">
+                  <label className="text-[10px] text-[var(--text-primary)] flex-1 min-w-[15rem]">
                     PDF の保存先
                     <div className="flex gap-1 mt-1">
                       <input
@@ -835,22 +835,25 @@ export function PlateSaveDialog({
                         onBlur={() => { void probePdfTarget(); }}
                         disabled={exporting}
                         placeholder="保存先フォルダ"
-                        className="min-w-0 flex-1 bg-[var(--bg-primary)] border border-[var(--border)]
+                        className="min-w-0 flex-1 bg-white/10 border border-[var(--text-secondary)]/60
                                    rounded px-2 py-1 text-xs text-[var(--text-primary)]
-                                   placeholder:text-[var(--text-secondary)]"
+                                   placeholder:text-[var(--text-primary)] placeholder:opacity-70
+                                   focus:outline-none focus:border-[var(--accent)]
+                                   disabled:opacity-40 disabled:cursor-not-allowed"
                       />
                       <button
                         type="button"
                         onClick={browsePdfOutput}
                         disabled={exporting || pdfBrowsing}
-                        className="px-2 py-1 rounded bg-[var(--border)] text-[10px]
-                                   text-[var(--text-secondary)] hover:text-white disabled:opacity-40"
+                        className="px-2 py-1 rounded bg-white/10 border border-[var(--text-secondary)]/60
+                                   text-[10px] text-[var(--text-primary)] hover:bg-white/15
+                                   disabled:opacity-40 disabled:cursor-not-allowed"
                       >
                         {pdfBrowsing ? '…' : '選択'}
                       </button>
                     </div>
                   </label>
-                  <label className="text-[10px] text-[var(--text-secondary)] flex-1 min-w-[12rem]">
+                  <label className="text-[10px] text-[var(--text-primary)] flex-1 min-w-[12rem]">
                     ファイル名（省略時はプレート名＋日時）
                     <input
                       type="text"
@@ -862,9 +865,11 @@ export function PlateSaveDialog({
                       onBlur={() => { void probePdfTarget(); }}
                       disabled={exporting}
                       placeholder={plate.name}
-                      className="block w-full mt-1 bg-[var(--bg-primary)] border border-[var(--border)]
+                      className="block w-full mt-1 bg-white/10 border border-[var(--text-secondary)]/60
                                  rounded px-2 py-1 text-xs text-[var(--text-primary)]
-                                 placeholder:text-[var(--text-secondary)]"
+                                 placeholder:text-[var(--text-primary)] placeholder:opacity-70
+                                 focus:outline-none focus:border-[var(--accent)]
+                                 disabled:opacity-40 disabled:cursor-not-allowed"
                     />
                   </label>
                   <button

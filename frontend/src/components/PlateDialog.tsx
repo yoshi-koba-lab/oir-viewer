@@ -1,10 +1,10 @@
 import { useState } from 'react';
 import { chooseFolder, scanPlate } from '../utils/api';
-import { openAndReload, showDefaultViewForActiveImage } from '../hooks/useImageLoader';
+import { openPathBatch, showDefaultViewForActiveImage } from '../hooks/useImageLoader';
 import { usePlateStore } from '../stores/plateStore';
 
 /**
- * Select and inspect an Olympus MATL acquisition, then open chosen wells.
+ * Select and inspect a MATL acquisition, then open chosen wells.
  *
  * This dialog deliberately stops before figure editing or export. Scanning the
  * manifest is cheap and opens no volume; the separate Plate Save dialog owns the
@@ -59,20 +59,24 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
     );
     if (targets.length === 0) return;
     setError('');
-    const failures: string[] = [];
-    let lastOpenedId: string | null = null;
-    for (const [index, well] of targets.entries()) {
-      setLoading(`${well.well_id} を読み込み中… (${index + 1}/${targets.length})`);
-      try {
-        const id = await openAndReload(well.stitch_path!, { showDefaultView: false });
-        if (id) lastOpenedId = id;
-      } catch (e) {
-        failures.push(`${well.well_id}: ${e instanceof Error ? e.message : e}`);
-      }
+    setLoading(`選択した ${targets.length} ウェルを読み込み中…`);
+    let result: Awaited<ReturnType<typeof openPathBatch>> | null = null;
+    try {
+      result = await openPathBatch(
+        targets.map((well) => well.stitch_path!),
+        targets.map((well) => well.well_id),
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading('');
     }
-    setLoading('');
+    if (!result) return;
+    const { lastOpenedId, failures } = result;
     if (lastOpenedId) showDefaultViewForActiveImage(lastOpenedId);
-    if (failures.length) setError(failures.join('\n'));
+    if (failures.length) {
+      setError(failures.map(({ label, message }) => `${label}: ${message}`).join('\n'));
+    }
     else onClose();
   };
 

@@ -24,7 +24,7 @@ import {
 import {
   defaultViewMode, rememberableViewMode, rememberedOrDefaultViewMode,
 } from '../utils/imageViewMode';
-import { threeDSaveIsBusy } from '../stores/operationStore';
+import { threeDSaveIsBusy, useOperationStore } from '../stores/operationStore';
 
 /** Human-readable message for a failed load, for the error toast. */
 function describeError(e: unknown, what: string): string {
@@ -88,6 +88,92 @@ export async function runImageOperation<T>(
 export const imageOperationIsBusy = (): boolean => (
   imageOperationRunning || imageOperationPending > 0
 );
+
+/**
+ * Whole-image progress is a count of completed, verifiable milestones. The
+ * backend currently returns Open/activate/upload as one opaque response, so we
+ * deliberately do not interpolate by elapsed time while that response is
+ * pending. A large OIR can therefore remain at one value for a while, but every
+ * displayed percentage names work that has actually completed.
+ */
+export const IMAGE_LOAD_MILESTONES_PER_ITEM = 6;
+
+interface ImageLoadRun {
+  token: number;
+  totalItems: number;
+}
+
+interface ImageLoadItemProgress {
+  run: ImageLoadRun;
+  itemIndex: number;
+  itemLabel: string;
+  /** Verified units completed before this item began. */
+  baseCompletedUnits: number;
+  completedMilestone: ImageLoadMilestone;
+}
+
+type ImageLoadMilestone = 0 | 1 | 2 | 3 | 4 | 5 | 6;
+
+function progressLabel(
+  itemLabel: string,
+  itemIndex: number,
+  totalItems: number,
+  detail: string,
+): string {
+  const batch = totalItems > 1 ? ` (${itemIndex + 1}/${totalItems})` : '';
+  return `${itemLabel}${batch}: ${detail}`;
+}
+
+function beginImageLoadRun(totalItems: number, itemLabel: string): ImageLoadRun | null {
+  const count = Math.max(1, Math.trunc(totalItems));
+  const token = useOperationStore.getState().beginImageLoad({
+    totalUnits: count * IMAGE_LOAD_MILESTONES_PER_ITEM,
+    totalItems: count,
+    label: progressLabel(itemLabel, 0, count, '画像ソースからの応答を待っています…'),
+  });
+  return token === null ? null : { token, totalItems: count };
+}
+
+function itemProgress(
+  run: ImageLoadRun | null,
+  itemIndex: number,
+  itemLabel: string,
+  baseCompletedUnits = itemIndex * IMAGE_LOAD_MILESTONES_PER_ITEM,
+): ImageLoadItemProgress | undefined {
+  if (!run) return undefined;
+  return {
+    run,
+    itemIndex,
+    itemLabel,
+    baseCompletedUnits,
+    completedMilestone: 0,
+  };
+}
+
+function reportImageLoadMilestone(
+  progress: ImageLoadItemProgress | undefined,
+  milestone: ImageLoadMilestone,
+  detail: string,
+): void {
+  if (!progress) return;
+  if (milestone < progress.completedMilestone) return;
+  progress.completedMilestone = milestone;
+  const {
+    run, itemIndex, itemLabel, baseCompletedUnits,
+  } = progress;
+  useOperationStore.getState().updateImageLoad(run.token, {
+    completedUnits: baseCompletedUnits + milestone,
+    itemIndex,
+    label: progressLabel(itemLabel, itemIndex, run.totalItems, detail),
+  });
+}
+
+function finishImageLoadRun(run: ImageLoadRun | null): void {
+  if (run) useOperationStore.getState().finishImageLoad(run.token);
+}
+
+/** Give React one task boundary in which to paint the verified 100% state. */
+const nextProgressPaint = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
 /**
  * Image ids whose persisted settings have already been applied this session.
@@ -350,6 +436,7 @@ async function prepareImageLoad(
   id: string,
   metadata: ImageMetadata,
   sessionState?: ImageViewState,
+  progress?: ImageLoadItemProgress,
 ): Promise<PreparedImageLoad> {
   const settingsTask = sessionState
     ? Promise.resolve<PersistedSettingsLoad>({ settings: null, error: null })
@@ -359,6 +446,7 @@ async function prepareImageLoad(
     settingsTask,
   ]);
   assertResponseGeometry(metadata, sourceResponse, 'Source baseline');
+  reportImageLoadMilestone(progress, 3, '基準面 Z1 / T1 の画素を確認しました');
 
   const persistedSettings = sessionState ? null : loaded.settings;
   const view = resolvedPreparedView(metadata, sessionState, persistedSettings);
@@ -379,6 +467,13 @@ async function prepareImageLoad(
         id,
       });
   assertResponseGeometry(metadata, targetResponse, 'Restored view');
+  reportImageLoadMilestone(
+    progress,
+    4,
+    usesSourcePixels
+      ? '初期表示が基準面と一致することを確認しました'
+      : '保存済み表示に対応する画素を確認しました',
+  );
   return {
     sourceResponse,
     targetResponse,
@@ -448,9 +543,12 @@ export async function reloadActiveChannelData(id?: string): Promise<boolean> {
 }
 
 /** Switch to a different image by ID. */
-async function switchToImageNow(id: string) {
+async function switchToImageNow(
+  id: string,
+  progress?: ImageLoadItemProgress,
+): Promise<boolean> {
   const store = useImageStore.getState();
-  if (id === store.activeImageId) return;
+  if (id === store.activeImageId) return false;
 
   const outgoing = captureOutgoingSource();
   const previousImageId = store.activeImageId;
@@ -469,21 +567,26 @@ async function switchToImageNow(id: string) {
 
     // Activate on server
     await activateImage(id);
-    if (token !== switchToken) return;
+    if (token !== switchToken) return false;
+    reportImageLoadMilestone(progress, 1, '画像ソースを有効化しました');
 
     // Load metadata
     const m = await fetchMetadata(id);
-    if (token !== switchToken) return;
+    if (token !== switchToken) return false;
+    reportImageLoadMilestone(progress, 2, '画像情報を確認しました');
     const saved = useImageStore.getState().imageViewStates[id];
-    const prepared = await prepareImageLoad(id, m, saved);
-    if (token !== switchToken) return;
+    const prepared = await prepareImageLoad(id, m, saved, progress);
+    if (token !== switchToken) return false;
     saveOutgoingIfStillCurrent(outgoing);
     presentPreparedImage(id, m, prepared);
+    reportImageLoadMilestone(progress, 5, '画素と表示設定を一度に反映しました');
 
     // Refresh list
     await refreshImageList();
-    if (token !== switchToken) return;
+    if (token !== switchToken) return false;
     showRememberedOrDefaultView(id, m.num_z);
+    reportImageLoadMilestone(progress, 6, 'タブ情報との同期が完了しました');
+    return true;
   } catch (e) {
     if (token === switchToken) {
       if (useImageStore.getState().activeImageId === previousImageId) {
@@ -492,6 +595,7 @@ async function switchToImageNow(id: string) {
       }
       store.setLoadError(describeError(e, 'Failed to open image'));
     }
+    return false;
   } finally {
     if (token === switchToken) store.setLoading(false);
   }
@@ -499,7 +603,18 @@ async function switchToImageNow(id: string) {
 
 export function switchToImage(id: string): Promise<void> {
   if (threeDSaveIsBusy()) return Promise.resolve();
-  return runImageOperation(() => switchToImageNow(id), undefined);
+  if (id === useImageStore.getState().activeImageId) return Promise.resolve();
+  return runImageOperation(async () => {
+    const item = useImageStore.getState().imageList.find((image) => image.id === id);
+    const label = item?.filename ?? '画像';
+    const run = beginImageLoadRun(1, label);
+    try {
+      const completed = await switchToImageNow(id, itemProgress(run, 0, label));
+      if (completed && run) await nextProgressPaint();
+    } finally {
+      finishImageLoadRun(run);
+    }
+  }, undefined);
 }
 
 /** Close an image by ID. */
@@ -576,6 +691,7 @@ export function closeImageById(id: string): Promise<void> {
 async function openAndReloadNow(
   path: string,
   options: { showDefaultView?: boolean } = {},
+  progress?: ImageLoadItemProgress,
 ): Promise<string | null> {
   const store = useImageStore.getState();
   const outgoing = captureOutgoingSource();
@@ -595,6 +711,8 @@ async function openAndReloadNow(
   try {
     const m = await openFile(path);
     if (token !== switchToken) return null;
+    reportImageLoadMilestone(progress, 1, '画像ソースを開きました');
+    reportImageLoadMilestone(progress, 2, '画像情報を確認しました');
     const id = m.id!;
 
     if (m.reused) {
@@ -610,10 +728,14 @@ async function openAndReloadNow(
     if (m.reused && id === previousImageId) {
       // The source, pixels and controls are already the authoritative live view.
       // In particular, do not let durable settings overwrite newer unsaved edits.
+      reportImageLoadMilestone(progress, 3, '表示中の基準画素を確認しました');
+      reportImageLoadMilestone(progress, 4, '表示中の対象面を確認しました');
       saveOutgoingIfStillCurrent(outgoing);
+      reportImageLoadMilestone(progress, 5, '現在の表示をそのまま使用しました');
       await refreshImageList();
       if (token !== switchToken) return null;
       if (!keptLiveMode) useViewStore.getState().setViewMode(previousViewMode);
+      reportImageLoadMilestone(progress, 6, 'タブ情報との同期が完了しました');
       return id;
     }
 
@@ -623,16 +745,18 @@ async function openAndReloadNow(
     if (m.reused && appliedSettings.has(id) && !sessionState) {
       throw new Error('既存タブの表示状態が見つからないため、安全に再表示できません');
     }
-    const prepared = await prepareImageLoad(id, m, sessionState);
+    const prepared = await prepareImageLoad(id, m, sessionState, progress);
     if (token !== switchToken) return null;
     saveOutgoingIfStillCurrent(outgoing);
     presentPreparedImage(id, m, prepared);
+    reportImageLoadMilestone(progress, 5, '画素と表示設定を一度に反映しました');
     await refreshImageList();
     if (token !== switchToken) return null;
     if (options.showDefaultView !== false) {
       if (m.reused) showRememberedOrDefaultView(id, m.num_z);
       else applyDefaultViewForActiveImage(id);
     }
+    reportImageLoadMilestone(progress, 6, 'タブ情報との同期が完了しました');
     return id;
   } catch (e) {
     if (token === switchToken) {
@@ -653,13 +777,24 @@ export function openAndReload(
   options: { showDefaultView?: boolean } = {},
 ): Promise<string | null> {
   if (threeDSaveIsBusy()) return Promise.resolve(null);
-  return runImageOperation(() => openAndReloadNow(path, options), null);
+  return runImageOperation(async () => {
+    const label = basename(path);
+    const run = beginImageLoadRun(1, label);
+    try {
+      const id = await openAndReloadNow(path, options, itemProgress(run, 0, label));
+      if (id && run) await nextProgressPaint();
+      return id;
+    } finally {
+      finishImageLoadRun(run);
+    }
+  }, null);
 }
 
 /** Upload a File object, add to image list. */
 async function uploadAndReloadNow(
   file: File,
   options: { showDefaultView?: boolean } = {},
+  progress?: ImageLoadItemProgress,
 ): Promise<string | null> {
   const store = useImageStore.getState();
   const outgoing = captureOutgoingSource();
@@ -674,14 +809,18 @@ async function uploadAndReloadNow(
   try {
     const m = await uploadFile(file);
     if (token !== switchToken) return null;
+    reportImageLoadMilestone(progress, 1, 'アップロードと画像ソースの読込が完了しました');
+    reportImageLoadMilestone(progress, 2, '画像情報を確認しました');
     const id = m.id!;
-    const prepared = await prepareImageLoad(id, m);
+    const prepared = await prepareImageLoad(id, m, undefined, progress);
     if (token !== switchToken) return null;
     saveOutgoingIfStillCurrent(outgoing);
     presentPreparedImage(id, m, prepared);
+    reportImageLoadMilestone(progress, 5, '画素と表示設定を一度に反映しました');
     await refreshImageList();
     if (token !== switchToken) return null;
     if (options.showDefaultView !== false) applyDefaultViewForActiveImage(id);
+    reportImageLoadMilestone(progress, 6, 'タブ情報との同期が完了しました');
     return id;
   } catch (e) {
     if (token === switchToken) {
@@ -703,7 +842,95 @@ export function uploadAndReload(
   options: { showDefaultView?: boolean } = {},
 ): Promise<string | null> {
   if (threeDSaveIsBusy()) return Promise.resolve(null);
-  return runImageOperation(() => uploadAndReloadNow(file, options), null);
+  return runImageOperation(async () => {
+    const label = file.name || '画像';
+    const run = beginImageLoadRun(1, label);
+    try {
+      const id = await uploadAndReloadNow(file, options, itemProgress(run, 0, label));
+      if (id && run) await nextProgressPaint();
+      return id;
+    } finally {
+      finishImageLoadRun(run);
+    }
+  }, null);
+}
+
+export interface ImageLoadBatchFailure {
+  label: string;
+  message: string;
+}
+
+export interface ImageLoadBatchResult {
+  lastOpenedId: string | null;
+  failures: ImageLoadBatchFailure[];
+}
+
+async function runImageLoadBatch<T>(
+  items: readonly T[],
+  labelFor: (item: T, index: number) => string,
+  load: (item: T, progress: ImageLoadItemProgress | undefined) => Promise<string | null>,
+): Promise<ImageLoadBatchResult> {
+  const empty: ImageLoadBatchResult = { lastOpenedId: null, failures: [] };
+  if (items.length === 0 || threeDSaveIsBusy()) return empty;
+  return runImageOperation(async () => {
+    const firstLabel = labelFor(items[0], 0);
+    const run = beginImageLoadRun(items.length, firstLabel);
+    const failures: ImageLoadBatchFailure[] = [];
+    let lastOpenedId: string | null = null;
+    let verifiedUnits = 0;
+    try {
+      for (const [index, item] of items.entries()) {
+        const label = labelFor(item, index);
+        const progress = itemProgress(run, index, label, verifiedUnits);
+        reportImageLoadMilestone(progress, 0, '画像ソースからの応答を待っています…');
+        try {
+          const id = await load(item, progress);
+          // A token mismatch means this run was superseded. Do not start another
+          // multi-GB file merely to make the counter reach its denominator.
+          if (!id) break;
+          lastOpenedId = id;
+          verifiedUnits += progress?.completedMilestone
+            ?? IMAGE_LOAD_MILESTONES_PER_ITEM;
+        } catch (e) {
+          const message = e instanceof Error ? e.message : String(e);
+          failures.push({ label, message });
+          // Only milestones reached before the failure are carried forward.
+          // Unrun work must never make a later item jump toward 100%.
+          verifiedUnits += progress?.completedMilestone ?? 0;
+        }
+      }
+      if (failures.length === 0 && lastOpenedId && run) await nextProgressPaint();
+      if (failures.length > 0) {
+        useImageStore.getState().setLoadError(
+          failures.map(({ label, message }) => `${label}: ${message}`).join('\n'),
+        );
+      }
+      return { lastOpenedId, failures };
+    } finally {
+      finishImageLoadRun(run);
+    }
+  }, empty);
+}
+
+/** Open native-picker paths as one serialized, continuously reported batch. */
+export function openPathBatch(
+  paths: readonly string[],
+  labels?: readonly string[],
+): Promise<ImageLoadBatchResult> {
+  return runImageLoadBatch(
+    paths,
+    (path, index) => labels?.[index] || basename(path),
+    (path, progress) => openAndReloadNow(path, { showDefaultView: false }, progress),
+  );
+}
+
+/** Upload dropped files as one serialized, continuously reported batch. */
+export function uploadFileBatch(files: readonly File[]): Promise<ImageLoadBatchResult> {
+  return runImageLoadBatch(
+    files,
+    (file) => file.name || '画像',
+    (file, progress) => uploadAndReloadNow(file, { showDefaultView: false }, progress),
+  );
 }
 
 export function useImageLoader() {
@@ -739,26 +966,38 @@ export function useImageLoader() {
       const token = ++switchToken;
       operationToken = token;
       const store = useImageStore.getState();
+      let progressRun: ImageLoadRun | null = null;
+      let progressCompleted = false;
       store.setLoading(true);
       try {
         const list = await refreshImageList();
         if (token !== switchToken) return;
         const active = list.find(i => i.active);
         if (active) {
+          const label = active.filename || '前回の画像';
+          progressRun = beginImageLoadRun(1, label);
+          const progress = itemProgress(progressRun, 0, label);
+          reportImageLoadMilestone(progress, 1, '前回の画像ソースを確認しました');
           useViewStore.getState().setViewMode('2d');
           const m = await fetchMetadata(active.id);
           if (token !== switchToken) return;
+          reportImageLoadMilestone(progress, 2, '画像情報を確認しました');
           const saved = useImageStore.getState().imageViewStates[active.id];
-          const prepared = await prepareImageLoad(active.id, m, saved);
+          const prepared = await prepareImageLoad(active.id, m, saved, progress);
           if (token !== switchToken) return;
           presentPreparedImage(active.id, m, prepared);
+          reportImageLoadMilestone(progress, 5, '画素と表示設定を一度に反映しました');
           applyDefaultViewForActiveImage(active.id);
+          reportImageLoadMilestone(progress, 6, '前回の画像の復元が完了しました');
+          progressCompleted = true;
         }
       } catch (e) {
         if (token === switchToken) {
           store.setLoadError(describeError(e, 'Failed to restore the previous session'));
         }
       } finally {
+        if (progressCompleted && progressRun) await nextProgressPaint();
+        finishImageLoadRun(progressRun);
         if (token === switchToken) store.setLoading(false);
       }
     }, undefined);

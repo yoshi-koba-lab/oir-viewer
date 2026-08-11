@@ -1,4 +1,4 @@
-"""Read an Olympus MATL acquisition into a validated plate manifest.
+"""Read a MATL acquisition into a validated plate manifest.
 
 `matl.omp2info` is plain XML — no Bio-Formats needed. It describes the physical
 plate (`microPlate`) and one `group` per acquired well, each listing the per-tile
@@ -35,7 +35,7 @@ from source_state import (
 
 MATL_NAMES = ("matl.omp2info", "matl_forVSIimages.omp2info")
 
-#: Olympus stores stage geometry in nanometres.
+#: MATL stores stage geometry in nanometres.
 NM_PER_MM = 1_000_000.0
 
 
@@ -204,7 +204,7 @@ def scan(where: str) -> Plate:
         # UTF-8, not ASCII. Plate and sample names are routinely Japanese, and
         # "ascii", "replace" turns every one of those bytes into U+FFFD — so the
         # name is already destroyed before it reaches the PDF, whatever font is
-        # used to draw it. The BOM Olympus sometimes writes is handled too.
+        # used to draw it. A possible BOM is handled too.
         root = ET.fromstring(raw.decode("utf-8-sig", "replace"))
     except ET.ParseError as e:
         raise ValueError(f"matl の XML を解析できません: {e}") from e
@@ -364,7 +364,7 @@ def _resize_plane(plane: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
 def require_complete_split(reader_j, path: Path, actual_z: int) -> None:
     """Refuse a well whose split .oir is missing the chunks holding most of its Z.
 
-    Olympus splits a dataset over ~1 GB across `<name>.oir` plus extensionless
+    Large datasets can be split across `<name>.oir` plus extensionless
     `<name>_00001`, `_00002`, … siblings. Copy only the .oir and it still opens,
     still reports the full XY size, and exposes just the planes in the part that
     came with it — Z 13 of 50, in the case this was found on. reader.py catches

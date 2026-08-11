@@ -181,8 +181,8 @@ function waitForServer(port, timeoutMs = 60_000) {
  * Extensions the viewer can open. No leading dot: that is the shape Electron's
  * dialog filters take on every platform.
  *
- * The last filter matters as much as the first. Olympus splits a dataset over
- * ~1 GB into `<name>.oir` plus companions literally named `<name>_00001`,
+ * The last filter matters as much as the first. Large .oir datasets can be split
+ * into `<name>.oir` plus companions literally named `<name>_00001`,
  * `_00002` — no extension at all. A user who needs to see one of those (to
  * confirm it is there, or to pick a file in a folder full of them) cannot with
  * an extension filter applied, so "すべてのファイル" has to be reachable.

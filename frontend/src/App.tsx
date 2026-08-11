@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect } from 'react';
 import {
-  useImageLoader, uploadAndReload, openAndReload, showDefaultViewForActiveImage,
+  useImageLoader, uploadFileBatch, openPathBatch, showDefaultViewForActiveImage,
 } from './hooks/useImageLoader';
 import { useImageStore } from './stores/imageStore';
 import { threeDSaveIsBusy, useOperationStore } from './stores/operationStore';
@@ -29,6 +29,7 @@ function App() {
   const activeImageId = useImageStore((s) => s.activeImageId);
   const viewMode = useViewStore((s) => s.viewMode);
   const threeDSave = useOperationStore((s) => s.threeDSave);
+  const imageLoad = useOperationStore((s) => s.imageLoad);
   const [dragOver, setDragOver] = useState(false);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -53,19 +54,16 @@ function App() {
     const files = Array.from(e.dataTransfer.files);
     if (files.length === 0) return;
 
-    // uploadAndReload records the reason in the store, which LoadErrorToast
-    // renders and keeps on screen. Catching here only stops the rejection from
-    // going unhandled — a second local toast would just overlap the first.
-    let lastOpenedId: string | null = null;
-    for (const file of files) {
-      try {
-        const id = await uploadAndReload(file, { showDefaultView: false });
-        if (id) lastOpenedId = id;
-      } catch {
-        /* already reported */
-      }
+    // One batch owns one progress denominator. Restarting a 0–100 bar for each
+    // dropped file made the number move backwards and obscured partial failures.
+    try {
+      const { lastOpenedId } = await uploadFileBatch(files);
+      if (lastOpenedId) showDefaultViewForActiveImage(lastOpenedId);
+    } catch (e) {
+      useImageStore.getState().setLoadError(
+        e instanceof Error ? e.message : String(e),
+      );
     }
-    if (lastOpenedId) showDefaultViewForActiveImage(lastOpenedId);
   }, []);
 
   return (
@@ -113,9 +111,59 @@ function App() {
       <DimensionSliders />
 
       {/* Loading indicator */}
-      {loading && (
-        <div className="absolute top-12 left-1/2 -translate-x-1/2 bg-[var(--accent)] text-white text-xs px-3 py-1 rounded-full animate-pulse">
-          Loading...
+      {loading && !imageLoad && (
+        <div
+          className="pointer-events-none absolute left-1/2 top-12 z-[70] w-56 -translate-x-1/2 rounded-lg bg-neutral-950/95 px-3 py-2 text-white shadow-lg"
+          role="status"
+          aria-live="polite"
+          aria-label="画像データを読み込み中"
+        >
+          <div className="mb-1.5 text-center text-xs">画像データを読み込み中…</div>
+          <progress
+            max={100}
+            aria-label="画像データの読込待ち"
+            className="h-1.5 w-full accent-[var(--accent)]"
+          />
+        </div>
+      )}
+
+      {/* Whole-image Open/activate progress. This sits below the z-100 3D-save
+          lock and never competes with it; the operation queue prevents the two
+          from starting naturally at the same time. */}
+      {imageLoad && !threeDSave && (
+        <div
+          data-global-image-load-progress
+          className="pointer-events-none fixed left-1/2 top-14 z-[80] w-[min(32rem,calc(100vw-2rem))] -translate-x-1/2 rounded-lg border border-white/20 bg-neutral-950/95 px-4 py-3 text-white shadow-xl"
+          role="status"
+          aria-live="polite"
+          aria-label={imageLoad.completedUnits === 0
+            ? '2D表示を準備中 画像ソースの応答待ち'
+            : imageLoad.percent === 100
+              ? '2D表示の準備完了 100%'
+              : `2D表示を準備中 ${imageLoad.percent}%`}
+        >
+          <div className="mb-2 flex items-center justify-between gap-3 text-xs">
+            <span className="font-medium">
+              {imageLoad.percent === 100 ? '2D表示の準備完了' : '2D表示を準備中…'}
+            </span>
+            <span className="font-mono tabular-nums">
+              {imageLoad.completedUnits === 0 ? '進捗を確認中' : `${imageLoad.percent}%`}
+            </span>
+          </div>
+          <progress
+            value={imageLoad.completedUnits === 0 ? undefined : imageLoad.percent}
+            max={100}
+            aria-label={imageLoad.completedUnits === 0
+              ? '2D表示準備: 画像ソースの応答待ち'
+              : `2D表示準備の進捗 ${imageLoad.percent}%`}
+            className="h-2 w-full accent-[var(--accent)]"
+          />
+          <div className="mt-2 truncate text-[11px] text-white/70" title={imageLoad.label}>
+            {imageLoad.label}
+          </div>
+          <div className="mt-1 text-[10px] text-white/40">
+            2D初期表示までの、完了を確認できた工程に基づく進捗です
+          </div>
         </div>
       )}
 
@@ -195,18 +243,11 @@ function WelcomeScreen() {
       const picked = await chooseFiles();
       if (threeDSaveIsBusy()) return;
       if (picked.cancelled || picked.paths.length === 0) return;
-      let lastOpenedId: string | null = null;
-      const failures: string[] = [];
-      for (const p of picked.paths) {
-        try {
-          const id = await openAndReload(p, { showDefaultView: false });
-          if (id) lastOpenedId = id;
-        } catch (e) {
-          failures.push(`${p}: ${e instanceof Error ? e.message : e}`);
-        }
-      }
+      const { lastOpenedId, failures } = await openPathBatch(picked.paths);
       if (lastOpenedId) showDefaultViewForActiveImage(lastOpenedId);
-      if (failures.length) setError(failures.join('\n'));
+      if (failures.length) {
+        setError(failures.map(({ label, message }) => `${label}: ${message}`).join('\n'));
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {

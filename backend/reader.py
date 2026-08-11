@@ -884,7 +884,7 @@ def _detect_channel_types(meta, n_c: int, channel_names: list[str]) -> list[str]
 def declared_z_length(reader_j) -> int:
     """The Z length the vendor metadata says was acquired, or 0 if it does not say.
 
-    Olympus records each acquisition axis in the series metadata as an
+    The format records each acquisition axis in the series metadata as an
     `axis axis #N` / `axis maxSize #N` pair, and a copy that is missing its
     continuation chunks keeps those values intact — which is exactly what makes
     them worth comparing against the Z the reader can actually expose.
@@ -917,7 +917,7 @@ def declared_z_length(reader_j) -> int:
 def _detect_incomplete_oir(reader_j, path: str) -> str:
     """Warn when an OIR is missing the companion files that hold most of its pixels.
 
-    Olympus splits a dataset larger than ~1 GB across `<name>.oir` plus extensionless
+    Large datasets can be split across `<name>.oir` plus extensionless
     `<name>_00001`, `_00002`, … siblings. Copying or drag-and-dropping only the .oir
     yields a file that still opens and still reports the full XY size, but exposes
     just the planes in that first chunk — e.g. Z 13 of 50 — with no error anywhere.
@@ -949,7 +949,7 @@ def _detect_incomplete_oir(reader_j, path: str) -> str:
 def _read_channel_ranges(reader_j, n_c: int, channel_names: list[str], bit_depth: int) -> list[list[float]]:
     """Read the acquisition display range (LUT black/white points) per channel.
 
-    Olympus OIR records it in the vendor metadata as `all shadow #NN` /
+    OIR records it in vendor metadata as `all shadow #NN` /
     `all highlight #NN`, expressed in the LUT's own space (`LUT resolution #NN`,
     typically 65536) rather than in pixel values. A 12-bit image left at the
     default 0..65535 therefore means "the full 0..4095 sensor range", so the

@@ -1178,8 +1178,20 @@ export function Volume3DViewer() {
 
       {/* Loading overlay */}
       {loading && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/60 pointer-events-none">
-          <div className="text-white text-sm animate-pulse">3D画像を読み込み中…</div>
+        <div
+          className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/60"
+          role="status"
+          aria-live="polite"
+          aria-label="3D画像を読み込み中"
+        >
+          <div className="w-56 rounded-lg bg-neutral-950/90 px-4 py-3 text-white shadow-lg">
+            <div className="mb-2 text-center text-sm">3D画像を読み込み中…</div>
+            <progress
+              max={100}
+              aria-label="Maximum 3Dボリュームの読込待ち"
+              className="h-2 w-full accent-[var(--accent)]"
+            />
+          </div>
         </div>
       )}
 
@@ -1573,9 +1585,19 @@ export function Volume3DViewer() {
         <button
           onClick={resetToSource}
           disabled={resetting || !activeImageId || !sourceViewDefaults[activeImageId]}
+          aria-busy={resetting}
           className="mt-1 px-2 py-1 rounded bg-[var(--accent)] text-white text-xs hover:opacity-90 disabled:opacity-40 transition"
         >
-          {resetting ? '戻しています…' : '元ファイルの設定に全て戻す'}
+          {resetting ? (
+            <span className="flex w-full flex-col items-center gap-1">
+              <span>戻しています…</span>
+              <progress
+                max={100}
+                aria-label="3D表示設定のリセット待ち"
+                className="h-1 w-full accent-white"
+              />
+            </span>
+          ) : '元ファイルの設定に全て戻す'}
         </button>
       </div>
 

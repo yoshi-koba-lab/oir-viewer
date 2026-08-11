@@ -117,3 +117,66 @@ test('an image operation queued before save is refused again after its queue wai
   assert.equal(imageOperationIsBusy(), false);
   useOperationStore.getState().finishThreeDSave(token);
 });
+
+test('whole-image progress is token-owned, monotonic, and mutually exclusive with 3D save', () => {
+  useOperationStore.setState(useOperationStore.getInitialState(), true);
+  const token = useOperationStore.getState().beginImageLoad({
+    totalUnits: 12,
+    totalItems: 2,
+    label: 'A (1/2): waiting',
+  });
+  assert.ok(token);
+  assert.deepEqual(useOperationStore.getState().imageLoad, {
+    token,
+    completedUnits: 0,
+    totalUnits: 12,
+    percent: 0,
+    label: 'A (1/2): waiting',
+    itemIndex: 0,
+    totalItems: 2,
+  });
+  assert.equal(
+    useOperationStore.getState().beginImageLoad({
+      totalUnits: 6,
+      totalItems: 1,
+      label: 'second',
+    }),
+    null,
+  );
+  assert.equal(
+    useOperationStore.getState().beginThreeDSave({ percent: 0, label: 'save' }),
+    null,
+  );
+
+  useOperationStore.getState().updateImageLoad(token + 1, {
+    completedUnits: 12,
+    itemIndex: 1,
+    label: 'stale owner',
+  });
+  useOperationStore.getState().updateImageLoad(token, {
+    completedUnits: 3,
+    itemIndex: 0,
+    label: 'A: baseline verified',
+  });
+  assert.equal(useOperationStore.getState().imageLoad?.percent, 25);
+  useOperationStore.getState().updateImageLoad(token, {
+    completedUnits: 2,
+    itemIndex: 0,
+    label: 'late earlier milestone',
+  });
+  assert.equal(useOperationStore.getState().imageLoad?.completedUnits, 3);
+  assert.equal(useOperationStore.getState().imageLoad?.label, 'A: baseline verified');
+  useOperationStore.getState().updateImageLoad(token, {
+    completedUnits: 99,
+    itemIndex: 99,
+    label: 'B: complete',
+  });
+  assert.equal(useOperationStore.getState().imageLoad?.completedUnits, 12);
+  assert.equal(useOperationStore.getState().imageLoad?.percent, 100);
+  assert.equal(useOperationStore.getState().imageLoad?.itemIndex, 1);
+
+  useOperationStore.getState().finishImageLoad(token + 1);
+  assert.ok(useOperationStore.getState().imageLoad);
+  useOperationStore.getState().finishImageLoad(token);
+  assert.equal(useOperationStore.getState().imageLoad, null);
+});

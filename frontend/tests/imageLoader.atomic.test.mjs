@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { registerHooks } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
@@ -22,7 +22,12 @@ registerHooks({
 const originalFetch = globalThis.fetch;
 const { useImageStore } = await import('../src/stores/imageStore.ts');
 const { useViewStore } = await import('../src/stores/viewStore.ts');
-const { openAndReload } = await import('../src/hooks/useImageLoader.ts');
+const { useOperationStore } = await import('../src/stores/operationStore.ts');
+const {
+  openAndReload,
+  openPathBatch,
+  uploadAndReload,
+} = await import('../src/hooks/useImageLoader.ts');
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
@@ -31,6 +36,7 @@ afterEach(() => {
 beforeEach(() => {
   useImageStore.setState(useImageStore.getInitialState(), true);
   useViewStore.setState(useViewStore.getInitialState(), true);
+  useOperationStore.setState(useOperationStore.getInitialState(), true);
 });
 
 function metadata(id, path, overrides = {}) {
@@ -207,4 +213,260 @@ test('edits made to A while fresh B opens are captured immediately before B inst
   assert.equal(await opening, 'B2');
   assert.equal(useImageStore.getState().imageViewStates.A.channels[0].min, 700);
   assert.equal(useImageStore.getState().imageViewStates.A.channels[0].max, 800);
+});
+
+test('a whole-image open reports only verified milestones and paints 100 before clearing', async () => {
+  seedActive('PROG-A', '/data/progress.oir');
+  const observed = [];
+  const unsubscribe = useOperationStore.subscribe((state) => {
+    if (state.imageLoad) observed.push({ ...state.imageLoad });
+  });
+  globalThis.fetch = async (url) => {
+    const path = String(url);
+    if (path.startsWith('/api/open?')) {
+      return jsonResponse({ ...metadata('PROG-A', '/data/progress.oir'), reused: true });
+    }
+    if (path === '/api/images') {
+      return jsonResponse([
+        { ...metadata('PROG-A', '/data/progress.oir'), active: true },
+      ]);
+    }
+    throw new Error(`unexpected request: ${path}`);
+  };
+
+  assert.equal(await openAndReload('/data/progress.oir'), 'PROG-A');
+  unsubscribe();
+  assert.deepEqual(
+    [...new Set(observed.map(({ percent }) => percent))],
+    [0, 17, 33, 50, 67, 83, 100],
+  );
+  assert.equal(observed.at(-1).completedUnits, 6);
+  assert.equal(useOperationStore.getState().imageLoad, null);
+
+  // The deterministic counter ends at the coherent 2D presentation boundary.
+  // Opaque source decode and the following Maximum 3D load remain visibly
+  // indeterminate instead of borrowing this percentage or inventing time.
+  const appSource = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+  const genericLoading = appSource.slice(
+    appSource.indexOf('{/* Loading indicator */}'),
+    appSource.indexOf('{/* Whole-image Open/activate progress.'),
+  );
+  const imageLoading = appSource.slice(
+    appSource.indexOf('{/* Whole-image Open/activate progress.'),
+    appSource.indexOf('{/* Drag & drop overlay */}'),
+  );
+  const volumeSource = readFileSync(
+    new URL('../src/components/Volume3DViewer.tsx', import.meta.url),
+    'utf8',
+  );
+  const volumeLoading = volumeSource.slice(
+    volumeSource.indexOf('{/* Loading overlay */}'),
+    volumeSource.indexOf('{/* Error overlay */}'),
+  );
+  const volumeReset = volumeSource.slice(
+    volumeSource.indexOf('{/* Reset every per-file display choice'),
+    volumeSource.indexOf('{/* Info overlay */}'),
+  );
+  const compareSource = readFileSync(
+    new URL('../src/components/CompareView.tsx', import.meta.url),
+    'utf8',
+  );
+  const compareLoading = compareSource.slice(
+    compareSource.indexOf('function CompareLoadingIndicator'),
+    compareSource.indexOf('export function CompareView'),
+  );
+  const channelSource = readFileSync(
+    new URL('../src/components/ChannelPanel.tsx', import.meta.url),
+    'utf8',
+  );
+  const channelReset = channelSource.slice(
+    channelSource.indexOf("{viewMode === '2d' && ("),
+    channelSource.indexOf("{viewMode === '3d' &&"),
+  );
+  assert.match(imageLoading, /2D表示を準備中/);
+  assert.match(imageLoading, /2D表示の準備完了/);
+  assert.match(
+    imageLoading,
+    /value=\{imageLoad\.completedUnits === 0 \? undefined : imageLoad\.percent\}/,
+  );
+  assert.match(genericLoading, /<progress/);
+  assert.doesNotMatch(genericLoading, /\bvalue=/);
+  assert.match(volumeLoading, /3D画像を読み込み中/);
+  assert.match(volumeLoading, /<progress/);
+  assert.doesNotMatch(volumeLoading, /\bvalue=/);
+  assert.match(compareLoading, /<progress/);
+  assert.doesNotMatch(compareLoading, /\bvalue=/);
+  assert.equal(
+    (compareSource.match(/<CompareLoadingIndicator(?: compact)? \/>/g) ?? []).length,
+    2,
+  );
+  assert.match(channelReset, /2D表示設定のリセット待ち/);
+  assert.doesNotMatch(channelReset, /\bvalue=/);
+  assert.match(volumeReset, /3D表示設定のリセット待ち/);
+  assert.doesNotMatch(volumeReset, /\bvalue=/);
+});
+
+test('a failed whole-image open clears progress without claiming 100%', async () => {
+  const observed = [];
+  const unsubscribe = useOperationStore.subscribe((state) => {
+    if (state.imageLoad) observed.push(state.imageLoad.percent);
+  });
+  globalThis.fetch = async (url) => {
+    const path = String(url);
+    if (path.startsWith('/api/open?')) {
+      return new Response('decode failed', { status: 500 });
+    }
+    if (path === '/api/images') return jsonResponse([]);
+    throw new Error(`unexpected request: ${path}`);
+  };
+
+  await assert.rejects(openAndReload('/data/broken.oir'), /decode failed/);
+  unsubscribe();
+  assert.equal(observed.includes(100), false);
+  assert.equal(useOperationStore.getState().imageLoad, null);
+  assert.equal(useImageStore.getState().loading, false);
+  assert.match(useImageStore.getState().loadError, /broken\.oir/);
+});
+
+test('a two-well path batch has one monotonic denominator and preserves well labels', async () => {
+  let currentId = 'PLATE-A';
+  const observed = [];
+  const unsubscribe = useOperationStore.subscribe((state) => {
+    if (state.imageLoad) observed.push({ ...state.imageLoad });
+  });
+  globalThis.fetch = async (url) => {
+    const path = String(url);
+    if (path.startsWith('/api/open?')) {
+      const source = new URL(path, 'http://localhost').searchParams.get('path');
+      currentId = source?.endsWith('C05.oir') ? 'PLATE-C05' : 'PLATE-B02';
+      return jsonResponse({ ...metadata(currentId, source), reused: false });
+    }
+    if (path === '/api/images/PLATE-B02/view-settings'
+        || path === '/api/images/PLATE-C05/view-settings') {
+      return jsonResponse({ found: false, reason: 'none' });
+    }
+    if (path.startsWith('/api/image/all-channels-bin?')) {
+      return binaryResponse([31, 32, 33, 34], 30, 34);
+    }
+    if (path === '/api/images') {
+      return jsonResponse([
+        { ...metadata('PLATE-B02', '/plate/B02.oir'), active: currentId === 'PLATE-B02' },
+        { ...metadata('PLATE-C05', '/plate/C05.oir'), active: currentId === 'PLATE-C05' },
+      ]);
+    }
+    throw new Error(`unexpected request: ${path}`);
+  };
+
+  const result = await openPathBatch(
+    ['/plate/B02.oir', '/plate/C05.oir'],
+    ['B02', 'C05'],
+  );
+  unsubscribe();
+  assert.equal(result.lastOpenedId, 'PLATE-C05');
+  assert.deepEqual(result.failures, []);
+  assert.equal(observed.every(({ totalUnits }) => totalUnits === 12), true);
+  assert.equal(observed.every(({ totalItems }) => totalItems === 2), true);
+  assert.equal(observed.some(({ label }) => label.startsWith('B02 (1/2):')), true);
+  assert.equal(observed.some(({ label }) => label.startsWith('C05 (2/2):')), true);
+  const percents = observed.map(({ percent }) => percent);
+  assert.deepEqual([...percents].sort((a, b) => a - b), percents);
+  assert.equal(percents.at(-1), 100);
+  assert.equal(useOperationStore.getState().imageLoad, null);
+});
+
+test('a two-item all-failure batch never advances unverified units or reports 100%', async () => {
+  const observed = [];
+  const unsubscribe = useOperationStore.subscribe((state) => {
+    if (state.imageLoad) observed.push({ ...state.imageLoad });
+  });
+  globalThis.fetch = async (url) => {
+    const path = String(url);
+    if (path.startsWith('/api/open?')) {
+      return new Response('source decode failed', { status: 500 });
+    }
+    if (path === '/api/images') return jsonResponse([]);
+    throw new Error(`unexpected request: ${path}`);
+  };
+
+  const result = await openPathBatch(
+    ['/plate/B02-failed.oir', '/plate/C05-failed.oir'],
+    ['B02', 'C05'],
+  );
+  unsubscribe();
+  assert.equal(result.lastOpenedId, null);
+  assert.deepEqual(result.failures.map(({ label }) => label), ['B02', 'C05']);
+  assert.equal(Math.max(...observed.map(({ completedUnits }) => completedUnits)), 0);
+  assert.equal(observed.some(({ percent }) => percent === 100), false);
+  assert.equal(useOperationStore.getState().imageLoad, null);
+});
+
+test('a successful item followed by failure stops at verified success units', async () => {
+  const first = metadata('PARTIAL-A', '/plate/B02.oir');
+  const observed = [];
+  const unsubscribe = useOperationStore.subscribe((state) => {
+    if (state.imageLoad) observed.push({ ...state.imageLoad });
+  });
+  globalThis.fetch = async (url) => {
+    const path = String(url);
+    if (path.startsWith('/api/open?')) {
+      const source = new URL(path, 'http://localhost').searchParams.get('path');
+      return source?.endsWith('B02.oir')
+        ? jsonResponse({ ...first, reused: false })
+        : new Response('second source failed', { status: 500 });
+    }
+    if (path === '/api/images/PARTIAL-A/view-settings') {
+      return jsonResponse({ found: false, reason: 'none' });
+    }
+    if (path === '/api/images/PARTIAL-A/activate') return jsonResponse(first);
+    if (path.startsWith('/api/image/all-channels-bin?')) {
+      return binaryResponse([51, 52, 53, 54], 50, 54);
+    }
+    if (path === '/api/images') {
+      return jsonResponse([{ ...first, active: true }]);
+    }
+    throw new Error(`unexpected request: ${path}`);
+  };
+
+  const result = await openPathBatch(
+    ['/plate/B02.oir', '/plate/C05-failed.oir'],
+    ['B02', 'C05'],
+  );
+  unsubscribe();
+  assert.equal(result.lastOpenedId, 'PARTIAL-A');
+  assert.deepEqual(result.failures.map(({ label }) => label), ['C05']);
+  assert.equal(Math.max(...observed.map(({ completedUnits }) => completedUnits)), 6);
+  assert.equal(Math.max(...observed.map(({ percent }) => percent)), 50);
+  assert.equal(observed.some(({ percent }) => percent === 100), false);
+  assert.equal(useOperationStore.getState().imageLoad, null);
+});
+
+test('a dropped upload uses the same verified 0–100 progress contract', async () => {
+  const observed = [];
+  const unsubscribe = useOperationStore.subscribe((state) => {
+    if (state.imageLoad) observed.push(state.imageLoad.percent);
+  });
+  globalThis.fetch = async (url) => {
+    const path = String(url);
+    if (path === '/api/upload') {
+      return jsonResponse({ ...metadata('UPLOAD-A', '/uploads/drop.oir'), reused: false });
+    }
+    if (path === '/api/images/UPLOAD-A/view-settings') {
+      return jsonResponse({ found: false, reason: 'none' });
+    }
+    if (path.startsWith('/api/image/all-channels-bin?')) {
+      return binaryResponse([41, 42, 43, 44], 40, 44);
+    }
+    if (path === '/api/images') {
+      return jsonResponse([
+        { ...metadata('UPLOAD-A', '/uploads/drop.oir'), active: true },
+      ]);
+    }
+    throw new Error(`unexpected request: ${path}`);
+  };
+
+  const file = new File([new Uint8Array([1, 2, 3])], 'drop.oir');
+  assert.equal(await uploadAndReload(file), 'UPLOAD-A');
+  unsubscribe();
+  assert.deepEqual([...new Set(observed)], [0, 17, 33, 50, 67, 83, 100]);
+  assert.equal(useOperationStore.getState().imageLoad, null);
 });

@@ -4,7 +4,7 @@ import { useImageStore } from '../stores/imageStore';
 import { threeDSaveIsBusy, useOperationStore } from '../stores/operationStore';
 import { usePlateStore } from '../stores/plateStore';
 import {
-  openAndReload, basename, showDefaultViewForActiveImage,
+  openAndReload, openPathBatch, showDefaultViewForActiveImage,
 } from '../hooks/useImageLoader';
 import { chooseFiles } from '../utils/api';
 import { SaveDialog } from './SaveDialog';
@@ -96,21 +96,12 @@ export function Toolbar() {
         report('ファイルが選択されませんでした（ファイル選択ダイアログから何も返りませんでした）');
         return;
       }
-      const failures: string[] = [];
-      let lastOpenedId: string | null = null;
-      for (const p of picked.paths) {
-        try {
-          // Present only the last successful image. Mounting Maximum-quality 3D
-          // for every intermediate file would overlap several GB-scale loads.
-          const id = await openAndReload(p, { showDefaultView: false });
-          if (id) lastOpenedId = id;
-        } catch (e) {
-          failures.push(`${basename(p)}: ${e instanceof Error ? e.message : e}`);
-        }
-      }
+      // Present only the last successful image. Mounting Maximum-quality 3D
+      // for every intermediate file would overlap several GB-scale loads.
+      const { lastOpenedId, failures } = await openPathBatch(picked.paths);
       if (lastOpenedId) showDefaultViewForActiveImage(lastOpenedId);
       if (failures.length) {
-        report(failures.join('\n'));
+        report(failures.map(({ label, message }) => `${label}: ${message}`).join('\n'));
       } else {
         setShowOpenDialog(false);
         setFilePath('');

@@ -5,6 +5,10 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.5.10 — 2026-08-11 — Image opening and tab restoration now show progress
+//     bars without estimating opaque work. Plate Save keeps its destination and
+//     filename controls clearly visible before focus. The README is now a concise
+//     guide to the current features and basic operation.
 //   1.5.9 — 2026-08-09 — Conditions move out of the image. The columns marked 図
 //     were printed inside each cell in stroked white, over the sample: it hid
 //     whatever was beneath it, and nothing distinguished an annotation from
@@ -534,7 +538,7 @@
 //     pinned a volume per well), closes the Java reader in a finally, admits one
 //     well at a time, and refuses anything but Low — the cap is enforced server
 //     side, not just in the UI.
-//   1.2.8 — 2026-08-06 — Reads an Olympus MATL plate acquisition. A Plate button
+//   1.2.8 — 2026-08-06 — Reads a MATL plate acquisition. A Plate button
 //     opens a folder, parses matl.omp2info (plain XML, no Bio-Formats), and shows
 //     the acquisition in the plate's own shape — unacquired wells kept as empty
 //     cells in their real positions, which is also the layout a PDF export will
@@ -635,7 +639,7 @@
 //     on every platform: a preload script exposes exactly two calls over
 //     contextBridge, and the renderer falls back to the HTTP endpoint only when
 //     there is no shell. That endpoint now answers 501 with an explanation instead
-//     of hanging. The file filter always offers "all files" — Olympus companion
+//     of hanging. The file filter always offers "all files" — companion
 //     chunks have no extension, so an extension filter hides them.
 //   1.2.2 — 2026-08-06 — The histogram no longer rescans the raw plane on every
 //     contrast tick. It was keyed on the channel object, which setChannelRange
@@ -706,7 +710,7 @@
 //     owns the window; GitHub Actions builds mac-arm64/mac-x64/win-x64 installers.
 //     requirements.txt gained the deps the code always used (scyjava, JPype1, tifffile,
 //     python-multipart, cjdk) — a CI build could not have worked without them.
-//   1.0.0 — 2026-08-04 — First numbered release. Viewer for Olympus .oir (plus TIFF/ND2/LIF/CZI) 5D
+//   1.0.0 — 2026-08-04 — First numbered release. Viewer for .oir (plus TIFF/ND2/LIF/CZI) 5D
 //     stacks: 2D view with per-channel LUT/contrast and a cursor coordinate + per-channel intensity
 //     readout, vertical Z strip on the left edge (top = first slice), Split (per-channel + merge),
 //     Compare (up to 6 images side by side with synced or per-panel pan/zoom, shared Z/MIP selection
@@ -721,4 +725,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.5.9';
+export const VERSION = '1.5.10';

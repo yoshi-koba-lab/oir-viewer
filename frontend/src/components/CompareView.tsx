@@ -55,6 +55,27 @@ function pruneByIds<T>(prev: Record<string, T>, keep: Set<string>): Record<strin
   return next;
 }
 
+/** The compare endpoints expose no trustworthy fractional progress. */
+function CompareLoadingIndicator({ compact = false }: { compact?: boolean }) {
+  return (
+    <div
+      className={compact ? 'w-16' : 'w-28'}
+      role="status"
+      aria-live="polite"
+      aria-label="Comparison image loading"
+    >
+      <div className={`${compact ? 'text-[9px]' : 'text-xs'} mb-1 text-center text-white/60`}>
+        Loading...
+      </div>
+      <progress
+        max={100}
+        aria-label="Comparison image load waiting"
+        className={`${compact ? 'h-1' : 'h-1.5'} w-full accent-[var(--accent)]`}
+      />
+    </div>
+  );
+}
+
 export function CompareView() {
   const imageList = useImageStore((s) => s.imageList);
   const activeChannels = useImageStore((s) => s.channels);
@@ -497,7 +518,7 @@ export function CompareView() {
                     </button>
                   </div>
                 ) : (
-                  <span className="text-white/40 text-xs">Loading...</span>
+                  <CompareLoadingIndicator />
                 )}
               </div>
             );
@@ -988,8 +1009,8 @@ function ComparePanel({
           </button>
         </div>
       ) : busy ? (
-        <div className="absolute top-1 right-1 text-[9px] px-1.5 py-0.5 rounded bg-black/60 text-white/70 animate-pulse">
-          Loading...
+        <div className="absolute right-1 top-1 rounded bg-black/70 px-1.5 py-1">
+          <CompareLoadingIndicator compact />
         </div>
       ) : null}
       {/* Plane + zoom + dimensions */}
