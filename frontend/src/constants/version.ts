@@ -5,6 +5,8 @@
 // - X.Y (major.minor): only bumped when the user explicitly requests it.
 //
 // Update history (latest first):
+//   1.5.11 — 2026-08-11 — The application window and browser tab now keep the
+//     product title "OIR Viewer" after the frontend page finishes loading.
 //   1.5.10 — 2026-08-11 — Image opening and tab restoration now show progress
 //     bars without estimating opaque work. Plate Save keeps its destination and
 //     filename controls clearly visible before focus. The README is now a concise
@@ -725,4 +727,4 @@
 //     auto-selects a free port and publishes it to the frontend.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.5.10';
+export const VERSION = '1.5.11';
