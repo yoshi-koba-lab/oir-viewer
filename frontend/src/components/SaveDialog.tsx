@@ -1,6 +1,12 @@
 import { useState, useEffect, useRef } from 'react';
 import { useImageStore } from '../stores/imageStore';
 import {
+  cropOwnerMatchesMetadata,
+  useViewStore,
+} from '../stores/viewStore';
+import { imageOperationIsBusy } from '../hooks/useImageLoader';
+import { threeDSaveIsBusy } from '../stores/operationStore';
+import {
   saveImages, chooseFolder, OverwriteConflict,
   type ExportJobProgress, type SaveRequest,
 } from '../utils/api';
@@ -39,8 +45,12 @@ export function SaveDialog({ open, onClose }: Props) {
   const imageViewStates = useImageStore((s) => s.imageViewStates);
   const currentZ = useImageStore((s) => s.currentZ);
   const currentT = useImageStore((s) => s.currentT);
+  const cropRect = useViewStore((s) => s.cropRect);
+  const cropOwnerState = useViewStore((s) => s.cropOwner);
 
   const activeId = activeImageId ?? imageList.find((img) => img.active)?.id;
+  const cropCurrent = !cropRect
+    || cropOwnerMatchesMetadata(cropOwnerState, activeImageId, metadata);
 
   const [outputDir, setOutputDir] = useState('~/Desktop');
   /**
@@ -199,6 +209,10 @@ export function SaveDialog({ open, onClose }: Props) {
 
   const handleSave = async (overwrite = false) => {
     if (saveRun.current) return;
+    if (threeDSaveIsBusy() || useImageStore.getState().loading || imageOperationIsBusy()) {
+      setError('画像の読み込み・切り替え・3D保存が完了してから保存してください。');
+      return;
+    }
     if (!outputDir.trim()) {
       setError('保存先フォルダを入力してください');
       return;
@@ -224,6 +238,29 @@ export function SaveDialog({ open, onClose }: Props) {
       return;
     }
 
+    // A crop belongs to one exact source presentation. Refuse before starting
+    // the export job when that source changed, is still loading, or a file
+    // switch/open is queued; sending a stale rectangle would otherwise apply
+    // it to a same-sized but unrelated image.
+    const currentImage = useImageStore.getState();
+    const currentView = useViewStore.getState();
+    const requestedCrop = currentView.cropRect;
+    if (currentImage.loading || threeDSaveIsBusy() || imageOperationIsBusy()) {
+      setError('画像の読み込み・切り替え中のため、保存を開始できません。完了後に再試行してください。');
+      return;
+    }
+    if (requestedCrop) {
+      if (!currentImage.activeImageId || !currentImage.metadata
+          || !cropOwnerMatchesMetadata(currentView.cropOwner, currentImage.activeImageId, currentImage.metadata)) {
+        setError('画像ソースが切り替わったため、クロップ範囲は無効です。「全体に戻す」後に再指定してください。');
+        return;
+      }
+      if (selectedImages.size !== 1 || !selectedImages.has(currentImage.activeImageId)) {
+        setError('クロップ保存は、範囲を指定した現在の画像1枚のみ選択してください。');
+        return;
+      }
+    }
+
     saveRun.current = true;
     const expectedRevisions = overwrite ? (conflict?.revisions ?? {}) : {};
     setError('');
@@ -236,6 +273,10 @@ export function SaveDialog({ open, onClose }: Props) {
     try {
       const chIndices = Array.from(selectedChannels).sort((a, b) => a - b);
       const ids = Array.from(selectedImages);
+      // Freeze the exact crop with the other save settings.  The backend
+      // validates it against every selected source before reading pixels, so a
+      // stale rectangle fails closed instead of silently exporting a different
+      // area from a second image.
       // The flat lists below describe the active image only. Drop indices it no
       // longer has (the active image can change under an open dialog, e.g. by a
       // file drop) so building them cannot throw.
@@ -275,6 +316,14 @@ export function SaveDialog({ open, onClose }: Props) {
         current_z: currentZ,
         current_t: currentT,
         bit_depth_output: bitDepth,
+        crop: requestedCrop
+          ? {
+              x: Math.round(requestedCrop.x),
+              y: Math.round(requestedCrop.y),
+              width: Math.round(requestedCrop.width),
+              height: Math.round(requestedCrop.height),
+            }
+          : null,
       };
 
       const result: SaveResult = await saveImages(req, setProgress);
@@ -314,6 +363,16 @@ export function SaveDialog({ open, onClose }: Props) {
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
       <div className="relative bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-5 w-[560px] max-h-[90vh] overflow-y-auto shadow-xl">
         <h3 className="text-sm font-bold mb-4 text-[var(--text-primary)]">Save Image As</h3>
+        {cropRect && cropCurrent ? (
+          <p className="-mt-2 mb-3 rounded border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-[10px] leading-relaxed text-emerald-200">
+            クロップ範囲を適用: x={Math.round(cropRect.x)}, y={Math.round(cropRect.y)},
+            {' '}{Math.round(cropRect.width)}×{Math.round(cropRect.height)} px
+          </p>
+        ) : cropRect ? (
+          <p className="-mt-2 mb-3 rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[10px] leading-relaxed text-amber-200">
+            画像ソースが切り替わったため、クロップ範囲は無効です。保存前に範囲を再指定してください。
+          </p>
+        ) : null}
 
         <fieldset disabled={saving} className="contents">
 

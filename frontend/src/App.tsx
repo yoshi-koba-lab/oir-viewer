@@ -12,12 +12,14 @@ import { UpdateNotice } from './components/UpdateNotice';
 import { DimensionSliders, ZSliderVertical } from './components/DimensionSliders';
 import { Toolbar } from './components/Toolbar';
 import { FileTabBar } from './components/FileTabBar';
+import { FileManagerDrawer } from './components/FileManagerDrawer';
 import { IntensityProfile } from './components/IntensityProfile';
 import { MeasurementPanel } from './components/MeasurementPanel';
 import { MetadataPanel } from './components/MetadataPanel';
 import { SplitView } from './components/SplitView';
 import { Volume3DViewer } from './components/Volume3DViewer';
 import { CompareView } from './components/CompareView';
+import { CropSettingsPanel } from './components/CropSettingsPanel';
 import { chooseFiles } from './utils/api';
 import { VERSION } from './constants/version';
 import './index.css';
@@ -28,9 +30,11 @@ function App() {
   const metadata = useImageStore((s) => s.metadata);
   const activeImageId = useImageStore((s) => s.activeImageId);
   const viewMode = useViewStore((s) => s.viewMode);
+  const cropPanelOpen = useViewStore((s) => s.cropPanelOpen);
   const threeDSave = useOperationStore((s) => s.threeDSave);
   const imageLoad = useOperationStore((s) => s.imageLoad);
   const [dragOver, setDragOver] = useState(false);
+  const [fileManagerOpen, setFileManagerOpen] = useState(false);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -74,10 +78,14 @@ function App() {
       onDrop={handleDrop}
     >
       {/* Top toolbar */}
-      <Toolbar />
+      <Toolbar
+        fileManagerOpen={fileManagerOpen}
+        onToggleFileManager={() => setFileManagerOpen((open) => !open)}
+      />
 
       {/* File tabs */}
       <FileTabBar />
+      {fileManagerOpen && <FileManagerDrawer onClose={() => setFileManagerOpen(false)} />}
 
       {/* Main area. With nothing loaded this REPLACES the viewport rather than
           floating over it: the old full-window overlay dimmed the toolbar too,
@@ -87,7 +95,13 @@ function App() {
       ) : viewMode === 'compare' ? (
         <CompareView />
       ) : (
-        <div className="flex flex-1 overflow-hidden">
+        <div data-main-workspace className="flex flex-1 overflow-hidden">
+          {/* Crop settings are a real workspace column, not a floating popup.
+              This reserves the width before the viewport at every desktop
+              width, so no crop control can cover image pixels. */}
+          {cropPanelOpen && (viewMode === '2d' || viewMode === '3d') && (
+            <CropSettingsPanel metadata={metadata} />
+          )}
           {/* Vertical Z slider on the left edge (2D / Split) */}
           {(viewMode === '2d' || viewMode === 'split') && <ZSliderVertical />}
 

@@ -257,3 +257,87 @@ export function drawScalebarAt(
  * showed up as the bar creeping upward a few pixels on every grab.
  */
 export const SCALEBAR_BLOCK_H = 19;
+
+/** Conservative pure-CSS estimate used to keep an exported label in the frame. */
+export function scalebarLabelWidth(um: number, scale = 1): number {
+  // Arial's lowercase "m" is close to 10 px wide at the 12 px export font,
+  // while digits are narrower.  Using an average of 7 px underestimates labels
+  // such as "10 mm" and can let the outlined text clip even when the bar fits.
+  // Ten pixels per code point plus the stroke allowance is deliberately
+  // conservative: a false refusal is recoverable by widening the crop, whereas
+  // publishing a clipped physical annotation is not.
+  return formatUm(um).length * 10 * scale + 4 * scale;
+}
+
+export interface CroppedScalebarPlan {
+  /** Physical length to draw. */
+  um: number;
+  /** Pixel length in the unscaled (CSS) frame. */
+  px: number;
+  /** Export-space label width, including the outline allowance. */
+  labelWidthPx: number;
+  /** Export-space inner padding used by placement. */
+  padPx: number;
+}
+
+/**
+ * Re-plan a 3D scale bar after a crop changes the output canvas dimensions.
+ *
+ * The current bar's `px / um` is the calibrated physical scale. Automatic
+ * lengths may step down to the next nice value; an explicit user length is
+ * never shortened and instead fails closed when the bar or label cannot fit.
+ */
+export function planCroppedScalebar(
+  current: { um: number; px: number },
+  cropWidth: number,
+  cropHeight: number,
+  exportScale: number,
+  requestedUm: number | null,
+  pad = 14,
+): CroppedScalebarPlan {
+  if (![current.um, current.px, cropWidth, cropHeight, exportScale, pad]
+    .every(Number.isFinite) || !(current.um > 0) || !(current.px > 0)
+    || !(cropWidth > 0) || !(cropHeight > 0) || !(exportScale > 0) || !(pad > 0)) {
+    throw new Error('クロップ画像のスケールバーを計算できません。');
+  }
+  const padPx = pad * exportScale;
+  const availableWidth = cropWidth - 2 * padPx;
+  const availableHeight = cropHeight - 2 * padPx;
+  const blockHeight = SCALEBAR_BLOCK_H * exportScale;
+  if (!(availableWidth > 0) || !(availableHeight >= blockHeight)) {
+    throw new Error('クロップ画像が狭すぎるため、スケールバーを配置できません。');
+  }
+  const umPerCssPixel = current.um / current.px;
+  const fits = (um: number): CroppedScalebarPlan | null => {
+    const px = um / umPerCssPixel;
+    const labelWidthPx = scalebarLabelWidth(um, exportScale);
+    if (!(um > 0) || !(px > 0)
+        || Math.max(px * exportScale, labelWidthPx) > availableWidth) return null;
+    return { um, px, labelWidthPx, padPx };
+  };
+
+  if (requestedUm !== null && requestedUm > 0) {
+    const explicit = fits(requestedUm);
+    if (!explicit) {
+      throw new Error(
+        `指定したスケールバー ${formatUm(requestedUm)} はクロップ画像に収まりません。`
+        + 'クロップ範囲を広げるか、スケールバーの長さを変更してください。',
+      );
+    }
+    return explicit;
+  }
+
+  // Keep the full-frame calibration and chosen nice length when the crop still
+  // has room. Re-planning is only needed after the original bar would clip.
+  const unchanged = fits(current.um);
+  if (unchanged) return unchanged;
+
+  const maxUm = availableWidth / exportScale / umPerCssPixel;
+  let candidate = niceScaleLength(Math.min(current.um, maxUm * 0.99));
+  for (let i = 0; i < 32 && candidate > 0; i++) {
+    const automatic = fits(candidate);
+    if (automatic) return automatic;
+    candidate = niceScaleLength(candidate * 0.5);
+  }
+  throw new Error('クロップ画像が狭すぎるため、自動スケールバーを配置できません。');
+}

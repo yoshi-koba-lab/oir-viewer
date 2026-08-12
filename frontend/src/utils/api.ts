@@ -459,6 +459,8 @@ export interface SaveRequest {
   current_z: number;
   current_t: number;
   bit_depth_output: string;
+  /** Optional source-pixel rectangle; null means export the complete image. */
+  crop?: { x: number; y: number; width: number; height: number } | null;
 }
 
 export interface ExportJobProgress {
@@ -588,6 +590,8 @@ export interface ProjectionRequest {
   /** Replace an existing projection after explicit confirmation. */
   overwrite?: boolean;
   expected_revisions?: Record<string, string>;
+  /** Optional source-pixel rectangle applied to the projected plane. */
+  crop?: { x: number; y: number; width: number; height: number } | null;
 }
 
 export interface ProjectionResultItem {

@@ -26,6 +26,7 @@ const { useOperationStore } = await import('../src/stores/operationStore.ts');
 const {
   openAndReload,
   openPathBatch,
+  startupActiveImage,
   uploadAndReload,
 } = await import('../src/hooks/useImageLoader.ts');
 
@@ -80,6 +81,17 @@ function jsonResponse(body, status = 200) {
     headers: { 'Content-Type': 'application/json' },
   });
 }
+
+test('empty startup image list stays empty for the Welcome screen', () => {
+  assert.equal(startupActiveImage([]), undefined);
+  assert.equal(
+    startupActiveImage([
+      { id: 'A', filename: 'A.oir', active: false },
+      { id: 'B', filename: 'B.oir', active: true },
+    ]).id,
+    'B',
+  );
+});
 
 function binaryResponse(values, autoMin = 1, autoMax = 100) {
   const width = 2;

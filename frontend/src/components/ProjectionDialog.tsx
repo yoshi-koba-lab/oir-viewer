@@ -1,9 +1,14 @@
 import { useState, useEffect, useRef } from 'react';
 import { useImageStore, type ProjectionMethod } from '../stores/imageStore';
 import {
+  cropOwnerMatchesMetadata,
+  useViewStore,
+} from '../stores/viewStore';
+import {
   applyProjection, chooseFolder, OverwriteConflict, type ExportJobProgress,
 } from '../utils/api';
-import { switchToImage, refreshImageList } from '../hooks/useImageLoader';
+import { imageOperationIsBusy, switchToImage, refreshImageList } from '../hooks/useImageLoader';
+import { threeDSaveIsBusy } from '../stores/operationStore';
 import { dirnameOf, filenameProblem, stemOf } from '../utils/paths';
 import { OverwriteConfirm } from './SaveDialog';
 
@@ -29,6 +34,10 @@ export function ProjectionDialog({ open, onClose }: Props) {
   const imageList = useImageStore((s) => s.imageList);
   const activeImageId = useImageStore((s) => s.activeImageId);
   const currentT = useImageStore((s) => s.currentT);
+  const cropRect = useViewStore((s) => s.cropRect);
+  const cropOwner = useViewStore((s) => s.cropOwner);
+  const cropCurrent = !cropRect
+    || cropOwnerMatchesMetadata(cropOwner, activeImageId, metadata);
 
   const [method, setMethod] = useState<ProjectionMethod>('max');
   const [zFrom, setZFrom] = useState(1);
@@ -164,6 +173,10 @@ export function ProjectionDialog({ open, onClose }: Props) {
 
   const handleApply = async (overwrite = false) => {
     if (projectionRun.current) return;
+    if (threeDSaveIsBusy() || useImageStore.getState().loading || imageOperationIsBusy()) {
+      setError('画像の読み込み・切り替え・3D保存が完了してから投影を開始してください。');
+      return;
+    }
     if (selectedImages.size === 0) {
       setError('画像を1つ以上選択してください');
       return;
@@ -176,6 +189,24 @@ export function ProjectionDialog({ open, onClose }: Props) {
       const bad = filenameProblem(projectionInputStem(baseName));
       if (bad) {
         setError(bad);
+        return;
+      }
+    }
+    const currentImage = useImageStore.getState();
+    const currentView = useViewStore.getState();
+    const requestedCrop = currentView.cropRect;
+    if (currentImage.loading || threeDSaveIsBusy() || imageOperationIsBusy()) {
+      setError('画像の読み込み・切り替え中のため、投影保存を開始できません。完了後に再試行してください。');
+      return;
+    }
+    if (requestedCrop) {
+      if (!currentImage.activeImageId || !currentImage.metadata
+          || !cropOwnerMatchesMetadata(currentView.cropOwner, currentImage.activeImageId, currentImage.metadata)) {
+        setError('画像ソースが切り替わったため、クロップ範囲は無効です。「全体に戻す」後に再指定してください。');
+        return;
+      }
+      if (selectedImages.size !== 1 || !selectedImages.has(currentImage.activeImageId)) {
+        setError('クロップ投影は、範囲を指定した現在の画像1枚のみ選択してください。');
         return;
       }
     }
@@ -209,6 +240,14 @@ export function ProjectionDialog({ open, onClose }: Props) {
         filename: selectedImages.size === 1 ? projectionInputStem(baseName) : '',
         overwrite,
         expected_revisions: expectedRevisions,
+        crop: requestedCrop
+          ? {
+              x: Math.round(requestedCrop.x),
+              y: Math.round(requestedCrop.y),
+              width: Math.round(requestedCrop.width),
+              height: Math.round(requestedCrop.height),
+            }
+          : null,
       }, setProgress);
 
       // Refresh image list
@@ -271,6 +310,16 @@ export function ProjectionDialog({ open, onClose }: Props) {
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
       <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-5 w-[480px] max-h-[90vh] overflow-y-auto shadow-xl">
         <h3 className="text-sm font-bold mb-4 text-[var(--text-primary)]">Z Projection</h3>
+        {cropRect && cropCurrent ? (
+          <p className="-mt-2 mb-3 rounded border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-[10px] leading-relaxed text-emerald-200">
+            クロップ範囲を投影画像に適用: x={Math.round(cropRect.x)}, y={Math.round(cropRect.y)},
+            {' '}{Math.round(cropRect.width)}×{Math.round(cropRect.height)} px
+          </p>
+        ) : cropRect ? (
+          <p className="-mt-2 mb-3 rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[10px] leading-relaxed text-amber-200">
+            画像ソースが切り替わったため、クロップ範囲は無効です。保存前に範囲を再指定してください。
+          </p>
+        ) : null}
 
         {/* Target images */}
         <div className="mb-4">

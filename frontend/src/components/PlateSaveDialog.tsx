@@ -108,6 +108,7 @@ export function PlateSaveDialog({
   // the export both have to re-read when the tabs or the active tab change.
   const imageList = useImageStore((s) => s.imageList);
   const activeImageId = useImageStore((s) => s.activeImageId);
+  const cropRect = useViewStore((s) => s.cropRect);
 
   const commitPlateZoom = () => {
     const problem = plateZoomProblem(zoomPercentInput);
@@ -702,6 +703,12 @@ export function PlateSaveDialog({
               >
                 {plate.source}
               </div>
+
+              {cropRect && (
+                <p className="mb-2 rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[10px] leading-relaxed text-amber-200">
+                  クロップ範囲は Plate Save（3D → PDF）にはまだ適用されません。PDF は各ウェル全体を出力します。
+                </p>
+              )}
 
               {plate.warnings.map((warning, index) => (
                 <p

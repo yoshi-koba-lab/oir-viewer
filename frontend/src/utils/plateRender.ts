@@ -190,6 +190,8 @@ export class PlateRenderer {
         uVisible: { value: [true, true, true, true] },
         uSteps: { value: 200 },
         uZMin: { value: 0 }, uZMax: { value: 1 },
+        uCropMin: { value: new THREE.Vector2(0, 0) },
+        uCropMax: { value: new THREE.Vector2(1, 1) },
         cameraPos: { value: new THREE.Vector3() },
       },
       side: THREE.BackSide,

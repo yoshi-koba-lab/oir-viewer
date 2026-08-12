@@ -50,6 +50,11 @@ export const fragmentShader = `
   // Sub-range of the stack to render, in normalised volume Z (0..1).
   uniform float uZMin;
   uniform float uZMax;
+  // Source-image crop, expressed in the volume's normalized X/Y plane.
+  // Defaults are the full plane; the interactive viewer narrows these only
+  // after a verified crop completion, while PlateRenderer leaves them full.
+  uniform vec2 uCropMin;
+  uniform vec2 uCropMax;
 
   vec2 intersectBox(vec3 orig, vec3 dir) {
     vec3 tMin = (vec3(0.0) - orig) / dir;
@@ -85,6 +90,8 @@ export const fragmentShader = `
 
       vec3 samplePos = vOrigin + rayDir * t;
       if (any(lessThan(samplePos, vec3(0.0))) || any(greaterThan(samplePos, vec3(1.0)))) continue;
+      if (samplePos.x < uCropMin.x || samplePos.x > uCropMax.x
+          || samplePos.y < uCropMin.y || samplePos.y > uCropMax.y) continue;
       // Restrict to the selected slab of the stack.
       if (samplePos.z < uZMin || samplePos.z > uZMax) continue;
 

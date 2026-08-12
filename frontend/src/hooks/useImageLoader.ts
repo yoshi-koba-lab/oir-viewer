@@ -11,6 +11,7 @@ import {
   listImages, activateImage, closeImage,
   type AllChannelsBinResponse,
   type ImageMetadata,
+  type ImageListItem,
   type SavedImageView,
 } from '../utils/api';
 import { fetchAllChannelsCached, prefetchSlice, clearImageCache } from '../utils/sliceCache';
@@ -40,6 +41,11 @@ function describeError(e: unknown, what: string): string {
 export function basename(p: string): string {
   const parts = p.split(/[\\/]/);
   return parts[parts.length - 1] || p;
+}
+
+/** Select the backend's startup image, if any; an empty list stays Welcome. */
+export function startupActiveImage(list: readonly ImageListItem[]): ImageListItem | undefined {
+  return list.find((item) => item.active);
 }
 
 /**
@@ -972,12 +978,12 @@ export function useImageLoader() {
       try {
         const list = await refreshImageList();
         if (token !== switchToken) return;
-        const active = list.find(i => i.active);
+        const active = startupActiveImage(list);
         if (active) {
-          const label = active.filename || '前回の画像';
+          const label = active.filename || '起動時の画像';
           progressRun = beginImageLoadRun(1, label);
           const progress = itemProgress(progressRun, 0, label);
-          reportImageLoadMilestone(progress, 1, '前回の画像ソースを確認しました');
+          reportImageLoadMilestone(progress, 1, '起動時の画像ソースを確認しました');
           useViewStore.getState().setViewMode('2d');
           const m = await fetchMetadata(active.id);
           if (token !== switchToken) return;
@@ -988,12 +994,12 @@ export function useImageLoader() {
           presentPreparedImage(active.id, m, prepared);
           reportImageLoadMilestone(progress, 5, '画素と表示設定を一度に反映しました');
           applyDefaultViewForActiveImage(active.id);
-          reportImageLoadMilestone(progress, 6, '前回の画像の復元が完了しました');
+          reportImageLoadMilestone(progress, 6, '起動時の画像の準備が完了しました');
           progressCompleted = true;
         }
       } catch (e) {
         if (token === switchToken) {
-          store.setLoadError(describeError(e, 'Failed to restore the previous session'));
+          store.setLoadError(describeError(e, 'Failed to prepare the startup image'));
         }
       } finally {
         if (progressCompleted && progressRun) await nextProgressPaint();

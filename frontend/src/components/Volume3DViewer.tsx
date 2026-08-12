@@ -2,7 +2,12 @@ import { useRef, useEffect, useCallback, useState } from 'react';
 import * as THREE from 'three';
 import { useImageStore } from '../stores/imageStore';
 import { useOperationStore } from '../stores/operationStore';
-import { useViewStore } from '../stores/viewStore';
+import {
+  cropOwnerForMetadata,
+  sameCropOwner,
+  useViewStore,
+} from '../stores/viewStore';
+import { cropRectForCapture } from '../utils/crop';
 import {
   fetchVolumeBin, fetchVolumeMemoryPlan,
   chooseFolder, saveRender, OverwriteConflict,
@@ -18,11 +23,14 @@ import {
   drawScalebarAt,
   formatUm,
   niceScaleLength,
+  planCroppedScalebar,
+  scalebarLabelWidth,
   scalebarPlacement,
   type ScalebarPos,
 } from '../utils/scalebar';
 import { ScalebarOverlay } from './ScalebarOverlay';
 import { ScalebarSettings } from './ScalebarSettings';
+import { CropOverlay } from './CropOverlay';
 import {
   VOLUME_CAMERA_FOV_DEG, vertexShader, fragmentShader,
 } from '../utils/volumeShader';
@@ -33,11 +41,15 @@ import {
 import {
   MIN_VOLUME_ZOOM_PERCENT,
   resolveVolumeCameraZoom,
+  volumeCameraCropFit,
   volumePhysicalGeometry,
 } from '../utils/threeDCamera';
 import {
   completedSavePercent,
+  ownsThreeDSaveCrop,
   ThreeDSaveGuard,
+  type ThreeDSaveCropOwner,
+  type ThreeDSaveCropRect,
   type ThreeDSaveSnapshot,
 } from '../utils/threeDSave';
 
@@ -65,6 +77,44 @@ function drainWebGLErrors(gl: WebGL2RenderingContext): number[] {
   return errors;
 }
 
+/** Read the active source and crop as one synchronous save provenance record. */
+function currentThreeDSaveCrop(): {
+  cropRect: ThreeDSaveCropRect | null;
+  cropOwner: ThreeDSaveCropOwner;
+} {
+  const image = useImageStore.getState();
+  const metadata = image.metadata;
+  const view = useViewStore.getState();
+  const metadataOwner = cropOwnerForMetadata(image.activeImageId, metadata);
+  if (view.cropRect && !sameCropOwner(view.cropOwner, metadataOwner)) {
+    throw new Error(
+      'クロップ範囲が現在の画像ソースに紐付いていないため、3D保存を中止しました。'
+      + '「全体に戻す」で解除してから再実行してください。',
+    );
+  }
+  const owner = metadataOwner;
+  return {
+    cropRect: view.cropRect ? { ...view.cropRect } : null,
+    cropOwner: {
+      imageId: owner?.imageId ?? null,
+      sourceIdentity: owner?.sourceIdentity ?? null,
+      sourceRevision: owner?.sourceRevision ?? null,
+      width: owner?.width ?? 0,
+      height: owner?.height ?? 0,
+    },
+  };
+}
+
+function assertThreeDSaveCrop(snapshot: ThreeDSaveSnapshot): void {
+  const current = currentThreeDSaveCrop();
+  if (!ownsThreeDSaveCrop(snapshot, current.cropRect, current.cropOwner)) {
+    throw new Error(
+      '保存中に画像ソースまたはクロップ範囲が変更されたため、3D保存を中止しました。'
+      + '何も保存していません。',
+    );
+  }
+}
+
 interface LoadedVolumeProvenance {
   runId: number;
   imageId: string;
@@ -80,6 +130,42 @@ interface LoadedVolumeProvenance {
 interface SaveProgress {
   percent: number;
   label: string;
+}
+
+interface DisplayCropFit {
+  ownerKey: string;
+  rect: ThreeDSaveCropRect;
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+  target: [number, number, number];
+  scaleX: number;
+  scaleY: number;
+  scaleZ: number;
+}
+
+function sameThreeDSaveCropRect(
+  a: ThreeDSaveCropRect | null,
+  b: ThreeDSaveCropRect | null,
+): boolean {
+  return !!a && !!b && a.x === b.x && a.y === b.y
+    && a.width === b.width && a.height === b.height;
+}
+
+/** A fitted canvas already contains the selected source area. */
+function displayCropMatchesSnapshot(
+  fit: DisplayCropFit | null,
+  snapshot: ThreeDSaveSnapshot,
+): boolean {
+  const owner = snapshot.cropOwner;
+  const ownerKey = [
+    owner.imageId, owner.sourceIdentity, owner.sourceRevision,
+    owner.width, owner.height,
+  ].join('|');
+  return !!fit && !!snapshot.cropRect
+    && fit.ownerKey === ownerKey
+    && sameThreeDSaveCropRect(fit.rect, snapshot.cropRect);
 }
 
 /** Wrap an azimuth into 0..360 for display. */
@@ -119,7 +205,13 @@ function drawScalebar(
   // was dragged into place is what gets saved.
   const rect = { x: 0, y: 0, w: canvasW, h: canvasH };
   const p = scalebarPlacement(
-    rect, pos, canvasW, canvasH, bar.px * scale, SCALEBAR_BLOCK_H * scale, 14 * scale,
+    rect,
+    pos,
+    canvasW,
+    canvasH,
+    Math.max(bar.px * scale, scalebarLabelWidth(bar.um, scale)),
+    SCALEBAR_BLOCK_H * scale,
+    14 * scale,
   );
   drawScalebarAt(ctx, p.x, p.baseline, bar.px * scale, bar.um, color, scale);
 }
@@ -136,6 +228,8 @@ export function Volume3DViewer() {
   const animIdRef = useRef<number>(0);
 
   const metadata = useImageStore((s) => s.metadata);
+  const metadataRef = useRef(metadata);
+  metadataRef.current = metadata;
   const channels = useImageStore((s) => s.channels);
   const currentT = useImageStore((s) => s.currentT);
   const activeImageId = useImageStore((s) => s.activeImageId);
@@ -168,6 +262,11 @@ export function Volume3DViewer() {
   const scalebarUm = useViewStore((s) => s.scalebarUm);
   const scalebarColor = useViewStore((s) => s.scalebarColor);
   const scalebarPos = useViewStore((s) => s.scalebarPos);
+  const cropRect = useViewStore((s) => s.cropRect);
+  const cropOwner = useViewStore((s) => s.cropOwner);
+  const cropPanelOpen = useViewStore((s) => s.cropPanelOpen);
+  const cropFitRequest = useViewStore((s) => s.cropFitRequest);
+  const consumeCropFit = useViewStore((s) => s.consumeCropFit);
 
   // Save options
   const [saveFormat, setSaveFormat] = useState<'png' | 'tiff'>('png');
@@ -209,6 +308,12 @@ export function Volume3DViewer() {
   // Orbit state in degrees. az spins around the image's vertical axis, el lifts
   // the camera above the image plane.
   const orbit = useRef({ ...initialCameraRef.current });
+  // A completed crop is a display transform, not a second export crop. The
+  // shader clips samples to this source rectangle while the camera fits the
+  // corresponding physical sub-box. Keeping it in a ref avoids a React render
+  // race between panel completion and a save snapshot.
+  const displayCropFitRef = useRef<DisplayCropFit | null>(null);
+  const previousCropPanelOpenRef = useRef(false);
   // Mirror of the orbit angles, so they can also be typed in.
   const [angles, setAngles] = useState({
     az: initialCameraRef.current.az,
@@ -246,7 +351,26 @@ export function Volume3DViewer() {
     const cam = cameraRef.current;
     const mesh = meshRef.current;
     if (!cam) return;
-    const { scaleX, scaleY, scaleZ } = volumeInfoRef.current;
+    const fullGeometry = volumeInfoRef.current;
+    const fitted = displayCropFitRef.current;
+    // Physical spacing may arrive after the crop panel was completed. Rebuild
+    // the fitted sub-box from the source rect on every camera update so an
+    // anisotropic volume never keeps a stale unit-cube target/radius.
+    let fittedGeometry: ReturnType<typeof volumeCameraCropFit> | null = null;
+    const currentMetadata = metadataRef.current;
+    if (fitted && currentMetadata) {
+      try {
+        fittedGeometry = volumeCameraCropFit(
+          fullGeometry,
+          fitted.rect,
+          currentMetadata.width,
+          currentMetadata.height,
+        );
+      } catch {
+        fittedGeometry = null;
+      }
+    }
+    const { scaleX, scaleY, scaleZ } = fittedGeometry ?? fitted ?? fullGeometry;
     const resolved = resolveVolumeCameraZoom({
       scaleX,
       scaleY,
@@ -269,18 +393,28 @@ export function Volume3DViewer() {
     const { az, el, radius } = orbit.current;
     const a = az * DEG;
     const e = el * DEG;
+    const target: [number, number, number] = fittedGeometry?.target
+      ?? fitted?.target
+      ?? [CENTER, CENTER, CENTER];
     // az=0, el=0 looks straight down the optical axis, i.e. the familiar XY face
     // from the 2D view. Anchoring the angles to the image planes rather than to
     // three.js's Y-up makes "0°/0°" mean something to a microscopist.
     // Orbiting the centre also matters: pivoting on the world origin put the
     // pivot on a corner of the box and swung the sample out of frame.
     cam.position.set(
-      CENTER + radius * Math.cos(e) * Math.sin(a),
-      CENTER + radius * Math.sin(e),
-      CENTER + radius * Math.cos(e) * Math.cos(a)
+      target[0] + radius * Math.cos(e) * Math.sin(a),
+      target[1] + radius * Math.sin(e),
+      target[2] + radius * Math.cos(e) * Math.cos(a)
     );
-    cam.lookAt(CENTER, CENTER, CENTER);
+    cam.lookAt(target[0], target[1], target[2]);
     cam.updateMatrixWorld();
+
+    const cropMin = materialRef.current?.uniforms.uCropMin?.value as THREE.Vector2 | undefined;
+    const cropMax = materialRef.current?.uniforms.uCropMax?.value as THREE.Vector2 | undefined;
+    if (cropMin && cropMax) {
+      cropMin.set(fitted?.minX ?? 0, fitted?.minY ?? 0);
+      cropMax.set(fitted?.maxX ?? 1, fitted?.maxY ?? 1);
+    }
 
     // Camera position in model space for correct ray-box intersection
     if (materialRef.current) {
@@ -301,6 +435,112 @@ export function Volume3DViewer() {
     viewRevisionRef.current += 1;
     recomputeScalebar(); // depends on the camera distance
   }, [recomputeScalebar]);
+
+  /** Apply one verified source crop to the live 3D camera and shader. */
+  const fitCropSelection = useCallback((rect: ThreeDSaveCropRect, owner: ReturnType<typeof cropOwnerForMetadata>) => {
+    if (!owner || !metadata || saveGuardRef.current.isLocked) return false;
+    if (!sameCropOwner(owner, cropOwnerForMetadata(activeImageId, metadata))) return false;
+    let fit;
+    try {
+      fit = volumeCameraCropFit(
+        volumeInfoRef.current,
+        rect,
+        metadata.width,
+        metadata.height,
+      );
+    } catch {
+      return false;
+    }
+    displayCropFitRef.current = {
+      ownerKey: owner.key,
+      rect: { ...rect },
+      minX: rect.x / metadata.width,
+      minY: rect.y / metadata.height,
+      maxX: (rect.x + rect.width) / metadata.width,
+      maxY: (rect.y + rect.height) / metadata.height,
+      target: fit.target,
+      scaleX: fit.scaleX,
+      scaleY: fit.scaleY,
+      scaleZ: fit.scaleZ,
+    };
+    // Crop editing always starts from the unambiguous XY face. Completion can
+    // then fit the selected region without carrying an old tilt into the crop.
+    orbit.current.az = 0;
+    orbit.current.el = 0;
+    orbit.current.zoomPercent = 100;
+    setAngles({ az: 0, el: 0 });
+    setZoomDraft(null);
+    updateCamera();
+    return true;
+  }, [activeImageId, metadata, updateCamera]);
+
+  // Opening the crop panel resets the 3D orientation and temporarily restores
+  // the full volume. Otherwise the source-pixel overlay would be drawn over a
+  // previously fitted/cropped camera and pointer coordinates would be wrong.
+  useEffect(() => {
+    const wasOpen = previousCropPanelOpenRef.current;
+    previousCropPanelOpenRef.current = cropPanelOpen;
+    if (wasOpen || !cropPanelOpen || saveGuardRef.current.isLocked) return;
+    displayCropFitRef.current = null;
+    orbit.current.az = 0;
+    orbit.current.el = 0;
+    orbit.current.zoomPercent = 100;
+    setAngles({ az: 0, el: 0 });
+    setZoomDraft(null);
+    updateCamera();
+  }, [cropPanelOpen, updateCamera]);
+
+  // A completed crop may arrive through the panel's one-shot request, or by
+  // mounting this viewer after a crop was already completed in another view.
+  // In both cases, owner validation happens before camera/shader mutation.
+  useEffect(() => {
+    if (cropPanelOpen || !cropRect || !cropOwner || !metadata || !activeImageId) return;
+    const currentOwner = cropOwnerForMetadata(activeImageId, metadata);
+    if (!sameCropOwner(cropOwner, currentOwner)) return;
+    const current = displayCropFitRef.current;
+    if (current && currentOwner && current.ownerKey === currentOwner.key
+        && sameThreeDSaveCropRect(current.rect, cropRect)) return;
+    fitCropSelection(cropRect, currentOwner);
+  }, [activeImageId, cropOwner, cropPanelOpen, cropRect, fitCropSelection, metadata]);
+
+  useEffect(() => {
+    const request = cropFitRequest;
+    if (!request) return;
+    if (!cropRect || !cropOwner || !metadata || !activeImageId) {
+      consumeCropFit(request.sequence);
+      return;
+    }
+    const currentOwner = cropOwnerForMetadata(activeImageId, metadata);
+    if (!sameCropOwner(cropOwner, currentOwner) || request.ownerKey !== currentOwner?.key) {
+      consumeCropFit(request.sequence);
+      return;
+    }
+    // The panel freezes the exact rectangle at completion. If the live crop
+    // changed before this keyed viewer observed the request, consume and reject
+    // it rather than fitting a different selection under the old request.
+    if (!sameThreeDSaveCropRect(request.rect, cropRect)) {
+      consumeCropFit(request.sequence);
+      return;
+    }
+    if (cropPanelOpen || saveGuardRef.current.isLocked) return;
+    // A malformed/stale request fails closed inside fitCropSelection. Consume
+    // it either way so React cannot retry the same invalid geometry forever;
+    // the live crop remains available for the user to correct in the panel.
+    fitCropSelection(request.rect, currentOwner);
+    consumeCropFit(request.sequence);
+  }, [activeImageId, consumeCropFit, cropFitRequest, cropOwner, cropPanelOpen, cropRect, fitCropSelection, metadata]);
+
+  // Resetting to the source (or switching to a different source owner) must
+  // clear the display transform before a stale crop can affect a new volume.
+  useEffect(() => {
+    const currentOwner = cropOwnerForMetadata(activeImageId, metadata);
+    const fitted = displayCropFitRef.current;
+    if (fitted && (!currentOwner || fitted.ownerKey !== currentOwner.key
+      || !cropRect || !sameThreeDSaveCropRect(fitted.rect, cropRect))) {
+      displayCropFitRef.current = null;
+      updateCamera();
+    }
+  }, [activeImageId, cropRect, metadata, updateCamera]);
 
   /** Apply a typed zoom percentage; 100% always means fit for the live geometry. */
   const applyZoomPercent = useCallback((requested: number) => {
@@ -390,6 +630,8 @@ export function Volume3DViewer() {
         uSteps: { value: RAY_STEPS },
         uZMin: { value: 0.0 },
         uZMax: { value: 1.0 },
+        uCropMin: { value: new THREE.Vector2(0, 0) },
+        uCropMax: { value: new THREE.Vector2(1, 1) },
         uVolumeScale: { value: new THREE.Vector3(1, 1, 1) },
       },
     });
@@ -821,6 +1063,7 @@ export function Volume3DViewer() {
   ): RenderImagePayload | null => {
     if (!saveGuardRef.current.owns(saveSnapshot, viewRevisionRef.current)
         || !loadedVolumeIsCurrent()) return null;
+    assertThreeDSaveCrop(saveSnapshot);
     const renderer = rendererRef.current;
     const scene = sceneRef.current;
     const cam = cameraRef.current;
@@ -837,6 +1080,10 @@ export function Volume3DViewer() {
       const glErrors = drainWebGLErrors(gl);
       if (!saveGuardRef.current.owns(saveSnapshot, viewRevisionRef.current)
           || gl.isContextLost() || glErrors.length > 0) return null;
+      // The crop is part of the same snapshot as the WebGL frame. A direct
+      // store mutation during a multi-image save fails closed rather than
+      // publishing MERGE and channel images with different rectangles.
+      assertThreeDSaveCrop(saveSnapshot);
       const src = renderer.domElement;
       const w = src.width;
       const h = src.height;
@@ -851,18 +1098,86 @@ export function Volume3DViewer() {
       ctx.fillStyle = '#000000';
       ctx.fillRect(0, 0, w, h);
       ctx.drawImage(src, 0, 0);
+
+      // Crop after the verified WebGL frame has been copied.  The crop tool
+      // stores source-image pixel corners; 3D uses the same normalized fraction
+      // of its rendered framebuffer for this trial implementation.  Draw the
+      // scale bar on the cropped canvas so it remains inside the saved image
+      // even when the selected area does not contain the on-screen bar.
+      // When the live viewer has already clipped the shader and fitted the
+      // camera to this exact owner/rectangle, read back the full canvas. A
+      // second normalized crop would double-crop the user's selection. If a
+      // crop exists but has not been completed/fitted, preserve the trial
+      // export's original post-crop behavior.
+      const crop = cropRectForCapture(
+        saveSnapshot.cropRect,
+        saveSnapshot.cropOwner.width || w,
+        saveSnapshot.cropOwner.height || h,
+        w,
+        h,
+        displayCropMatchesSnapshot(displayCropFitRef.current, saveSnapshot),
+      );
+      const output = document.createElement('canvas');
+      output.width = crop.width;
+      output.height = crop.height;
+      const outputCtx = output.getContext('2d');
+      if (!outputCtx) return null;
+      outputCtx.fillStyle = '#000000';
+      outputCtx.fillRect(0, 0, crop.width, crop.height);
+      outputCtx.drawImage(
+        flat,
+        crop.x, crop.y, crop.width, crop.height,
+        0, 0, crop.width, crop.height,
+      );
       if (saveIncludeScalebar && hasPhysicalScale && scalebar) {
-        drawScalebar(ctx, scalebar, w, h, scalebarColor, scalebarPos, src.clientWidth > 0 ? w / src.clientWidth : 1);
+        const exportScale = src.clientWidth > 0 ? w / src.clientWidth : 1;
+        // Re-plan against the cropped canvas. Automatic lengths can become a
+        // shorter nice value; an explicit user length throws here if its bar or
+        // label cannot fit, so the save never publishes a clipped annotation.
+        const croppedBar = planCroppedScalebar(
+          scalebar,
+          crop.width,
+          crop.height,
+          exportScale,
+          scalebarUm,
+        );
+        // A manually dragged bar is stored as a fraction of the full frame.
+        // Rebase it into the crop when it remains inside the selected area;
+        // otherwise fall back to the documented lower-left default.
+        const fullFx = scalebarPos?.fx ?? -1;
+        const fullFy = scalebarPos?.fy ?? -1;
+        const cropFx = crop.width > 0
+          ? (fullFx * w - crop.x) / crop.width
+          : -1;
+        const cropFy = crop.height > 0
+          ? (fullFy * h - crop.y) / crop.height
+          : -1;
+        const croppedScalebarPos = scalebarPos
+          && cropFx >= 0 && cropFx <= 1 && cropFy >= 0 && cropFy <= 1
+          ? { fx: cropFx, fy: cropFy }
+          : null;
+        drawScalebar(
+          outputCtx,
+          croppedBar,
+          crop.width,
+          crop.height,
+          scalebarColor,
+          // The selected image is the output coordinate system.  A saved bar
+          // position outside it cannot be represented safely, so use the
+          // documented default inside the crop in that case.
+          croppedScalebarPos,
+          exportScale,
+        );
       }
-      const bytes = new Uint8Array(ctx.getImageData(0, 0, w, h).data.buffer);
-      return { name, width: w, height: h, data_b64: bytesToBase64(bytes) };
+      const bytes = new Uint8Array(outputCtx.getImageData(0, 0, crop.width, crop.height).data.buffer);
+      return { name, width: crop.width, height: crop.height, data_b64: bytesToBase64(bytes) };
     } finally {
       mat.uniforms.uVisible.value = prev;
       renderer.render(scene, cam);
     }
   }, [
     hasPhysicalScale, loadedVolumeIsCurrent, saveIncludeScalebar,
-    scalebar, scalebarColor, scalebarPos,
+    scalebar, scalebarColor, scalebarPos, scalebarUm,
   ]);
 
   /** Channels the save will use: an explicit pick, else whatever is visible now. */
@@ -912,7 +1227,18 @@ export function Volume3DViewer() {
     if (saveGuardRef.current.isLocked) return;
     syncChannelUniforms();
     syncZUniforms();
-    const saveSnapshot = saveGuardRef.current.begin(viewRevisionRef.current);
+    let frozenCrop: ReturnType<typeof currentThreeDSaveCrop>;
+    try {
+      frozenCrop = currentThreeDSaveCrop();
+    } catch (error) {
+      setSaveErr(error instanceof Error ? error.message : 'クロップ範囲を確認できないため保存を中止しました');
+      return;
+    }
+    const saveSnapshot = saveGuardRef.current.begin(
+      viewRevisionRef.current,
+      frozenCrop.cropRect,
+      frozenCrop.cropOwner,
+    );
     if (!saveSnapshot) return;
 
     const firstProgress = {
@@ -955,6 +1281,7 @@ export function Volume3DViewer() {
           || !loadedVolumeIsCurrent()) {
         throw new Error('3Dボリュームが変更されたため保存を中止しました。読み込み完了後に再実行してください');
       }
+      assertThreeDSaveCrop(saveSnapshot);
 
       const limit = 4;
       const images: RenderImagePayload[] = [];
@@ -997,6 +1324,7 @@ export function Volume3DViewer() {
           || !loadedVolumeIsCurrent()) {
         throw new Error('保存中に3D表示が変更されたため、何も保存していません');
       }
+      assertThreeDSaveCrop(saveSnapshot);
 
       reportProgress({
         percent: completedSavePercent(expectedImages, totalTasks),
@@ -1007,6 +1335,7 @@ export function Volume3DViewer() {
           || !loadedVolumeIsCurrent()) {
         throw new Error('ファイル保存の直前に3D表示が変更されたため、何も保存していません');
       }
+      assertThreeDSaveCrop(saveSnapshot);
       const res = await saveRender({
         output_dir: dir,
         basename: saveName.trim() || stemOf(metadata.filename),
@@ -1162,6 +1491,11 @@ export function Volume3DViewer() {
     <div ref={rootRef} className="relative flex-1 overflow-hidden bg-black">
       {/* Keep the render viewport beside the controls. Fitting against the full
           root would put the volume's right edge underneath the 230 px panel. */}
+      {/* This viewport must remain absolutely pinned to the available area. Do
+          not add `relative` here: Tailwind's utility order can make the later
+          relative rule win, returning this wrapper to normal flow and leaving
+          the WebGL canvas with only its content-sized (roughly 20%) height. The
+          absolute element is already a containing block for its overlays. */}
       <div className="absolute inset-y-0 left-0 right-[238px] min-w-0 overflow-hidden">
         <div
           ref={containerRef}
@@ -1174,6 +1508,17 @@ export function Volume3DViewer() {
         {/* The overlay shares the exact unobscured viewport used by the camera
             and export, so its default is genuinely inside the image at left-bottom. */}
         <ScalebarOverlay metrics={scalebar} pad={14} />
+        {cropPanelOpen && (
+          <CropOverlay
+            width={metadata.width}
+            height={metadata.height}
+            zoom={1}
+            panX={0}
+            panY={0}
+            containerRef={containerRef}
+            fitToCanvas
+          />
+        )}
       </div>
 
       {/* Loading overlay */}
@@ -1477,6 +1822,13 @@ export function Volume3DViewer() {
           {!hasPhysicalScale && (
             <div className="text-[10px] leading-relaxed text-amber-300">
               物理サイズ情報がないためスケールバーを入れられません
+            </div>
+          )}
+
+          {cropRect && (
+            <div className="rounded border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-1 text-[10px] leading-relaxed text-emerald-200">
+              クロップ範囲を保存画像に適用: x={Math.round(cropRect.x)}, y={Math.round(cropRect.y)},
+              {' '}{Math.round(cropRect.width)}×{Math.round(cropRect.height)} px
             </div>
           )}
 

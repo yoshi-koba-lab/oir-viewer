@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
 
-import { completedSavePercent, ThreeDSaveGuard } from '../src/utils/threeDSave.ts';
+import {
+  completedSavePercent,
+  ownsThreeDSaveCrop,
+  ThreeDSaveGuard,
+} from '../src/utils/threeDSave.ts';
 
 test('capture phases leave the final percentage for the filesystem write', () => {
   // MERGE + four channels + one all-or-nothing write.
@@ -35,4 +40,74 @@ test('one save owns one view revision and a second run cannot interleave', () =>
   assert.equal(guard.isLocked, true);
   guard.finish(second);
   assert.equal(guard.isLocked, false);
+});
+
+test('one 3D save freezes one crop for every MERGE/channel frame', () => {
+  const guard = new ThreeDSaveGuard();
+  const crop = { x: 10, y: 20, width: 300, height: 240 };
+  const owner = {
+    imageId: 'image-a',
+    sourceIdentity: 'identity-a',
+    sourceRevision: 'revision-a',
+    width: 640,
+    height: 480,
+  };
+  const snapshot = guard.begin(11, crop, owner);
+  assert.ok(snapshot);
+  assert.deepEqual(snapshot.cropRect, crop);
+  assert.deepEqual(snapshot.cropOwner, owner);
+  crop.width = 1;
+  assert.equal(snapshot.cropRect.width, 300);
+
+  // Every frame reads the copied snapshot, not a mutable store object.
+  const frames = [snapshot.cropRect, snapshot.cropRect, snapshot.cropRect];
+  const frozen = { x: 10, y: 20, width: 300, height: 240 };
+  assert.deepEqual(frames, [frozen, frozen, frozen]);
+  assert.equal(ownsThreeDSaveCrop(snapshot, frozen, owner), true);
+  assert.equal(
+    ownsThreeDSaveCrop(snapshot, { ...crop, width: crop.width - 1 }, owner),
+    false,
+  );
+  assert.equal(
+    ownsThreeDSaveCrop(snapshot, crop, { ...owner, sourceRevision: 'revision-b' }),
+    false,
+  );
+  const published = [];
+  if (ownsThreeDSaveCrop(snapshot, { ...frozen, x: 11 }, owner)) {
+    published.push('must-not-publish');
+  }
+  assert.deepEqual(published, []);
+  guard.finish(snapshot);
+});
+
+test('3D capture aborts before publication on crop/source mismatch', () => {
+  const viewer = readFileSync(new URL('../src/components/Volume3DViewer.tsx', import.meta.url), 'utf8');
+  assert.match(viewer, /assertThreeDSaveCrop\(saveSnapshot\)/);
+  assert.match(viewer, /cropRectForCapture\(\s*saveSnapshot\.cropRect/);
+  assert.match(viewer, /sameThreeDSaveCropRect\(request\.rect, cropRect\)/);
+  assert.doesNotMatch(viewer, /const cropState = useViewStore\.getState\(\)/);
+  const publish = viewer.indexOf('const res = await saveRender');
+  const finalAssert = viewer.lastIndexOf('assertThreeDSaveCrop(saveSnapshot)', publish);
+  assert.ok(publish > 0 && finalAssert > 0 && finalAssert < publish);
+});
+
+test('completed 3D crop fits the display and avoids a second capture crop', () => {
+  const viewer = readFileSync(new URL('../src/components/Volume3DViewer.tsx', import.meta.url), 'utf8');
+  const shader = readFileSync(new URL('../src/utils/volumeShader.ts', import.meta.url), 'utf8');
+  const plate = readFileSync(new URL('../src/utils/plateRender.ts', import.meta.url), 'utf8');
+  assert.match(viewer, /volumeCameraCropFit\(/);
+  assert.match(viewer, /cropPanelOpen/);
+  assert.match(viewer, /orbit\.current\.az = 0/);
+  assert.match(viewer, /orbit\.current\.el = 0/);
+  assert.match(viewer, /previousCropPanelOpenRef/);
+  assert.match(viewer, /cropPanelOpen && \(\s*<CropOverlay/);
+  assert.match(viewer, /setVolume3D\(\{\s*az,\s*el/);
+  assert.match(readFileSync(new URL('../src/components/CropSettingsPanel.tsx', import.meta.url), 'utf8'), /viewMode === '2d' \|\| viewMode === '3d'/);
+  assert.match(viewer, /cropRectForCapture\(/);
+  assert.match(viewer, /displayCropMatchesSnapshot\(displayCropFitRef\.current, saveSnapshot\)/);
+  assert.match(shader, /uniform vec2 uCropMin/);
+  assert.match(shader, /uniform vec2 uCropMax/);
+  assert.match(shader, /samplePos\.x < uCropMin\.x/);
+  assert.match(plate, /uCropMin: \{ value: new THREE\.Vector2\(0, 0\) \}/);
+  assert.match(plate, /uCropMax: \{ value: new THREE\.Vector2\(1, 1\) \}/);
 });

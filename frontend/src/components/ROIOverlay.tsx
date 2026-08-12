@@ -61,7 +61,7 @@ const hasExtent = (type: ROI['type'], p: Record<string, number>): boolean => {
 };
 
 export function ROIOverlay({ width, height, zoom, panX, panY, containerRef }: Props) {
-  const { roiTool, rois, drawingRoi, activeRoiId, addRoi, removeRoi, setDrawingRoi, setActiveRoi } =
+  const { roiTool, cropActive, rois, drawingRoi, activeRoiId, addRoi, removeRoi, setDrawingRoi, setActiveRoi } =
     useViewStore();
   const startRef = useRef<Pt | null>(null);
 
@@ -127,25 +127,25 @@ export function ROIOverlay({ width, height, zoom, panX, panY, containerRef }: Pr
 
   const handleMouseDown = useCallback(
     (e: React.MouseEvent) => {
-      if (roiTool === 'none') return;
+      if (roiTool === 'none' || cropActive) return;
       e.stopPropagation();
       const pt = toImageCoords(e.clientX, e.clientY);
       if (!pt) return;
       startRef.current = pt;
       setDrawingRoi({ type: roiTool as ROI['type'], params: {} });
     },
-    [roiTool, toImageCoords, setDrawingRoi]
+    [cropActive, roiTool, toImageCoords, setDrawingRoi]
   );
 
   const handleMouseMove = useCallback(
     (e: React.MouseEvent) => {
-      if (!startRef.current || !drawingRoi?.type) return;
+      if (cropActive || !startRef.current || !drawingRoi?.type) return;
       e.stopPropagation();
       const pt = toImageCoords(e.clientX, e.clientY);
       if (!pt) return;
       setDrawingRoi({ ...drawingRoi, params: buildParams(drawingRoi.type, startRef.current, pt) });
     },
-    [drawingRoi, toImageCoords, buildParams, setDrawingRoi]
+    [cropActive, drawingRoi, toImageCoords, buildParams, setDrawingRoi]
   );
 
   const handleMouseUp = useCallback(() => {
@@ -245,7 +245,7 @@ export function ROIOverlay({ width, height, zoom, panX, panY, containerRef }: Pr
     const onMouseDown = (e: MouseEvent) => {
       if (e.button !== 0) return;
       const v = useViewStore.getState();
-      if (v.roiTool !== 'none' || v.rois.length === 0) return;
+      if (v.roiTool !== 'none' || v.cropActive || v.rois.length === 0) return;
       const box = el.getBoundingClientRect();
       const hit = pickRoi({ x: e.clientX - box.left, y: e.clientY - box.top }, v.rois, v.activeRoiId);
       if (!hit) return;
@@ -304,7 +304,7 @@ export function ROIOverlay({ width, height, zoom, panX, panY, containerRef }: Pr
   return (
     <svg
       className="absolute inset-0 w-full h-full pointer-events-none"
-      style={{ pointerEvents: roiTool !== 'none' ? 'auto' : 'none' }}
+      style={{ pointerEvents: roiTool !== 'none' && !cropActive ? 'auto' : 'none' }}
       onMouseDown={handleMouseDown}
       onMouseMove={handleMouseMove}
       onMouseUp={handleMouseUp}

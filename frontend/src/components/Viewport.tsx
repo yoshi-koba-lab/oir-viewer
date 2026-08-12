@@ -1,10 +1,16 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
 import { useCanvasRenderer } from '../hooks/useCanvasRenderer';
-import { useViewStore } from '../stores/viewStore';
+import {
+  cropOwnerForMetadata,
+  sameCropOwner,
+  useViewStore,
+} from '../stores/viewStore';
 import { useImageStore } from '../stores/imageStore';
 import { ROIOverlay } from './ROIOverlay';
+import { CropOverlay } from './CropOverlay';
 import { scalebarMetrics } from '../utils/scalebar';
 import { ScalebarOverlay } from './ScalebarOverlay';
+import { fitCropViewport } from '../utils/crop';
 
 /** Pixel under the cursor plus each visible channel's raw value there. */
 interface ReadoutInfo {
@@ -19,10 +25,14 @@ export function Viewport() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const { render } = useCanvasRenderer();
-  const { zoom, panX, panY, setZoom, setPan, roiTool, scalebarUm } = useViewStore();
+  const {
+    zoom, panX, panY, setZoom, setPan, roiTool, scalebarUm,
+    cropRect, cropOwner, cropFitRequest, consumeCropFit,
+  } = useViewStore();
   const metadata = useImageStore((s) => s.metadata);
   const showMIP = useImageStore((s) => s.showMIP);
   const projectionActive = useImageStore((s) => s.projection.active);
+  const activeImageId = useImageStore((s) => s.activeImageId);
   // Snapshot, used only to detect "the pixels changed" below. The readout itself
   // always reads the live store. Viewport already re-renders on channel changes
   // (useCanvasRenderer subscribes to them), so this adds no extra renders.
@@ -38,6 +48,36 @@ export function Viewport() {
   useEffect(() => {
     if (canvasRef.current) render(canvasRef.current);
   }, [render]);
+
+  // Completion of the crop panel requests a one-shot 2D fit. Keep the
+  // rectangle in source pixels and solve the same transform used by the
+  // renderer, so the selected area is centered rather than merely zoomed.
+  useEffect(() => {
+    const request = cropFitRequest;
+    if (!request || !metadata || !cropRect || !cropOwner || !activeImageId) return;
+    const currentOwner = cropOwnerForMetadata(activeImageId, metadata);
+    if (!sameCropOwner(cropOwner, currentOwner) || request.ownerKey !== currentOwner?.key) {
+      consumeCropFit(request.sequence);
+      return;
+    }
+    if (request.rect.x !== cropRect.x || request.rect.y !== cropRect.y
+        || request.rect.width !== cropRect.width || request.rect.height !== cropRect.height) {
+      consumeCropFit(request.sequence);
+      return;
+    }
+    const viewport = containerRef.current?.getBoundingClientRect();
+    if (!viewport || viewport.width <= 0 || viewport.height <= 0) return;
+    const fit = fitCropViewport(
+      cropRect,
+      metadata.width,
+      metadata.height,
+      viewport.width,
+      viewport.height,
+    );
+    setZoom(fit.zoom);
+    setPan(fit.panX, fit.panY);
+    consumeCropFit(request.sequence);
+  }, [activeImageId, consumeCropFit, cropFitRequest, cropOwner, cropRect, metadata, setPan, setZoom]);
 
   // Resize observer
   useEffect(() => {
@@ -177,6 +217,18 @@ export function Viewport() {
       />
       {metadata && !showMIP && !projectionActive && (
         <ROIOverlay
+          width={metadata.width}
+          height={metadata.height}
+          zoom={zoom}
+          panX={panX}
+          panY={panY}
+          containerRef={containerRef}
+        />
+      )}
+      {/* Cropping is a geometric display operation, so it remains available for
+          2D MIP/Z-projection frames even though ROI measurement is not. */}
+      {metadata && (
+        <CropOverlay
           width={metadata.width}
           height={metadata.height}
           zoom={zoom}

@@ -97,6 +97,11 @@ jobs:
         run: |
           # It must start, serve the UI and answer the API without a system Java.
           if [ "$RUNNER_OS" = "Windows" ]; then EXE=dist/backend/oir-viewer-backend.exe; else EXE=dist/backend/oir-viewer-backend; fi
+          # Regression for the packaged-only startup bug: a real user's home can
+          # already contain a non-empty session.json from an older release. The
+          # frozen executable must clear it before the first API response and
+          # expose no tabs, exactly like the source build.
+          python -c "import json, numpy as np, tifffile; from pathlib import Path; p=Path.home()/'.oir-viewer'; p.mkdir(parents=True, exist_ok=True); old=p/'old-session.tif'; tifffile.imwrite(old, np.arange(4, dtype=np.uint16).reshape(2,2)); (p/'session.json').write_text(json.dumps({'images':[{'source_path':str(old),'filename':old.name,'num_channels':1,'num_z':1,'num_t':1,'width':2,'height':2}]}), encoding='utf-8')"
           OIR_BACKEND_PORT=8799 "$EXE" &
           for i in $(seq 1 90); do
             code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8799/api/images || true)
@@ -105,6 +110,9 @@ jobs:
           done
           curl -fsS -o /dev/null http://127.0.0.1:8799/api/images
           curl -fsS -o /dev/null http://127.0.0.1:8799/
+          images=$(curl -fsS http://127.0.0.1:8799/api/images)
+          [ "$images" = "[]" ] || { echo "packaged backend restored old session: $images"; exit 1; }
+          python -c "import json; from pathlib import Path; assert json.loads((Path.home()/'.oir-viewer'/'session.json').read_text(encoding='utf-8')) == {'images': []}"
           echo "packaged backend OK"
           # Stop it: left running, the runner reports it as an orphan process.
           kill %1 2>/dev/null || true

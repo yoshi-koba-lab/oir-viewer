@@ -12,6 +12,7 @@ import { ProjectionDialog } from './ProjectionDialog';
 import { PlateDialog } from './PlateDialog';
 import { PlateSaveDialog } from './PlateSaveDialog';
 import { VERSION } from '../constants/version';
+import { CropControls } from './CropControls';
 
 const roiTools: { id: ROITool; label: string; icon: string }[] = [
   { id: 'none', label: 'Pan', icon: 'M' },
@@ -27,7 +28,12 @@ const viewModes: { id: ViewMode; label: string }[] = [
   { id: 'compare', label: 'Compare' },
 ];
 
-export function Toolbar() {
+interface ToolbarProps {
+  fileManagerOpen?: boolean;
+  onToggleFileManager?: () => void;
+}
+
+export function Toolbar({ fileManagerOpen = false, onToggleFileManager }: ToolbarProps) {
   const { roiTool, setRoiTool, viewMode, setViewMode, rois, clearRois, activeRoiId, showMergeInSplit, setShowMergeInSplit } =
     useViewStore();
   const metadata = useImageStore((s) => s.metadata);
@@ -44,7 +50,11 @@ export function Toolbar() {
   const [openError, setOpenError] = useState('');
   const [opening, setOpening] = useState(false);
   const setLoadError = useImageStore((s) => s.setLoadError);
-  const roiToolsUsable = viewMode === '2d' && !showMIP && !projectionActive;
+  const cropActive = useViewStore((s) => s.cropActive);
+  const roiToolsUsable = viewMode === '2d' && !showMIP && !projectionActive && !cropActive;
+  // Crop is geometric and remains valid for 2D MIP/Z-projection frames; ROI
+  // measurement has a separate restriction because it needs raw-plane data.
+  const cropUsable = !!metadata && (viewMode === '2d' || viewMode === '3d');
   const roiDisabledReason = viewMode !== '2d'
     ? 'available in 2D view only'
     : 'not available while MIP or Z projection is displayed';
@@ -114,7 +124,7 @@ export function Toolbar() {
   };
 
   return (
-    <div className="bg-[var(--bg-secondary)] border-b border-[var(--border)] px-4 py-1.5 flex items-center gap-4">
+    <div className="relative bg-[var(--bg-secondary)] border-b border-[var(--border)] px-4 py-1.5 flex items-center gap-4">
       {/* App name + version */}
       <div className="flex items-baseline gap-1.5 shrink-0 select-none">
         <span className="text-sm font-semibold text-[var(--text-primary)]">OIR Viewer</span>
@@ -143,6 +153,18 @@ export function Toolbar() {
         title="パスを直接入力して開く"
       >
         …
+      </button>
+      <button
+        type="button"
+        onClick={() => { if (!threeDSaveIsBusy()) onToggleFileManager?.(); }}
+        disabled={threeDSaveBusy}
+        className={`px-2 py-1 rounded text-xs transition ${fileManagerOpen
+          ? 'bg-[var(--accent)] text-white'
+          : 'bg-[var(--border)] text-[var(--text-secondary)] hover:text-white'}`}
+        aria-pressed={fileManagerOpen}
+        title="開いているファイルを管理"
+      >
+        File Manager
       </button>
       <button
         onClick={() => { if (!threeDSaveIsBusy()) setShowSaveDialog(true); }}
@@ -305,6 +327,7 @@ export function Toolbar() {
           </button>
         ))}
       </div>
+      <CropControls metadata={metadata} usable={cropUsable} />
       {viewMode === '2d' && (showMIP || projectionActive) && (
         <span className="text-[10px] text-amber-500 whitespace-nowrap">
           ROI測定はMIP/Z投影中は無効です

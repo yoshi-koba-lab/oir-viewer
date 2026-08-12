@@ -27,6 +27,30 @@ export interface VolumePhysicalGeometry {
   calibrated: boolean;
 }
 
+/** A crop rectangle in source-image pixel coordinates. */
+export interface VolumeCameraCropRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * The box and target used when a source-image crop is fitted in the 3D view.
+ *
+ * The ray marcher still renders the complete Z stack.  A crop is therefore a
+ * camera-space framing operation: X/Y are narrowed to the selected source
+ * fraction while Z remains the full physical depth.  `target` is in the same
+ * [0, 1] world space as the viewer's translated box, allowing an off-centre
+ * rectangle to be centred without moving the mesh or changing ray coordinates.
+ */
+export interface VolumeCameraCropFit {
+  scaleX: number;
+  scaleY: number;
+  scaleZ: number;
+  target: Vec3;
+}
+
 type Vec3 = [number, number, number];
 
 const dot = (a: Vec3, b: Vec3) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -48,6 +72,48 @@ function normalise(v: Vec3): Vec3 {
 
 function finitePositive(value: number, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+/**
+ * Derive the physical box and camera pivot for a source-pixel crop.
+ *
+ * Invalid dimensions/rectangles throw rather than silently fitting the full
+ * image. This mirrors export's fail-closed crop contract and makes a stale
+ * source owner visible to callers before the camera is changed.
+ */
+export function volumeCameraCropFit(
+  input: Pick<VolumeCameraFitInput, 'scaleX' | 'scaleY' | 'scaleZ'>,
+  crop: VolumeCameraCropRect,
+  sourceWidth: number,
+  sourceHeight: number,
+): VolumeCameraCropFit {
+  const width = Math.trunc(sourceWidth);
+  const height = Math.trunc(sourceHeight);
+  if (width <= 0 || height <= 0
+      || ![crop.x, crop.y, crop.width, crop.height].every(Number.isFinite)
+      || !(crop.width > 0) || !(crop.height > 0)
+      || crop.x < 0 || crop.y < 0
+      || crop.x + crop.width > width
+      || crop.y + crop.height > height) {
+    throw new Error('3Dクロップ範囲が画像の範囲外です。クロップ範囲を設定し直してください。');
+  }
+  const x0 = crop.x / width;
+  const y0 = crop.y / height;
+  const sx = crop.width / width;
+  const sy = crop.height / height;
+  const fullX = finitePositive(input.scaleX, 1);
+  const fullY = finitePositive(input.scaleY, 1);
+  const fullZ = finitePositive(input.scaleZ, 1);
+  return {
+    scaleX: fullX * sx,
+    scaleY: fullY * sy,
+    scaleZ: fullZ,
+    target: [
+      (1 - fullX) * 0.5 + fullX * (x0 + sx * 0.5),
+      (1 - fullY) * 0.5 + fullY * (y0 + sy * 0.5),
+      (1 - fullZ) * 0.5 + fullZ * 0.5,
+    ],
+  };
 }
 
 /**

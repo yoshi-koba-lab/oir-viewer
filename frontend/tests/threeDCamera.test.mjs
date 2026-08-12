@@ -5,6 +5,7 @@ import {
   fitVolumeCameraRadius,
   minimumVolumeCameraRadius,
   resolveVolumeCameraZoom,
+  volumeCameraCropFit,
   volumePhysicalGeometry,
   volumeRadiusForZoomPercent,
   volumeZoomPercentForRadius,
@@ -75,4 +76,44 @@ test('missing axis calibration never produces a physical scale', () => {
   assert.equal(calibrated.scaleX, 1);
   assert.equal(calibrated.scaleY, 0.5);
   assert.ok(Math.abs(calibrated.scaleZ - 100 / 409.6) < 1e-12);
+});
+
+test('3D crop fit narrows X/Y and centers an off-centre source rectangle in world space', () => {
+  const fit = volumeCameraCropFit(
+    { scaleX: 1, scaleY: 0.5, scaleZ: 0.2 },
+    { x: 20, y: 10, width: 40, height: 20 },
+    100,
+    80,
+  );
+  assert.deepEqual(fit, {
+    scaleX: 0.4,
+    scaleY: 0.125,
+    scaleZ: 0.2,
+    // The mesh is translated to keep its physical box centered in world space.
+    target: [0.4, 0.375, 0.5],
+  });
+});
+
+test('full-frame crop is an exact no-op for 3D framing', () => {
+  assert.deepEqual(
+    volumeCameraCropFit(
+      { scaleX: 0.8, scaleY: 0.6, scaleZ: 0.2 },
+      { x: 0, y: 0, width: 100, height: 80 },
+      100,
+      80,
+    ),
+    { scaleX: 0.8, scaleY: 0.6, scaleZ: 0.2, target: [0.5, 0.5, 0.5] },
+  );
+});
+
+test('invalid 3D crop geometry fails closed', () => {
+  assert.throws(
+    () => volumeCameraCropFit(
+      { scaleX: 1, scaleY: 1, scaleZ: 1 },
+      { x: 90, y: 0, width: 20, height: 10 },
+      100,
+      80,
+    ),
+    /範囲外/,
+  );
 });

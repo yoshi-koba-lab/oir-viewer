@@ -69,7 +69,8 @@ import view_settings
 images: dict[str, ImageReader] = {}
 active_id: str | None = None
 
-# Persistent app data (uploads survive restarts; session records open files).
+# Persistent app data (uploads and view settings survive restarts; the session
+# file is retained for diagnostics, but startup deliberately begins fresh).
 APP_DIR = os.path.join(os.path.expanduser("~"), ".oir-viewer")
 UPLOADS_DIR = os.path.join(APP_DIR, "uploads")
 SESSION_FILE = os.path.join(APP_DIR, "session.json")
@@ -78,7 +79,7 @@ _view_settings_store = view_settings.ViewSettingsStore(VIEW_SETTINGS_FILE)
 
 
 def _save_session() -> None:
-    """Persist the list of open files (with real paths) so they can be restored."""
+    """Persist open-file metadata for explicit diagnostics, not auto-startup."""
     import json
     tmp_path = ""
     try:
@@ -89,8 +90,8 @@ def _save_session() -> None:
         # have already been published.
         with _state_lock:
             metadata = [reader.metadata for reader in images.values()]
-        # Dimensions travel with the path so the next startup can show the tabs
-        # without opening anything.
+        # Dimensions travel with the path for an explicit legacy/diagnostic
+        # restore; normal startup intentionally writes an empty list first.
         entries = [
             {
                 "source_path": meta.source_path, "filename": meta.filename,
@@ -104,7 +105,7 @@ def _save_session() -> None:
             if meta.source_path and os.path.exists(meta.source_path)
         ]
         # Write-then-rename: truncating session.json in place leaves a corrupt file
-        # if the write is interrupted, which then kills the next restore.
+        # if the write is interrupted, which then breaks an explicit diagnostic.
         with tempfile.NamedTemporaryFile(
             "w", dir=APP_DIR, prefix=".session-", suffix=".tmp", delete=False
         ) as f:
@@ -123,19 +124,14 @@ def _save_session() -> None:
 
 
 def _restore_session() -> int:
-    """Re-list the files from the last session. Returns how many were restored.
+    """Re-list the files from the last session for explicit diagnostics/tests.
 
-    Nothing is read here. The previous version called load_file() on every
-    remembered path inside the startup lifespan, which for eight plate wells of
-    real data is 34 GB of pixels before the server answers its first request —
-    the app could not start at all, and the failure looked like a crash rather
-    than like "the last session was too big". Each file becomes a deferred
-    reader instead: the tab is there, and the pixels arrive when it is opened.
+    Normal application startup does not call this function. Returns how many
+    deferred readers were registered when an explicit caller requests it.
 
-    Dimensions come from the session file so the tab list is right without
-    touching the disk. They are only a cache — the first real load re-reads the
-    file and overwrites them — so a file edited between sessions corrects itself
-    rather than being trusted forever.
+    Nothing is read here. This legacy path remains only for explicit tests or
+    diagnostics that need to inspect deferred-reader behavior; the application
+    lifespan never calls it.
     """
     import json
     if not os.path.exists(SESSION_FILE):
@@ -346,20 +342,103 @@ def _selftest_session() -> int:
             or _selftest_view_settings_api())
 
 
+def _start_fresh_session() -> int:
+    """Start with no open files, never with remembered files.
+
+    The previous startup path called ``_restore_session`` here, which made the
+    last set of tabs reappear every time the application launched.  Session
+    persistence remains available for view settings and explicit file
+    operations, but opening the application itself now starts from a clean
+    image list and lets the frontend show its Welcome screen.
+    """
+    global images, active_id, _lru
+    with _state_lock:
+        # Drop all references atomically so a re-entrant test or embedded
+        # server cannot observe a half-cleared tab list. Releasing the dict
+        # also makes any resident pixel arrays eligible for collection.
+        images = {}
+        active_id = None
+        _lru = []
+    _save_session()
+    return 0
+
+
+def _selftest_fresh_startup() -> int:
+    """Ensure the app lifespan does not call the previous-session restore path."""
+    global APP_DIR, SESSION_FILE, images, active_id, _lru
+    import asyncio
+    import json
+    import tempfile
+
+    saved_images, saved_active, saved_lru = images, active_id, _lru
+    saved_app_dir, saved_session_file = APP_DIR, SESSION_FILE
+    saved_restore = _restore_session
+    saved_prewarm = _prewarm_jvm
+    restore_called = False
+
+    def forbidden_restore() -> int:
+        nonlocal restore_called
+        restore_called = True
+        raise AssertionError("startup attempted to restore the previous session")
+
+    async def probe() -> None:
+        async with lifespan(app):
+            return
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            APP_DIR = os.path.join(tmp, "app")
+            SESSION_FILE = os.path.join(APP_DIR, "session.json")
+            os.makedirs(APP_DIR)
+            with open(SESSION_FILE, "w") as f:
+                json.dump({"images": [{"source_path": "/old/session.oir"}]}, f)
+
+            old_reader = ImageReader()
+            old_reader.metadata = ImageMetadata(
+                filename="old-session.oir", source_path="/old/session.oir",
+                num_channels=1, num_z=1, num_t=1, width=2, height=2,
+            )
+            old_reader.data = np.ones((1, 1, 1, 2, 2), dtype=np.uint16)
+            images, active_id, _lru = {"old": old_reader}, "old", ["old"]
+
+            globals()["_restore_session"] = forbidden_restore
+            globals()["_prewarm_jvm"] = lambda: None
+            asyncio.run(probe())
+
+            listed = asyncio.run(list_images())
+            with open(SESSION_FILE) as f:
+                persisted = json.load(f)
+            if restore_called:
+                raise AssertionError("startup called the previous-session restore path")
+            if images or active_id is not None or _lru:
+                raise AssertionError(
+                    f"fresh startup retained images: {list(images)}, active={active_id}, lru={_lru}"
+                )
+            if listed:
+                raise AssertionError(f"fresh startup exposed images: {listed}")
+            if persisted != {"images": []}:
+                raise AssertionError(f"fresh startup did not clear session file: {persisted}")
+    except Exception as exc:
+        print(f"selftest FAILED: fresh startup -> {type(exc).__name__}: {exc}", flush=True)
+        return 26
+    finally:
+        globals()["_restore_session"] = saved_restore
+        globals()["_prewarm_jvm"] = saved_prewarm
+        APP_DIR, SESSION_FILE = saved_app_dir, saved_session_file
+        images, active_id, _lru = saved_images, saved_active, saved_lru
+
+    print("selftest: fresh startup OK (empty image list; previous session is not auto-restored)", flush=True)
+    return 0
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """App lifespan: restore the previous session, or load dummy data for dev."""
+    """App lifespan: start a fresh image list on every application launch."""
     # Daemon thread: the JVM's cold start is seconds long and must not delay the
     # port line the shell is waiting on, nor keep the process alive at exit.
     threading.Thread(target=_prewarm_jvm, name="jvm-prewarm", daemon=True).start()
-    restored = _restore_session()
-    if restored:
-        print(f"Restored {restored} image(s) from previous session")
-    else:
-        r = ImageReader()
-        r.load_dummy()
-        add_image(r)
-        print("No session to restore - loaded dummy data")
+    _start_fresh_session()
+    print("Started with an empty image list; previous session was not restored")
     yield
     # (no shutdown cleanup needed — session is persisted incrementally)
 
@@ -2313,6 +2392,14 @@ def choose_files():
 _PROJ_LABEL = {"max": "MaxProj", "min": "MinProj", "avg": "AvgProj"}
 
 
+class CropRectRequest(BaseModel):
+    """Source-image pixel crop, measured from the top-left corner."""
+    x: int
+    y: int
+    width: int
+    height: int
+
+
 class ProjectionRequest(BaseModel):
     image_ids: list[str]
     method: str = "max"        # "max" | "min" | "avg"
@@ -2329,6 +2416,9 @@ class ProjectionRequest(BaseModel):
     #: Identity of each file the user actually approved replacing. A bare
     #: overwrite flag is not enough when rendering can take minutes.
     expected_revisions: dict[str, str] = {}
+    #: Optional source-pixel rectangle. It is validated before any projection
+    #: plane is read and applied to the resulting 2D projection.
+    crop: CropRectRequest | None = None
 
 
 @app.post("/api/projection/jobs")
@@ -3501,7 +3591,7 @@ def apply_projection(req: ProjectionRequest):
             raise ValueError("画像を1つ以上選択してください")
 
         results: list[dict] = []
-        pending: list[tuple[str, ImageReader, ImageMetadata, str]] = []
+        pending: list[tuple[str, ImageReader, ImageMetadata, str, tuple[int, int, int, int] | None]] = []
         runtime_sources: list[ImageMetadata] = []
         batch = len(req.image_ids) > 1
 
@@ -3516,7 +3606,8 @@ def apply_projection(req: ProjectionRequest):
                 _ensure_reader_ready_reserved(r, img_id, metadata_only=True)
             meta = r.metadata
             out_path = _projection_target(req, meta, batch)
-            pending.append((img_id, r, meta, out_path))
+            crop_rect = _resolve_crop_rect(req.crop, int(meta.width), int(meta.height))
+            pending.append((img_id, r, meta, out_path, crop_rect))
 
         target_keys = [_path_key(item[3]) for item in pending]
         if len(set(target_keys)) != len(target_keys):
@@ -3555,7 +3646,7 @@ def apply_projection(req: ProjectionRequest):
             f"Z投影を保存中（0/{len(pending)}画像）…",
         )
 
-        for image_index, (img_id, r, _cached_meta, out_path) in enumerate(pending):
+        for image_index, (img_id, r, _cached_meta, out_path, crop_rect) in enumerate(pending):
             # A restored session deliberately carries dimensions only. Loading
             # can replace them with authoritative channel names, pixel sizes,
             # channel count and ranges; use those for both pixels and OME-XML.
@@ -3571,12 +3662,14 @@ def apply_projection(req: ProjectionRequest):
                 meta, z_from, z_to, t = _projection_runtime_plan(
                     r, req, out_path, batch,
                 )
+                crop_rect = _resolve_crop_rect(req.crop, int(meta.width), int(meta.height))
                 runtime_sources.append(meta)
 
                 # Project all channels: result shape (C, Y, X)
                 projected = []
                 for c in range(meta.num_channels):
                     proj = r.get_projection(c, t, z_from, z_to, req.method)
+                    proj = _crop_plane(proj, crop_rect)
                     projected.append(proj)
                     completed_units += 1
                     _export_progress(
@@ -3743,7 +3836,7 @@ def apply_projection(req: ProjectionRequest):
         # Registration may evict an older reader. Do that under the shared gate
         # too, but after all publication locks are gone.
         with _memory_heavy_reservation(advances_epoch=False):
-            for ((source_image_id, _reader, _meta, _planned), out_path,
+            for ((source_image_id, _reader, _meta, _planned, _crop), out_path,
                  new_reader) in zip(pending, targets, staged_readers):
                 new_id = add_image(new_reader)
 
@@ -3769,7 +3862,7 @@ def apply_projection(req: ProjectionRequest):
 
 def _selftest_export_targets() -> int:
     """Prove export refusals happen before pixels are read or files are changed."""
-    global images, active_id, _lru, APP_DIR
+    global images, active_id, _lru, APP_DIR, SESSION_FILE
     import tempfile
 
     class _NoPixelReader:
@@ -3803,11 +3896,26 @@ def _selftest_export_targets() -> int:
             self.slice_calls += 1
             return super().get_slice(c, z, t)
 
-    saved_images, saved_active, saved_lru, saved_app_dir = images, active_id, _lru, APP_DIR
+    saved_images, saved_active, saved_lru = images, active_id, _lru
+    saved_app_dir, saved_session_file = APP_DIR, SESSION_FILE
     try:
         with tempfile.TemporaryDirectory() as tmp:
             APP_DIR = os.path.join(tmp, "app")
             os.makedirs(APP_DIR)
+            SESSION_FILE = os.path.join(APP_DIR, "session.json")
+            crop_tuple = _resolve_crop_rect(CropRectRequest(x=1, y=1, width=2, height=2), 4, 5)
+            crop_probe = np.arange(20, dtype=np.uint16).reshape(5, 4)
+            crop_result = _crop_plane(crop_probe, crop_tuple)
+            if crop_tuple != (1, 1, 2, 2) or not np.array_equal(
+                crop_result, np.array([[5, 6], [9, 10]], dtype=np.uint16),
+            ):
+                raise AssertionError("source crop did not preserve the requested plane")
+            try:
+                _resolve_crop_rect(CropRectRequest(x=3, y=0, width=2, height=1), 4, 5)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("out-of-bounds crop was accepted")
             plate_source = Path(tmp, "plate-source.oir")
             plate_source.write_bytes(b"plate source")
             plate_source_state = snapshot_source(plate_source)
@@ -4468,6 +4576,90 @@ def _selftest_export_targets() -> int:
                     )):
                 raise AssertionError("2D staged save did not preserve verified pixels")
 
+            # End-to-end crop regression: a non-symmetric source pattern must
+            # survive Save's crop, staging, reopen, and publication with the
+            # requested source-pixel orientation and dimensions intact.
+            import tifffile
+            crop_source = Path(tmp, "crop-pattern.oir")
+            crop_source.write_bytes(b"crop source")
+            crop_state = snapshot_source(crop_source)
+            crop_meta = ImageMetadata(
+                filename=crop_source.name, source_path=str(crop_source),
+                source_identity=crop_state.identity, source_revision=crop_state.revision,
+                num_channels=1, num_z=1, num_t=1, width=4, height=3,
+                channel_names=["signal"],
+            )
+            crop_reader = _CountingReader(crop_meta)
+            crop_reader.data = np.array(
+                [[[[[10, 20, 30, 40],
+                    [50, 60, 70, 80],
+                    [90, 100, 110, 120]]]]],
+                dtype=np.uint16,
+            )
+            images, active_id, _lru = {"crop": crop_reader}, "crop", []
+            crop_target = Path(tmp, "crop-2d_merge.tif")
+            crop_saved = save_images(SaveRequest(
+                output_dir=tmp, image_ids=["crop"], basename="crop-2d",
+                channels=[0], channel_colors=[[255, 255, 255]],
+                channel_mins=[0], channel_maxs=[120], save_separate=False,
+                save_merge=True, z_mode="current", format="tiff",
+                bit_depth_output="16",
+                crop=CropRectRequest(x=1, y=1, width=2, height=2),
+            ))
+            crop_expected = _render_merge(
+                [np.array([[60, 70], [100, 110]], dtype=np.uint16)],
+                [[255, 255, 255]], [0], [120], True,
+            )
+            with tifffile.TiffFile(crop_target) as tif:
+                crop_pixels = np.asarray(tif.asarray())
+            if (not isinstance(crop_saved, dict)
+                    or crop_reader.slice_calls != 1
+                    or crop_pixels.shape != (2, 2, 3)
+                    or not np.array_equal(crop_pixels, crop_expected)):
+                raise AssertionError(
+                    f"2D crop publication mismatch: shape={crop_pixels.shape}, "
+                    f"pixels={crop_pixels.tolist()}"
+                )
+
+            # The projection path must apply the same source crop before OME
+            # publication. Use a second Z plane so max projection cannot pass
+            # merely by copying the current plane.
+            projection_meta = ImageMetadata(
+                filename=crop_source.name, source_path=str(crop_source),
+                source_identity=crop_state.identity, source_revision=crop_state.revision,
+                num_channels=1, num_z=2, num_t=1, width=4, height=3,
+                channel_names=["signal"],
+            )
+            projection_reader = _CountingReader(projection_meta)
+            projection_reader.data = np.array(
+                [[[[[1, 2, 3, 4],
+                    [5, 6, 7, 8],
+                    [9, 10, 11, 12]],
+                   [[13, 14, 15, 16],
+                    [17, 60, 70, 20],
+                    [21, 100, 110, 24]]]]],
+                dtype=np.uint16,
+            )
+            images, active_id, _lru = {"crop-proj": projection_reader}, "crop-proj", []
+            projection_target = Path(tmp, "crop-projection.ome.tif")
+            projection_saved = apply_projection(ProjectionRequest(
+                image_ids=["crop-proj"], output_dir=tmp,
+                filename="crop-projection", method="max", z_from=0, z_to=1, t=0,
+                crop=CropRectRequest(x=1, y=1, width=2, height=2),
+            ))
+            with tifffile.TiffFile(projection_target) as tif:
+                projection_pixels = np.asarray(tif.asarray())
+            if projection_pixels.ndim == 2:
+                projection_pixels = projection_pixels[np.newaxis, ...]
+            projection_expected = np.array([[[60, 70], [100, 110]]], dtype=np.uint16)
+            if (not isinstance(projection_saved, dict)
+                    or projection_pixels.shape != projection_expected.shape
+                    or not np.array_equal(projection_pixels, projection_expected)):
+                raise AssertionError(
+                    f"projection crop publication mismatch: shape={projection_pixels.shape}, "
+                    f"pixels={projection_pixels.tolist()}"
+                )
+
             images, active_id, _lru = {"one": reader}, "one", []
 
             conflict = apply_projection(ProjectionRequest(
@@ -4640,7 +4832,7 @@ def _selftest_export_targets() -> int:
         return 24
     finally:
         images, active_id, _lru = saved_images, saved_active, saved_lru
-        APP_DIR = saved_app_dir
+        APP_DIR, SESSION_FILE = saved_app_dir, saved_session_file
 
     print("selftest: export targets OK (open sources immutable; conflicts skip pixels)",
           flush=True)
@@ -4686,6 +4878,8 @@ class SaveRequest(BaseModel):
     overwrite: bool = False
     #: Exact target states returned by the conflict response the user approved.
     expected_revisions: dict[str, str] = {}
+    #: Optional source-pixel rectangle applied to every selected image.
+    crop: CropRectRequest | None = None
     bit_depth_output: str = "16"   # "8" or "16" (16 only for TIFF)
 
 
@@ -4787,6 +4981,35 @@ def _resolve_channel_settings(req: SaveRequest, img_id: str, meta) -> tuple[list
             channel=s.channel, color=[int(v) for v in color], min=s.min, max=s.max,
         ))
     return settings, dropped
+
+
+def _resolve_crop_rect(crop: CropRectRequest | None, width: int, height: int) -> tuple[int, int, int, int] | None:
+    """Validate a source crop before reading any pixels.
+
+    A crop is intentionally rejected rather than silently clamped. A rectangle
+    selected for one image must not become a different rectangle for another
+    image in a batch, and stale coordinates must fail closed before output work.
+    """
+    if crop is None:
+        return None
+    x, y, w, h = int(crop.x), int(crop.y), int(crop.width), int(crop.height)
+    if width <= 0 or height <= 0 or x < 0 or y < 0 or w <= 0 or h <= 0:
+        raise ValueError("クロップ範囲が不正です。画像内の正の範囲を指定してください。")
+    if x + w > width or y + h > height:
+        raise ValueError(
+            f"クロップ範囲 ({x}, {y}, {w}, {h}) が画像サイズ {width}×{height} を超えています。"
+        )
+    return x, y, w, h
+
+
+def _crop_plane(data: np.ndarray, crop: tuple[int, int, int, int] | None) -> np.ndarray:
+    """Return a contiguous view of one plane cropped to the requested bounds."""
+    if crop is None:
+        return data
+    x, y, w, h = crop
+    if data.ndim != 2 or x + w > data.shape[1] or y + h > data.shape[0]:
+        raise ValueError("クロップ範囲と読み込んだ画像平面のサイズが一致しません。")
+    return np.ascontiguousarray(data[y:y + h, x:x + w])
 
 
 #: How many conflicting names to name in the warning before summarising.
@@ -5147,6 +5370,7 @@ def save_images(req: SaveRequest):
             t_from = max(0, min(t_from, n_t - 1))
             t_to = max(t_from, min(t_to, n_t - 1))
             t_list = list(range(t_from, t_to + 1))
+            crop_rect = _resolve_crop_rect(req.crop, int(meta.width), int(meta.height))
 
             # Names depend on nothing but the settings, so every destination for
             # this image is known before a single plane is read. Collected here
@@ -5165,7 +5389,7 @@ def save_images(req: SaveRequest):
                     if req.save_merge and settings:
                         planned.append(os.path.join(img_dir, f"{basename}_merge{zt}{ext}"))
             pending.append((img_id, r, meta, settings, basename, img_dir,
-                            z_list, t_list, img_z_from, img_z_to))
+                            z_list, t_list, img_z_from, img_z_to, crop_rect))
 
         if not planned:
             raise ValueError("保存する画像がありません。チャンネルとZ/T範囲を確認してください。")
@@ -5230,7 +5454,7 @@ def save_images(req: SaveRequest):
         )
 
         for (img_id, r, meta, settings, basename, img_dir,
-             z_list, t_list, img_z_from, img_z_to) in pending:
+             z_list, t_list, img_z_from, img_z_to, crop_rect) in pending:
             # A batch may reach an evicted reader without activating its tab.
             # Keep its decode and every derived frame in one reservation so a
             # concurrent open cannot force another multi-GB source into memory.
@@ -5277,6 +5501,7 @@ def save_images(req: SaveRequest):
                                 )
                             else:
                                 sl = r.get_slice(s.channel, z_idx, t_val)
+                            sl = _crop_plane(sl, crop_rect)
                             cmin, cmax = s.min, s.max
                             if cmin is None or cmax is None:
                                 auto_lo, auto_hi = auto_contrast(sl)
@@ -5480,7 +5705,8 @@ def main():
         rc = selftest()
         rc_plate = plate.selftest()
         rc_session = _selftest_session()
-        raise SystemExit(rc or rc_plate or rc_session)
+        rc_startup = _selftest_fresh_startup()
+        raise SystemExit(rc or rc_plate or rc_session or rc_startup)
     use_webview = "--no-webview" not in sys.argv and not getattr(sys, "frozen", False)
     if use_webview:
         try:
