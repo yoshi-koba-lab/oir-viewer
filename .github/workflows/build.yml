@@ -123,6 +123,53 @@ jobs:
           npm install
           npx electron-builder ${{ matrix.builder_args }} --publish never
 
+      # macOS ships the .app inside the DMG, so the app has to be signed before
+      # the DMG is built — hence --dir above is not used and the app is signed in
+      # place, then the DMG is rebuilt around it.
+      #
+      # Why this exists: with no signing identity on the runner, electron-builder
+      # skips signing entirely and leaves Electron's own linker signature on the
+      # binary. That signature declares sealed resources the bundle does not
+      # have, so `codesign --verify` fails outright — and a quarantined app with a
+      # BROKEN signature is reported by macOS as "damaged", which reads as a
+      # corrupt download and offers no way forward. An ad-hoc signature is still
+      # not notarized, but it is valid, so the same app instead gets the ordinary
+      # "unidentified developer" prompt the user can allow.
+      #
+      # Not `mac.identity: null` in package.json: that was the obvious guess and
+      # it is the opposite — electron-builder logs "skipped macOS code signing
+      # reason=identity explicitly is set to null".
+      - name: Sign the macOS app ad-hoc and verify it
+        if: runner.os == 'macOS'
+        run: |
+          APP=$(find release -maxdepth 2 -name "*.app" -print -quit)
+          [ -n "$APP" ] || { echo "no .app produced"; exit 1; }
+          echo "signing $APP"
+          xattr -cr "$APP"
+          codesign --force --deep --sign - "$APP"
+          # Fail the build rather than ship an unopenable DMG: this is the exact
+          # check that would have caught the broken signature in every release so
+          # far, none of which was ever verified.
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -dv "$APP" 2>&1 | grep -q "Identifier=jp.ykobayashi.oirviewer" \
+            || { echo "signed bundle kept Electron's identity"; exit 1; }
+
+      - name: Rebuild the DMG around the signed app
+        if: runner.os == 'macOS'
+        working-directory: desktop
+        run: |
+          APP=$(cd .. && find release -maxdepth 2 -name "*.app" -print -quit)
+          rm -f ../release/*.dmg
+          npx electron-builder ${{ matrix.builder_args }} \
+            --prepackaged "../$APP" --publish never
+          # And prove the app inside the shipped DMG is the signed one.
+          cd ..
+          DMG=$(find release -maxdepth 1 -name "*.dmg" -print -quit)
+          hdiutil attach "$DMG" -nobrowse -readonly -mountpoint /tmp/verify-dmg
+          codesign --verify --deep --strict "/tmp/verify-dmg/OIR Viewer.app"
+          hdiutil detach /tmp/verify-dmg
+          echo "DMG contains a validly signed app"
+
       - uses: actions/upload-artifact@v4
         with:
           name: oir-viewer-${{ matrix.name }}
