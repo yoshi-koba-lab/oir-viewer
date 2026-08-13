@@ -17,6 +17,7 @@ backend/runtime/
 # Packaging output
 build/
 dist/
+release/
 *.spec.bak
 src-tauri/target/
 

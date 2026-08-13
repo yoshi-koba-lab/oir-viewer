@@ -43,6 +43,20 @@ export interface OpenWell {
   channelIdx: number[];
   levels: [number, number][];
   colors: [number, number, number][];
+  /**
+   * Channels the 3D view can draw at all (the first four). Channel patterns
+   * validate against this: a pattern naming CH3 on a two-channel well must
+   * refuse rather than silently draw something else.
+   */
+  numChannels: number;
+  /**
+   * Per channel 0..numChannels-1, the tab's window and colour whether or not
+   * the channel is currently visible. A fixed pattern may draw a hidden
+   * channel, and it draws it with the tab's own settings — the pattern decides
+   * which channels appear, never how they look.
+   */
+  channelWindows: [number, number][];
+  channelColors: [number, number, number][];
   view: Volume3DState;
   /**
    * The Z slab as a 0..1 fraction of the stack. The export re-reads the volume
@@ -96,6 +110,10 @@ export function collectOpenWells(scan: PlateScan | null): OpenWell[] {
       : st.imageViewStates[item.id]?.currentT ?? 0;
 
     const channelIdx = channels.map((_, i) => i).filter((i) => channels[i].visible).slice(0, 4);
+    const numChannels = Math.min(channels.length, 4);
+    const channelWindows = channels.slice(0, numChannels)
+      .map((ch) => [ch.min, ch.max] as [number, number]);
+    const channelColors = channels.slice(0, numChannels).map((ch) => ch.color);
     const total = Math.max(1, view.zTotal);
     const zFrac: [number, number] = [
       Math.max(0, Math.min(1, (view.zStart - 1) / total)),
@@ -117,6 +135,9 @@ export function collectOpenWells(scan: PlateScan | null): OpenWell[] {
       channelIdx,
       levels: channelIdx.map((c) => [channels[c].min, channels[c].max] as [number, number]),
       colors: channelIdx.map((c) => channels[c].color),
+      numChannels,
+      channelWindows,
+      channelColors,
       view,
       zFrac,
     });

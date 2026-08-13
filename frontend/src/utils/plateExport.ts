@@ -16,17 +16,27 @@ export function plateZoomProblem(value: string): string {
 }
 
 /**
- * Count only completed, externally-verifiable units: one preflight, two units
- * per well (data acquired, then render/PNG completed), and one final verified
- * publish. Stage starts never advance the percentage.
+ * Count only completed, externally-verifiable units: one preflight, per well
+ * one data acquisition plus one render per selected channel pattern, and one
+ * verified publish per pattern. Stage starts never advance the percentage.
+ *
+ * The pattern count defaults to 1, which reproduces the original two-units-
+ * per-well schedule exactly — existing callers and recorded expectations are
+ * unchanged.
  */
-export function plateExportTotalUnits(totalWells: number): number {
-  return 1 + Math.max(0, Math.trunc(totalWells)) * 2 + 1;
+export function plateExportTotalUnits(totalWells: number, patternCount = 1): number {
+  const wells = Math.max(0, Math.trunc(totalWells));
+  const patterns = Math.max(1, Math.trunc(patternCount));
+  return 1 + wells * (1 + patterns) + patterns;
 }
 
-/** 100% is reachable only when the caller includes the verified publish unit. */
-export function plateExportPercent(completedUnits: number, totalWells: number): number {
-  const total = plateExportTotalUnits(totalWells);
+/** 100% is reachable only when the caller includes every verified publish unit. */
+export function plateExportPercent(
+  completedUnits: number,
+  totalWells: number,
+  patternCount = 1,
+): number {
+  const total = plateExportTotalUnits(totalWells, patternCount);
   const completed = Math.max(0, Math.min(total, Math.trunc(completedUnits)));
   return Math.floor((completed / total) * 100);
 }

@@ -2,6 +2,8 @@
 //
 // Format: vX.Y.Z
 // Update history (latest first):
+//   1.5.15 — 2026-08-13 — Plate Save can export several named channel patterns
+//     (for example all channels and CH1+2 only) as separate PDFs in one run.
 //   1.5.14 — 2026-08-13 — Crop selections stay aligned between the display and
 //     saved output in 2D and 3D. Browser Open accepts selected files, and Plate
 //     dialogs stay usable inside the window.
@@ -68,4 +70,4 @@
 //     and TIFF/PNG/JPEG plus OME-TIFF export.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.5.14';
+export const VERSION = '1.5.15';

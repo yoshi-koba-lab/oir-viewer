@@ -57,3 +57,13 @@ test('Plate zoom editing accepts a real percent but never treats an empty or uns
   assert.match(plateZoomProblem('-20'), /10–1000/);
   assert.match(plateZoomProblem('1001'), /10–1000/);
 });
+
+test('pattern count multiplies renders and publishes, and defaults to one', () => {
+  // 1 preflight + wells*(1 fetch + P renders) + P publishes.
+  assert.equal(plateExportTotalUnits(8), plateExportTotalUnits(8, 1));
+  assert.equal(plateExportTotalUnits(8, 2), 1 + 8 * 3 + 2);
+  assert.equal(plateExportPercent(0, 8, 2), 0);
+  assert.equal(plateExportPercent(1 + 8 * 3 + 2, 8, 2), 100);
+  // 100% is unreachable until the last publish unit lands.
+  assert.ok(plateExportPercent(1 + 8 * 3 + 1, 8, 2) < 100);
+});

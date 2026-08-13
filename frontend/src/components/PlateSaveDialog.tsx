@@ -12,6 +12,12 @@ import { gpuLimits } from '../utils/gpuLimits';
 import { OverwriteConflict } from '../utils/api';
 import { basenameOf, filenameProblem } from '../utils/paths';
 import { plateExportPercent, plateZoomProblem } from '../utils/plateExport';
+import {
+  VISIBLE_PATTERN, channelSetLabel, loadPatterns, patternChannelsFor,
+  patternFileStem, patternMask, patternProblem, savePatterns,
+  unionChannelsFor, wellsMissingPatternChannels,
+  type PlatePattern,
+} from '../utils/platePatterns';
 import { formatUm } from '../utils/scalebar';
 import {
   MAX_VOLUME_ZOOM_PERCENT,
@@ -96,9 +102,11 @@ export function PlateSaveDialog({
   const [nameConflict, setNameConflict] = useState<
     { files: string[]; count: number; more: number } | null
   >(null);
-  type PdfJob = { outputDir: string; filename: string; expectedRevision?: string };
-  /** The exact path the user approved; confirmation never opens a second picker. */
-  const [pendingJob, setPendingJob] = useState<PdfJob | null>(null);
+  type PdfJob = {
+    patternKey: string; outputDir: string; filename: string; expectedRevision?: string;
+  };
+  /** The exact paths the user approved; confirmation never opens a second picker. */
+  const [pendingJobs, setPendingJobs] = useState<PdfJob[] | null>(null);
   /** Invalidates an older asynchronous name check after the field changes. */
   const pdfCheckSeq = useRef(0);
   const [conflict, setConflict] = useState<
@@ -109,6 +117,74 @@ export function PlateSaveDialog({
   const imageList = useImageStore((s) => s.imageList);
   const activeImageId = useImageStore((s) => s.activeImageId);
   const cropRect = useViewStore((s) => s.cropRect);
+
+  /**
+   * Channel patterns: each selected one becomes its own PDF. User-defined
+   * patterns persist in localStorage; the built-in "visible channels" pattern
+   * is always offered and reproduces the behaviour this dialog always had.
+   */
+  const [userPatterns, setUserPatterns] = useState<PlatePattern[]>(
+    () => loadPatterns(window.localStorage),
+  );
+  const [selectedPatternKeys, setSelectedPatternKeys] = useState<string[]>(
+    [VISIBLE_PATTERN.key],
+  );
+  const [newPatternName, setNewPatternName] = useState('');
+  const [newPatternChannels, setNewPatternChannels] = useState<number[]>([]);
+  const allPatterns = useMemo(
+    () => [VISIBLE_PATTERN, ...userPatterns],
+    [userPatterns],
+  );
+  const selectedPatterns = useMemo(
+    () => allPatterns.filter((p) => selectedPatternKeys.includes(p.key)),
+    [allPatterns, selectedPatternKeys],
+  );
+  useEffect(() => {
+    savePatterns(window.localStorage, userPatterns);
+  }, [userPatterns]);
+
+  const togglePatternSelected = (key: string) => {
+    setSelectedPatternKeys((prev) => (
+      prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]
+    ));
+    invalidatePdfTarget();
+  };
+
+  const toggleNewPatternChannel = (channel: number) => {
+    setNewPatternChannels((prev) => (
+      prev.includes(channel)
+        ? prev.filter((c) => c !== channel)
+        : [...prev, channel].sort((a, b) => a - b)
+    ));
+  };
+
+  const addPattern = () => {
+    const problem = patternProblem(newPatternName, newPatternChannels, userPatterns);
+    if (problem) { setError(problem); return; }
+    const pattern: PlatePattern = {
+      key: `p${Date.now().toString(36)}-${userPatterns.length}`,
+      name: newPatternName.trim(),
+      channels: [...newPatternChannels].sort((a, b) => a - b),
+    };
+    setUserPatterns((prev) => [...prev, pattern]);
+    // Adding is an expression of intent to use it; selecting it saves a click
+    // and makes the effect of 追加 visible immediately.
+    setSelectedPatternKeys((prev) => [...prev, pattern.key]);
+    setNewPatternName('');
+    setNewPatternChannels([]);
+    invalidatePdfTarget();
+  };
+
+  const removePattern = (key: string) => {
+    setUserPatterns((prev) => prev.filter((p) => p.key !== key));
+    setSelectedPatternKeys((prev) => prev.filter((k) => k !== key));
+    invalidatePdfTarget();
+  };
+
+  /** Live feedback for the add form, silent until the user has typed anything. */
+  const newPatternProblemText = (newPatternName.trim() || newPatternChannels.length)
+    ? patternProblem(newPatternName, newPatternChannels, userPatterns)
+    : '';
 
   const commitPlateZoom = () => {
     const problem = plateZoomProblem(zoomPercentInput);
@@ -161,7 +237,7 @@ export function PlateSaveDialog({
     setCheckingPdfName(false);
     setNameConflict(null);
     setConflict(null);
-    setPendingJob(null);
+    setPendingJobs(null);
   };
 
   /** Check a typed name when focus leaves it; the export repeats this check. */
@@ -214,7 +290,7 @@ export function PlateSaveDialog({
    * appear in the PDF as an empty cell — indistinguishable from a well nobody
    * imaged — so the first failure aborts and nothing is written.
    */
-  const exportPdf = async (overwrite = false, approvedJob: PdfJob | null = null) => {
+  const exportPdf = async (overwrite = false, approvedJobs: PdfJob[] | null = null) => {
     const scan = plate;
     if (!scan) return;
     // Flush the tab being looked at. Its settings live in the live store fields
@@ -258,24 +334,56 @@ export function PlateSaveDialog({
       setError(`このプレートに属さないウェルが開いています: ${noPath.map((w) => w.wellId).join(', ')}`);
       return;
     }
-    const noCh = wells.filter((w) => w.channelIdx.length === 0);
-    if (noCh.length) {
-      setError(
-        `表示中のチャンネルがないウェルがあります: ${noCh.map((w) => w.wellId).join(', ')}\n`
-        + '各ウェルでチャンネルを 1 つ以上表示してください。',
-      );
+    // Which patterns this run draws. A conflict-approved rerun replays exactly
+    // the jobs the user confirmed; deleting a pattern between the dialog and
+    // the confirmation must fail rather than silently exporting fewer PDFs.
+    const runPatterns = approvedJobs
+      ? approvedJobs.map((jobEntry) => allPatterns.find((p) => p.key === jobEntry.patternKey))
+      : selectedPatterns;
+    if (approvedJobs && runPatterns.some((p) => p === undefined)) {
+      setError('確認済みのパターンが見つかりません。パターンを選び直してください。');
       return;
     }
-    const outsideInteractive3D = wells.filter(
-      (w) => w.channelIdx.some((channel) => channel >= 4),
-    );
-    if (outsideInteractive3D.length) {
-      setError(
-        `3D 画面に読み込まれていない5番目以降のチャンネルが選ばれています: ${
-          outsideInteractive3D.map((w) => w.wellId).join(', ')}\n`
-        + 'PDF と画面が異なる図になるため作成しません。先頭4チャンネル内で表示を調整してください。',
-      );
+    const patterns = runPatterns as PlatePattern[];
+    if (patterns.length === 0) {
+      setError('保存する色パターンを 1 つ以上選んでください。');
       return;
+    }
+    // The visible-channels pattern inherits the checks this dialog always ran;
+    // they are meaningless for fixed patterns, which ignore visibility.
+    if (patterns.some((p) => p.channels === null)) {
+      const noCh = wells.filter((w) => w.channelIdx.length === 0);
+      if (noCh.length) {
+        setError(
+          `表示中のチャンネルがないウェルがあります: ${noCh.map((w) => w.wellId).join(', ')}\n`
+          + '各ウェルでチャンネルを 1 つ以上表示するか、固定チャンネルのパターンを選んでください。',
+        );
+        return;
+      }
+      const outsideInteractive3D = wells.filter(
+        (w) => w.channelIdx.some((channel) => channel >= 4),
+      );
+      if (outsideInteractive3D.length) {
+        setError(
+          `3D 画面に読み込まれていない5番目以降のチャンネルが選ばれています: ${
+            outsideInteractive3D.map((w) => w.wellId).join(', ')}\n`
+          + 'PDF と画面が異なる図になるため作成しません。先頭4チャンネル内で表示を調整してください。',
+        );
+        return;
+      }
+    }
+    // A fixed pattern naming a channel a well does not have cannot be drawn as
+    // named; drawing something else instead would be a silently wrong figure.
+    for (const p of patterns) {
+      const missing = wellsMissingPatternChannels(p, wells);
+      if (missing.length) {
+        setError(
+          `パターン「${p.name}」（${channelSetLabel(p.channels ?? [])}）に無いチャンネルの`
+          + `ウェルがあります: ${missing.join(', ')}\n`
+          + 'パターンのチャンネルを減らすか、このパターンの選択を外してください。',
+        );
+        return;
+      }
     }
 
     // Freeze the conditions at the same instant as the well views. The table
@@ -338,16 +446,31 @@ export function PlateSaveDialog({
     const maxXy = wanted === 0 ? max3D : Math.min(wanted, max3D);
     const clamped = maxXy !== wanted;
 
-    let job = approvedJob;
-    const outputDir = job?.outputDir ?? pdfOutputDir.trim();
-    const typedName = job?.filename ?? pdfInputStem(pdfName);
+    let jobs = approvedJobs;
+    const outputDir = jobs?.[0]?.outputDir ?? pdfOutputDir.trim();
+    const typedName = pdfInputStem(pdfName);
     if (!outputDir) {
       setError('PDF の保存先フォルダを選んでください。');
       return;
     }
-    if (!job && pdfInputProblem(pdfName)) {
+    if (!jobs && pdfInputProblem(pdfName)) {
       setError(pdfInputProblem(pdfName));
       return;
+    }
+    if (!jobs && patterns.length > 1) {
+      // With no base name the backend would stamp each PDF its own timestamp,
+      // and nothing in the names would say they came from one run.
+      if (!typedName) {
+        setError('複数のパターンを保存するときは、ファイル名を入力してください。');
+        return;
+      }
+      for (const p of patterns) {
+        const stemProblem = filenameProblem(patternFileStem(typedName, p, patterns.length));
+        if (stemProblem) {
+          setError(`パターン「${p.name}」のファイル名: ${stemProblem}`);
+          return;
+        }
+      }
     }
     if (unifyZoom && plateZoomProblem(zoomPercentInput)) {
       setError(plateZoomProblem(zoomPercentInput));
@@ -384,7 +507,7 @@ export function PlateSaveDialog({
       color: viewSettings.scalebarColor,
     };
     let completedUnits = 0;
-    const completedPercent = () => plateExportPercent(completedUnits, wells.length);
+    const completedPercent = () => plateExportPercent(completedUnits, wells.length, patterns.length);
     let publishCompleted = false;
     let completionMessage = '';
 
@@ -395,46 +518,68 @@ export function PlateSaveDialog({
       setExporting(false);
     };
 
-    if (!job) {
+    if (!jobs) {
       setProgress({ percent: 0, label: 'PDF名と保存先を確認中…' });
+      const built: PdfJob[] = [];
+      const conflictFiles: string[] = [];
+      let conflictMore = 0;
       try {
-        const checked = await checkPlatePdfTarget({
-          plate_name: scan.name, output_dir: outputDir, filename: typedName,
-        });
-        if (pdfRunSeq.current !== runId || cancelRef.current) {
-          releaseRun();
-          return;
+        for (const p of patterns) {
+          const stem = patternFileStem(typedName, p, patterns.length);
+          try {
+            const checked = await checkPlatePdfTarget({
+              plate_name: scan.name, output_dir: outputDir, filename: stem,
+            });
+            built.push({
+              patternKey: p.key, outputDir,
+              filename: checked.filename, expectedRevision: checked.revision,
+            });
+          } catch (e) {
+            if (!(e instanceof OverwriteConflict)) throw e;
+            // Keep checking the rest: the user decides once, over the full list
+            // of files the run would replace, not once per pattern.
+            built.push({
+              patternKey: p.key, outputDir,
+              filename: stem
+                || (basenameOf(e.files[0] ?? '').replace(/\.pdf$/i, '') || 'plate'),
+              expectedRevision: Object.values(e.revisions)[0],
+            });
+            conflictFiles.push(...e.files);
+            conflictMore += e.more;
+          }
+          if (pdfRunSeq.current !== runId || cancelRef.current) {
+            releaseRun();
+            return;
+          }
         }
-        job = {
-          outputDir, filename: checked.filename, expectedRevision: checked.revision,
-        };
-        setNameConflict(null);
       } catch (e) {
         if (pdfRunSeq.current === runId && !cancelRef.current) {
-          if (e instanceof OverwriteConflict) {
-            const resolved = typedName
-              || (basenameOf(e.files[0] ?? '').replace(/\.pdf$/i, '') || 'plate');
-            const blockedJob = {
-              outputDir, filename: resolved,
-              expectedRevision: Object.values(e.revisions)[0],
-            };
-            setPendingJob(blockedJob);
-            setNameConflict({ files: e.files, count: e.count, more: e.more });
-            setConflict({ files: e.files, count: e.count, more: e.more });
-          } else {
-            setError(e instanceof Error ? e.message : String(e));
-          }
+          setError(e instanceof Error ? e.message : String(e));
         }
         releaseRun();
         return;
       }
+      if (conflictFiles.length) {
+        const summary = {
+          files: conflictFiles,
+          count: conflictFiles.length + conflictMore,
+          more: conflictMore,
+        };
+        setPendingJobs(built);
+        setNameConflict(summary);
+        setConflict(summary);
+        releaseRun();
+        return;
+      }
+      jobs = built;
+      setNameConflict(null);
     }
 
     // A confirmed preflight starts the long render with the progress UI visible,
     // not hidden behind the confirmation dialog for the next several minutes.
-    if (approvedJob) {
+    if (approvedJobs) {
       setConflict(null);
-      setPendingJob(null);
+      setPendingJobs(null);
       setNameConflict(null);
     }
 
@@ -462,14 +607,21 @@ export function PlateSaveDialog({
       releaseRun();
       return;
     }
-    const frames: {
+    type PdfFrame = {
       well_id: string; row: number; col: number; png_b64: string; caption: string[];
       source_path: string; source_identity: string; source_revision: string;
-    }[] = [];
+    };
+    const framesByPattern = new Map<string, PdfFrame[]>(
+      patterns.map((p) => [p.key, []]),
+    );
     const appliedFigureSettings = new Map<
       string,
       { zoomPercent: number; scalebarUm: number | null }
     >();
+    // For the catch block: which PDFs were already published when a later
+    // compose failed, and which pattern was being composed.
+    const writtenPdfs: { pattern: PlatePattern; path: string }[] = [];
+    let composing: PlatePattern | null = null;
     let renderer: PlateRenderer | null = null;
 
     const figureCols = columns.filter((c) => c.onFigure);
@@ -490,54 +642,75 @@ export function PlateSaveDialog({
           label: `${w.wellId} (${i + 1}/${wells.length}) 保存用データを取得中…`,
         });
         abortRef.current = new AbortController();
-        // Each well carries its own contrast and channel choice — that is the
-        // point of tuning them one at a time — so the window baked in here is
-        // this well's, not a global one.
+        // One fetch serves every pattern: the union of their channel sets is
+        // requested, and each pattern is rendered from it with a visibility
+        // mask. Refetching per pattern would multiply the slowest step (about
+        // two minutes per well on real data at Maximum) by the pattern count.
+        // The window baked in stays this well's own — the union draws windows
+        // and colours from the tab's per-channel state, so a pattern decides
+        // which channels appear, never how they look.
+        const unionChannels = unionChannelsFor(patterns, w);
         const buf = await fetchPlateVolume({
           path: w.path!,
           source_identity: w.sourceIdentity,
           source_revision: w.sourceRevision,
-          channels: w.channelIdx,
-          levels: w.levels,
+          channels: unionChannels,
+          levels: unionChannels.map((c) => w.channelWindows[c]),
           t: w.t,
           max_xy: maxXy,
         }, abortRef.current.signal);
         if (runCancelled()) { setResult('中止しました。PDF は作成していません。'); return; }
         completedUnits += 1;
-        setProgress({
-          percent: completedPercent(),
-          label: `${w.wellId} (${i + 1}/${wells.length}) 保存画像を3D描画中…`,
-        });
         const vol = parseVolume(buf.data, buf.info);
+        const unionColors = unionChannels.map((c) => w.channelColors[c]);
         const requestedZoom = runUnifyZoom
           ? runZoomPercent
           : Number.isFinite(w.view.zoomPercent) && w.view.zoomPercent > 0
             ? w.view.zoomPercent
             : 100;
-        const shot = await renderer.render(
-          w.wellId, vol, w.colors, w.channelIdx.map(() => true),
-          w.view.az, w.view.el, requestedZoom, w.zFrac, runScalebar,
-        );
-        if (runCancelled()) { setResult('中止しました。PDF は作成していません。'); return; }
-        let bin = '';
-        for (let k = 0; k < shot.png.length; k += 0x8000) {
-          bin += String.fromCharCode(...shot.png.subarray(k, k + 0x8000));
+        const caption = figureCols
+          .map((c) => (cells[w.wellId]?.[c.key] ?? '').trim())
+          .filter(Boolean)
+          .concat(w.numT > 1 ? [`T${w.t + 1}`] : []);
+        for (const p of patterns) {
+          if (runCancelled()) { setResult('中止しました。PDF は作成していません。'); return; }
+          setProgress({
+            percent: completedPercent(),
+            label: `${w.wellId} (${i + 1}/${wells.length})`
+              + `${patterns.length > 1 ? ` ${p.name} を` : ' 保存画像を'}3D描画中…`,
+          });
+          const shot = await renderer.render(
+            w.wellId, vol, unionColors, patternMask(p, w, unionChannels),
+            w.view.az, w.view.el, requestedZoom, w.zFrac, runScalebar,
+          );
+          if (runCancelled()) { setResult('中止しました。PDF は作成していません。'); return; }
+          let bin = '';
+          for (let k = 0; k < shot.png.length; k += 0x8000) {
+            bin += String.fromCharCode(...shot.png.subarray(k, k + 0x8000));
+          }
+          framesByPattern.get(p.key)!.push({
+            well_id: w.wellId, row: w.row, col: w.col, png_b64: btoa(bin),
+            source_path: w.path!,
+            source_identity: buf.info.source_identity,
+            source_revision: buf.info.source_revision,
+            caption,
+          });
+          // Zoom and scale bar depend on the volume geometry and camera only,
+          // never on which channels are lit, so every pattern of one well must
+          // agree. A disagreement means that assumption broke — refuse rather
+          // than record one pattern's numbers as the truth about all of them.
+          const known = appliedFigureSettings.get(w.wellId);
+          if (!known) {
+            appliedFigureSettings.set(w.wellId, {
+              zoomPercent: shot.zoomPercent,
+              scalebarUm: shot.scalebarUm,
+            });
+          } else if (known.zoomPercent !== shot.zoomPercent
+            || known.scalebarUm !== shot.scalebarUm) {
+            throw new Error(`${w.wellId}: パターン間で拡大率またはスケールバーが一致しません。`);
+          }
+          completedUnits += 1;
         }
-        frames.push({
-          well_id: w.wellId, row: w.row, col: w.col, png_b64: btoa(bin),
-          source_path: w.path!,
-          source_identity: buf.info.source_identity,
-          source_revision: buf.info.source_revision,
-          caption: figureCols
-            .map((c) => (cells[w.wellId]?.[c.key] ?? '').trim())
-            .filter(Boolean)
-            .concat(w.numT > 1 ? [`T${w.t + 1}`] : []),
-        });
-        appliedFigureSettings.set(w.wellId, {
-          zoomPercent: shot.zoomPercent,
-          scalebarUm: shot.scalebarUm,
-        });
-        completedUnits += 1;
         setProgress({
           percent: completedPercent(),
           label: `${w.wellId} (${i + 1}/${wells.length}) 描画完了`,
@@ -547,10 +720,6 @@ export function PlateSaveDialog({
       if (runCancelled()) { setResult('中止しました。PDF は作成していません。'); return; }
       finalizingPdfRef.current = true;
       setFinalizingPdf(true);
-      setProgress({
-        percent: completedPercent(),
-        label: 'PDFファイルを保存中…（この段階は中止できません）',
-      });
       // Why each empty cell is empty. Marking them all "not acquired" would print
       // a false statement over a well the microscope did image — a reader of the
       // figure has no way to tell that apart from a genuinely empty position.
@@ -564,64 +733,110 @@ export function PlateSaveDialog({
             : 'excluded';
         }
       }
-      const res = await composePlatePdf({
-        plate_name: scan.name, rows: scan.rows, cols: scan.cols,
-        frames, well_states: states, cell_px: cellPx, output_dir: job.outputDir,
-        hide_empty_wells: runHideEmptyWells,
-        filename: job.filename,
-        overwrite,
-        expected_revision: job.expectedRevision,
-        // These two generated columns prove which figure-wide options were
-        // actually applied. Per-well zooms are retained when unification is off,
-        // and auto scale-bar lengths may legitimately differ by calibration.
-        table_headers: [...columns.map((c) => c.label), 'PDF拡大率', 'スケールバー（中心深度換算）'],
-        table_rows: wells.map((w) => {
-          const applied = appliedFigureSettings.get(w.wellId);
-          if (!applied) throw new Error(`${w.wellId}: PDF設定の記録がありません。`);
-          return [
-            ...columns.map((c) => cells[w.wellId]?.[c.key] ?? ''),
-            `${displayPercent(applied.zoomPercent)}%${runUnifyZoom ? '（統一）' : '（タブ設定）'}`,
-            applied.scalebarUm === null
-              ? 'なし'
-              : `${formatUm(applied.scalebarUm)}（中心深度換算・画像内左下）`,
-          ];
-        }),
-        // The resolution actually applied, never the one requested. Recording the
-        // request is how the footer came to state a resolution that was not used.
-        footer: `matl ${scan.matl_sha256.slice(0, 8)} | vol ${volKey}(${maxXy})`
-              + `${clamped ? ` GPU上限${max3D}に制限` : ''}`
-              + `${wells.some((w) => w.numT > 1)
-                ? ` | T ${wells.map((w) => `${w.wellId}:${w.t + 1}`).join(',')}` : ''}`
-              + ` | zoom ${runUnifyZoom ? `${displayPercent(runZoomPercent)}% unified` : 'per-well'}`
-              + ` | scalebar ${runIncludeScalebar ? 'on(center-depth)' : 'off'}`
-              + ` | layout ${runHideEmptyWells ? 'compact(empty hidden)' : 'full plate'}`
-              + ` | cell ${cellPx}px | ${wells.length} wells | ${new Date().toISOString()}`,
-      });
-      if (res.wells !== wells.length || !(res.bytes > 0) || !res.path) {
-        throw new Error('保存したPDFのウェル数またはファイル情報を検証できません。');
+      const completions: string[] = [];
+      for (const [patternIndex, p] of patterns.entries()) {
+        composing = p;
+        const job = jobs.find((j) => j.patternKey === p.key);
+        if (!job) throw new Error(`パターン「${p.name}」の保存先が確定していません。`);
+        setProgress({
+          percent: completedPercent(),
+          label: patterns.length > 1
+            ? `PDFファイルを保存中…（${patternIndex + 1}/${patterns.length}: ${p.name}・この段階は中止できません）`
+            : 'PDFファイルを保存中…（この段階は中止できません）',
+        });
+        const patternChannelNote = p.channels === null
+          ? 'per-well visible'
+          : channelSetLabel(p.channels);
+        const res = await composePlatePdf({
+          plate_name: scan.name, rows: scan.rows, cols: scan.cols,
+          frames: framesByPattern.get(p.key)!,
+          well_states: states, cell_px: cellPx, output_dir: job.outputDir,
+          hide_empty_wells: runHideEmptyWells,
+          filename: job.filename,
+          overwrite,
+          expected_revision: job.expectedRevision,
+          // These generated columns prove which figure-wide options were
+          // actually applied. Per-well zooms are retained when unification is
+          // off, auto scale-bar lengths may differ by calibration, and the
+          // channel column records what this PDF actually drew — for the
+          // visible pattern that varies per well, for a fixed pattern it does
+          // not, and either way the table says so instead of implying that the
+          // conditions table's channel column described this figure.
+          table_headers: [
+            ...columns.map((c) => c.label),
+            'PDF拡大率', 'スケールバー（中心深度換算）', '保存チャンネル',
+          ],
+          table_rows: wells.map((w) => {
+            const applied = appliedFigureSettings.get(w.wellId);
+            if (!applied) throw new Error(`${w.wellId}: PDF設定の記録がありません。`);
+            return [
+              ...columns.map((c) => cells[w.wellId]?.[c.key] ?? ''),
+              `${displayPercent(applied.zoomPercent)}%${runUnifyZoom ? '（統一）' : '（タブ設定）'}`,
+              applied.scalebarUm === null
+                ? 'なし'
+                : `${formatUm(applied.scalebarUm)}（中心深度換算・画像内左下）`,
+              channelSetLabel(patternChannelsFor(p, w)),
+            ];
+          }),
+          // The resolution actually applied, never the one requested. Recording the
+          // request is how the footer came to state a resolution that was not used.
+          footer: `matl ${scan.matl_sha256.slice(0, 8)} | vol ${volKey}(${maxXy})`
+                + `${clamped ? ` GPU上限${max3D}に制限` : ''}`
+                + ` | channels ${patternChannelNote}${patterns.length > 1 ? ` (${p.name})` : ''}`
+                + `${wells.some((w) => w.numT > 1)
+                  ? ` | T ${wells.map((w) => `${w.wellId}:${w.t + 1}`).join(',')}` : ''}`
+                + ` | zoom ${runUnifyZoom ? `${displayPercent(runZoomPercent)}% unified` : 'per-well'}`
+                + ` | scalebar ${runIncludeScalebar ? 'on(center-depth)' : 'off'}`
+                + ` | layout ${runHideEmptyWells ? 'compact(empty hidden)' : 'full plate'}`
+                + ` | cell ${cellPx}px | ${wells.length} wells | ${new Date().toISOString()}`,
+        });
+        if (res.wells !== wells.length || !(res.bytes > 0) || !res.path) {
+          throw new Error('保存したPDFのウェル数またはファイル情報を検証できません。');
+        }
+        writtenPdfs.push({ pattern: p, path: res.path });
+        completedUnits += 1;
+        completions.push(
+          `${patterns.length > 1 ? `【${p.name}】 ` : ''}`
+          + `${res.wells} ウェルを書き出しました（${Math.round(res.bytes / 1024)} KB）\n${res.path}`,
+        );
       }
-      completedUnits += 1;
+      composing = null;
       publishCompleted = true;
       setProgress({ percent: completedPercent(), label: 'PDF保存完了' });
-      completionMessage = (
-        `${res.wells} ウェルを書き出しました（${Math.round(res.bytes / 1024)} KB）\n${res.path}`
+      completionMessage = completions.join('\n')
         + (clamped
           ? `\n※ 解像度は この GPU の上限 ${max3D} px に制限しました（${vendor}）。`
-          : '')
-      );
+          : '');
     } catch (e) {
+      const writtenNote = writtenPdfs.length
+        ? `既に保存できたPDF:\n${writtenPdfs.map((w) => `【${w.pattern.name}】 ${w.path}`).join('\n')}\n\n`
+        : '';
       // A cancel aborts the fetch, which surfaces here as an AbortError. That is
       // the user's own action, not a failure to report as one.
-      if (runCancelled()) setResult('中止しました。PDF は作成していません。');
-      // Nothing was written; ask before replacing. The wells are already
+      if (runCancelled()) setResult(`${writtenNote}中止しました。残りの PDF は作成していません。`);
+      // Nothing was written yet; ask before replacing. The wells are already
       // rendered, so confirming does not repeat the expensive part... it does,
       // in fact, and that is the honest trade: keeping every frame in memory to
       // avoid it is what makes a 24-well export run out of room.
-      else if (e instanceof OverwriteConflict) {
-        setPendingJob({ ...job, expectedRevision: Object.values(e.revisions)[0] });
+      else if (e instanceof OverwriteConflict && writtenPdfs.length === 0) {
+        setPendingJobs((jobs ?? []).map((jobEntry) => (
+          jobEntry.patternKey === composing?.key
+            ? { ...jobEntry, expectedRevision: Object.values(e.revisions)[0] }
+            : jobEntry
+        )));
         setNameConflict({ files: e.files, count: e.count, more: e.more });
         setConflict({ files: e.files, count: e.count, more: e.more });
-      } else setError(e instanceof Error ? e.message : String(e));
+      } else if (e instanceof OverwriteConflict) {
+        // Some PDFs are already published. Re-running the whole set would
+        // re-render everything and re-ask about files this run just wrote, so
+        // report exactly where it stopped instead of pretending to resume.
+        setError(
+          `${writtenNote}パターン「${composing?.name ?? '?'}」の保存先ファイルが確認後に`
+          + '変わりました。残りのパターンは名前を変えるか、確認し直して再実行してください。',
+        );
+      } else {
+        setError(`${writtenNote}${e instanceof Error ? e.message : String(e)}`);
+      }
     } finally {
       abortRef.current = null;
       renderer?.dispose();
@@ -743,6 +958,88 @@ export function PlateSaveDialog({
                   （チャンネル・Min/Max・色・角度・Z 範囲）で書き出します。
                   3D ビューで調整してからここに戻ってきてください。
                 </p>
+              </div>
+
+              <div className="mt-4 pt-3 border-t border-[var(--border)]">
+                <h3 className="text-xs font-semibold mb-1">保存する色パターン</h3>
+                <p className="text-[10px] text-[var(--text-secondary)] mb-2 leading-relaxed">
+                  チェックしたパターンごとに 1 つの PDF を作ります。パターンが決めるのは
+                  <strong>描くチャンネルだけ</strong>で、色と Min/Max は各ウェルの設定のままです。
+                  複数選ぶと、ファイル名の後ろにパターン名が付きます。
+                </p>
+                <div className="flex flex-col gap-1">
+                  {allPatterns.map((p) => (
+                    <label
+                      key={p.key}
+                      className="flex items-center gap-2 text-[11px] cursor-pointer"
+                    >
+                      <input
+                        type="checkbox"
+                        className="accent-emerald-500"
+                        checked={selectedPatternKeys.includes(p.key)}
+                        disabled={exporting}
+                        onChange={() => togglePatternSelected(p.key)}
+                      />
+                      <span>{p.name}</span>
+                      <span className="text-[10px] text-[var(--text-secondary)]">
+                        {p.channels === null
+                          ? '各ウェルで表示中のチャンネル'
+                          : channelSetLabel(p.channels)}
+                      </span>
+                      {p.key !== VISIBLE_PATTERN.key && (
+                        <button
+                          type="button"
+                          onClick={() => removePattern(p.key)}
+                          disabled={exporting}
+                          title="このパターンを削除"
+                          className="px-1 text-[var(--text-secondary)] hover:text-red-400
+                                     disabled:opacity-30"
+                        >
+                          ×
+                        </button>
+                      )}
+                    </label>
+                  ))}
+                </div>
+                <div className="flex items-center gap-2 mt-2 flex-wrap">
+                  <input
+                    type="text"
+                    value={newPatternName}
+                    onChange={(e) => setNewPatternName(e.target.value)}
+                    disabled={exporting}
+                    placeholder="新しいパターン名（例: CH1+2）"
+                    className="w-44 bg-white/10 border border-[var(--text-secondary)]/60 rounded
+                               px-2 py-1 text-[11px] text-[var(--text-primary)]
+                               placeholder:opacity-60 focus:outline-none
+                               focus:border-[var(--accent)] disabled:opacity-40"
+                  />
+                  {[0, 1, 2, 3].map((c) => (
+                    <button
+                      key={c}
+                      type="button"
+                      disabled={exporting}
+                      onClick={() => toggleNewPatternChannel(c)}
+                      className={`px-2 py-1 rounded text-[10px] border transition ${
+                        newPatternChannels.includes(c)
+                          ? 'bg-[var(--accent)] text-white border-[var(--accent)]'
+                          : 'text-[var(--text-secondary)] border-[var(--border)]'}`}
+                    >
+                      CH{c + 1}
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={addPattern}
+                    disabled={exporting}
+                    className="px-2 py-1 rounded bg-white/10 text-[11px] hover:bg-white/20
+                               disabled:opacity-40 transition"
+                  >
+                    ＋ 追加
+                  </button>
+                  {newPatternProblemText && (
+                    <span className="text-[10px] text-red-400">{newPatternProblemText}</span>
+                  )}
+                </div>
               </div>
 
               <div className="mt-4 pt-3 border-t border-[var(--border)]">
@@ -887,13 +1184,17 @@ export function PlateSaveDialog({
                     disabled={exporting || openWells.length === 0 || !!conflict
                               || checkingPdfName || pdfBrowsing || !pdfOutputDir.trim()
                               || !!pdfInputProblem(pdfName)
+                              || selectedPatterns.length === 0
+                              || (selectedPatterns.length > 1 && !pdfInputStem(pdfName))
                               || (unifyZoom && !!plateZoomProblem(zoomPercentInput))}
                     className="px-4 py-2 rounded-lg bg-emerald-600 text-white text-xs font-medium
                                hover:opacity-90 disabled:opacity-40 transition"
                   >
                     {exporting
                       ? `PDF 保存中 ${progress?.percent ?? 0}%`
-                      : `3D → PDF を作成（${openWells.length} ウェル）`}
+                      : `3D → PDF を作成（${openWells.length} ウェル${
+                        selectedPatterns.length > 1
+                          ? ` × ${selectedPatterns.length}パターン` : ''}）`}
                   </button>
                   {exporting && (
                     <button
@@ -911,6 +1212,16 @@ export function PlateSaveDialog({
                     {plateZoomProblem(zoomPercentInput)}
                   </p>
                 )}
+                {selectedPatterns.length === 0 ? (
+                  <p className="text-[10px] text-red-400 mt-1">
+                    保存する色パターンを 1 つ以上選んでください。
+                  </p>
+                ) : null}
+                {selectedPatterns.length > 1 && !pdfInputStem(pdfName) ? (
+                  <p className="text-[10px] text-amber-400 mt-1">
+                    複数パターンの保存にはファイル名が必要です（各 PDF は「ファイル名_パターン名.pdf」になります）。
+                  </p>
+                ) : null}
                 {pdfInputProblem(pdfName) ? (
                   <p className="text-[10px] text-red-400 mt-1">{pdfInputProblem(pdfName)}</p>
                 ) : checkingPdfName ? (
@@ -946,7 +1257,8 @@ export function PlateSaveDialog({
                 )}
                 <p className="text-[10px] text-[var(--text-secondary)] mt-2 leading-relaxed">
                   コントラストは<strong>いま画面で設定されている Min/Max と色</strong>をそのまま
-                  焼き込みます（ウェルごとの自動調整はしません）。表示中のチャンネルのみ、最大 4 つ。<br />
+                  焼き込みます（ウェルごとの自動調整はしません）。描くチャンネルは上の
+                  色パターンで決まります（既定は各ウェルで表示中のチャンネル・最大 4 つ）。<br />
                   拡大率の100%は各ウェルをそれぞれ画像枠に収める倍率です（同じµm/pxに揃える設定ではありません）。
                   統一しない場合は各タブの 3D 拡大率を使います。<br />
                   スケールバーは voxel size と適用したカメラから、ボリューム中心深度でウェルごとに計算します。<br />
@@ -968,8 +1280,8 @@ export function PlateSaveDialog({
         <OverwriteConfirm
           conflict={conflict}
           busy={exporting}
-          onCancel={() => { setConflict(null); setPendingJob(null); }}
-          onConfirm={() => pendingJob && exportPdf(true, pendingJob)}
+          onCancel={() => { setConflict(null); setPendingJobs(null); }}
+          onConfirm={() => pendingJobs && exportPdf(true, pendingJobs)}
         />
       )}
     </>
