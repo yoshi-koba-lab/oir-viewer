@@ -11,7 +11,10 @@ import { collectOpenWells, mismatchedPlateTabs, snapshotOf } from '../utils/plat
 import { gpuLimits } from '../utils/gpuLimits';
 import { OverwriteConflict } from '../utils/api';
 import { basenameOf, filenameProblem } from '../utils/paths';
-import { plateExportPercent, plateZoomProblem } from '../utils/plateExport';
+import {
+  GENERATED_TABLE_HEADERS, PDF_TABLE_HEADER_LIMIT,
+  plateExportPercent, plateZoomProblem,
+} from '../utils/plateExport';
 import {
   VISIBLE_PATTERN, channelSetLabel, loadPatterns, patternChannelsFor,
   patternFileStem, patternMask, patternProblem, savePatterns,
@@ -112,6 +115,11 @@ export function PlateSaveDialog({
   const [conflict, setConflict] = useState<
     { files: string[]; count: number; more: number } | null
   >(null);
+  // The overwrite modal has no focus trap, so while it is up the form behind it
+  // must not accept changes: content controls (resolution, zoom…) do not clear
+  // the approved jobs, and editing them there would render different content
+  // into the targets the user just approved.
+  const uiLocked = exporting || conflict !== null;
   // Each well's own contrast and angle are what get baked in, so the table and
   // the export both have to re-read when the tabs or the active tab change.
   const imageList = useImageStore((s) => s.imageList);
@@ -245,20 +253,35 @@ export function PlateSaveDialog({
     const scan = plate;
     const name = pdfInputStem(pdfName);
     if (!scan || !dir.trim() || !pdfName.trim() || pdfInputProblem(pdfName)) return;
+    // With several patterns selected the run writes one file per pattern, so
+    // the hint probes the suffixed names; the base name is never written then,
+    // and probing it would both miss real conflicts and claim false ones.
+    const stems = selectedPatterns.length > 1
+      ? selectedPatterns.map((p) => patternFileStem(name, p, selectedPatterns.length))
+      : [name];
     const seq = ++pdfCheckSeq.current;
     setCheckingPdfName(true);
     try {
-      await checkPlatePdfTarget({
-        plate_name: scan.name, output_dir: dir.trim(), filename: name,
-      });
-      if (seq === pdfCheckSeq.current) setNameConflict(null);
+      const files: string[] = [];
+      let count = 0;
+      let more = 0;
+      for (const stem of stems) {
+        try {
+          await checkPlatePdfTarget({
+            plate_name: scan.name, output_dir: dir.trim(), filename: stem,
+          });
+        } catch (e) {
+          if (!(e instanceof OverwriteConflict)) throw e;
+          files.push(...e.files);
+          count += e.count;
+          more += e.more;
+        }
+        if (seq !== pdfCheckSeq.current) return;
+      }
+      setNameConflict(files.length ? { files, count, more } : null);
     } catch (e) {
       if (seq !== pdfCheckSeq.current) return;
-      if (e instanceof OverwriteConflict) {
-        setNameConflict({ files: e.files, count: e.count, more: e.more });
-      } else {
-        setError(e instanceof Error ? e.message : String(e));
-      }
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
       if (seq === pdfCheckSeq.current) setCheckingPdfName(false);
     }
@@ -403,9 +426,10 @@ export function PlateSaveDialog({
       const forcedWellLabel = requestedHideEmptyWells && !lines.includes(well.wellId) ? 1 : 0;
       return lines.length + forcedWellLabel + (well.numT > 1 ? 1 : 0);
     };
-    // Two verified output columns (zoom and scale bar) are appended below; the
-    // backend's hard table limit is 64 including them.
-    if (columns.length > 62
+    // The generated columns (zoom, scale bar, saved channels) are appended
+    // below; the backend's hard header limit includes them, so the budget for
+    // user columns shrinks whenever a generated column is added.
+    if (columns.length > PDF_TABLE_HEADER_LIMIT - GENERATED_TABLE_HEADERS.length
       || columns.some((column) => column.label.length > 1000)
       || wells.some((well) => columns.some((column) => (
         (cells[well.wellId]?.[column.key] ?? '').length > (column.onFigure ? 1000 : 5000)
@@ -432,11 +456,12 @@ export function PlateSaveDialog({
     }
 
     // Clamp to what this GPU can hold BEFORE asking for it. A 3D texture is
-    // driver-capped — 2048 under ANGLE, which is every Windows build — and the
-    // real data is 2911 wide, so "Max (原寸)" would stream ~1.7 GB per well and
-    // only then be refused at texImage3D, throwing away the whole export after
-    // minutes of work. Clamping only ever scales down: on a GPU that reports
-    // 16384 a 2911 px well still comes back untouched.
+    // driver-capped — 2048 under ANGLE, which is every Windows build — and
+    // stitched wells routinely exceed that, so "Max (原寸)" would stream the
+    // full-size volume per well and only then be refused at texImage3D,
+    // throwing away the whole export after minutes of work. Clamping only ever
+    // scales down: on a GPU whose cap exceeds the source, the volume comes
+    // back untouched.
     const { max3D, vendor } = gpuLimits();
     if (max3D === 0) {
       setError('この環境では WebGL2 が使えないため、3D の書き出しができません。');
@@ -548,6 +573,11 @@ export function PlateSaveDialog({
             conflictMore += e.more;
           }
           if (pdfRunSeq.current !== runId || cancelRef.current) {
+            // Same acknowledgement every later cancel point gives; a silent
+            // return here looked like the dialog ignoring the button.
+            if (pdfRunSeq.current === runId && cancelRef.current) {
+              setResult('中止しました。PDF は作成していません。');
+            }
             releaseRun();
             return;
           }
@@ -764,7 +794,7 @@ export function PlateSaveDialog({
           // conditions table's channel column described this figure.
           table_headers: [
             ...columns.map((c) => c.label),
-            'PDF拡大率', 'スケールバー（中心深度換算）', '保存チャンネル',
+            ...GENERATED_TABLE_HEADERS,
           ],
           table_rows: wells.map((w) => {
             const applied = appliedFigureSettings.get(w.wellId);
@@ -944,7 +974,7 @@ export function PlateSaveDialog({
                   </h3>
                   <button
                     onClick={() => seed(openWells.map((well) => snapshotOf(well, plate)), true)}
-                    disabled={openWells.length === 0 || exporting}
+                    disabled={openWells.length === 0 || uiLocked}
                     title="自動列を現在のビューアの設定で埋め直します（手で直した値も上書きします）"
                     className="text-[10px] underline text-[var(--text-secondary)]
                                hover:text-white disabled:opacity-40"
@@ -952,7 +982,7 @@ export function PlateSaveDialog({
                     自動列を現在の設定で更新
                   </button>
                 </div>
-                <PlateTable wells={openWells} disabled={exporting} />
+                <PlateTable wells={openWells} disabled={uiLocked} />
                 <p className="text-[10px] text-[var(--text-secondary)] mt-2 leading-relaxed">
                   各ウェルは <strong>開いたタブの現在の状態</strong>
                   （チャンネル・Min/Max・色・角度・Z 範囲）で書き出します。
@@ -977,7 +1007,7 @@ export function PlateSaveDialog({
                         type="checkbox"
                         className="accent-emerald-500"
                         checked={selectedPatternKeys.includes(p.key)}
-                        disabled={exporting}
+                        disabled={uiLocked}
                         onChange={() => togglePatternSelected(p.key)}
                       />
                       <span>{p.name}</span>
@@ -990,7 +1020,7 @@ export function PlateSaveDialog({
                         <button
                           type="button"
                           onClick={() => removePattern(p.key)}
-                          disabled={exporting}
+                          disabled={uiLocked}
                           title="このパターンを削除"
                           className="px-1 text-[var(--text-secondary)] hover:text-red-400
                                      disabled:opacity-30"
@@ -1006,7 +1036,7 @@ export function PlateSaveDialog({
                     type="text"
                     value={newPatternName}
                     onChange={(e) => setNewPatternName(e.target.value)}
-                    disabled={exporting}
+                    disabled={uiLocked}
                     placeholder="新しいパターン名（例: CH1+2）"
                     className="w-44 bg-white/10 border border-[var(--text-secondary)]/60 rounded
                                px-2 py-1 text-[11px] text-[var(--text-primary)]
@@ -1017,7 +1047,7 @@ export function PlateSaveDialog({
                     <button
                       key={c}
                       type="button"
-                      disabled={exporting}
+                      disabled={uiLocked}
                       onClick={() => toggleNewPatternChannel(c)}
                       className={`px-2 py-1 rounded text-[10px] border transition ${
                         newPatternChannels.includes(c)
@@ -1030,7 +1060,7 @@ export function PlateSaveDialog({
                   <button
                     type="button"
                     onClick={addPattern}
-                    disabled={exporting}
+                    disabled={uiLocked}
                     className="px-2 py-1 rounded bg-white/10 text-[11px] hover:bg-white/20
                                disabled:opacity-40 transition"
                   >
@@ -1049,7 +1079,7 @@ export function PlateSaveDialog({
                     <select
                       value={volKey}
                       onChange={(e) => setVolKey(e.target.value)}
-                      disabled={exporting}
+                      disabled={uiLocked}
                       className="block mt-1 bg-[var(--bg-primary)] border border-[var(--border)]
                                  rounded px-2 py-1 text-xs text-[var(--text-primary)]"
                     >
@@ -1063,7 +1093,7 @@ export function PlateSaveDialog({
                     <select
                       value={cellKey}
                       onChange={(e) => setCellKey(e.target.value)}
-                      disabled={exporting}
+                      disabled={uiLocked}
                       className="block mt-1 bg-[var(--bg-primary)] border border-[var(--border)]
                                  rounded px-2 py-1 text-xs text-[var(--text-primary)]"
                     >
@@ -1078,7 +1108,7 @@ export function PlateSaveDialog({
                         type="checkbox"
                         checked={unifyZoom}
                         onChange={(event) => setUnifyZoom(event.target.checked)}
-                        disabled={exporting}
+                        disabled={uiLocked}
                         className="accent-emerald-500"
                       />
                       <span>拡大率を統一</span>
@@ -1097,7 +1127,7 @@ export function PlateSaveDialog({
                             event.currentTarget.blur();
                           }
                         }}
-                        disabled={exporting || !unifyZoom}
+                        disabled={uiLocked || !unifyZoom}
                         aria-label="Plate PDFの統一拡大率"
                         className="w-20 bg-[var(--bg-primary)] border border-[var(--border)]
                                    rounded px-2 py-1 text-xs text-right text-[var(--text-primary)]
@@ -1110,7 +1140,7 @@ export function PlateSaveDialog({
                         type="checkbox"
                         checked={includeScalebar}
                         onChange={(event) => setIncludeScalebar(event.target.checked)}
-                        disabled={exporting}
+                        disabled={uiLocked}
                         className="accent-emerald-500"
                       />
                       <span>スケールバーを保存画像に入れる（中心深度換算・画像内左下）</span>
@@ -1120,7 +1150,7 @@ export function PlateSaveDialog({
                         type="checkbox"
                         checked={hideEmptyWells}
                         onChange={(event) => setHideEmptyWells(event.target.checked)}
-                        disabled={exporting}
+                        disabled={uiLocked}
                         className="accent-emerald-500"
                       />
                       <span>空きウェルは表示しない</span>
@@ -1140,7 +1170,7 @@ export function PlateSaveDialog({
                           invalidatePdfTarget();
                         }}
                         onBlur={() => { void probePdfTarget(); }}
-                        disabled={exporting}
+                        disabled={uiLocked}
                         placeholder="保存先フォルダ"
                         className="min-w-0 flex-1 bg-white/10 border border-[var(--text-secondary)]/60
                                    rounded px-2 py-1 text-xs text-[var(--text-primary)]
@@ -1151,7 +1181,7 @@ export function PlateSaveDialog({
                       <button
                         type="button"
                         onClick={browsePdfOutput}
-                        disabled={exporting || pdfBrowsing}
+                        disabled={uiLocked || pdfBrowsing}
                         className="px-2 py-1 rounded bg-white/10 border border-[var(--text-secondary)]/60
                                    text-[10px] text-[var(--text-primary)] hover:bg-white/15
                                    disabled:opacity-40 disabled:cursor-not-allowed"
@@ -1170,7 +1200,7 @@ export function PlateSaveDialog({
                         invalidatePdfTarget();
                       }}
                       onBlur={() => { void probePdfTarget(); }}
-                      disabled={exporting}
+                      disabled={uiLocked}
                       placeholder={plate.name}
                       className="block w-full mt-1 bg-white/10 border border-[var(--text-secondary)]/60
                                  rounded px-2 py-1 text-xs text-[var(--text-primary)]
@@ -1228,7 +1258,9 @@ export function PlateSaveDialog({
                   <p className="text-[10px] text-[var(--text-secondary)] mt-1">同名ファイルを確認中…</p>
                 ) : nameConflict ? (
                   <p className="text-[10px] text-amber-400 mt-1">
-                    {nameConflict.files[0]} は既にあります。作成前に上書きを確認します。
+                    {nameConflict.files.slice(0, 3).join('、')}
+                    {nameConflict.count > 3 ? ` 他${nameConflict.count - 3}件` : ''}
+                    {' '}は既にあります。作成前に上書きを確認します。
                   </p>
                 ) : null}
                 {(exporting || progress?.percent === 100) && progress && (

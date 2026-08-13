@@ -73,6 +73,8 @@ test('pattern names obey filename rules because they become filenames', () => {
   assert.notEqual(patternProblem('none', [], []), '');
   assert.notEqual(patternProblem(VISIBLE_PATTERN.name, [0], []), '');
   assert.notEqual(patternProblem('X', [0], [P('x', [1])]), '');
+  // NFC vs NFD spellings alias one file on macOS, so they are one name here.
+  assert.notEqual(patternProblem('ガ', [0], [P('ガ', [1])]), '');
 });
 
 test('a corrupt store yields no patterns instead of a broken dialog', () => {

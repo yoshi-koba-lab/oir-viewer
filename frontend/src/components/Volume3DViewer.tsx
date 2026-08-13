@@ -606,6 +606,9 @@ export function Volume3DViewer() {
   /** Apply a typed zoom percentage; 100% always means fit for the live geometry. */
   const applyZoomPercent = useCallback((requested: number) => {
     if (saveGuardRef.current.isLocked) return;
+    // Same freeze as applyAngles: the crop overlay's mapping assumes the pose
+    // the panel-open effect established, zoom included.
+    if (cropPanelOpen) return;
     if (!Number.isFinite(requested) || requested <= 0) {
       setZoomDraft(null);
       return;
@@ -613,7 +616,7 @@ export function Volume3DViewer() {
     orbit.current.zoomPercent = requested;
     setZoomDraft(null);
     updateCamera();
-  }, [updateCamera]);
+  }, [cropPanelOpen, updateCamera]);
 
   const invalidateLoadedVolume = useCallback((message: string) => {
     // Invalidate the async run as well as the save provenance. A context-loss
@@ -1031,9 +1034,11 @@ export function Volume3DViewer() {
   // Mouse handlers for orbit control
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     if (saveGuardRef.current.isLocked) return;
+    // No orbit while the crop panel is open — see applyAngles.
+    if (cropPanelOpen) return;
     isDragging.current = true;
     lastMouse.current = { x: e.clientX, y: e.clientY };
-  }, []);
+  }, [cropPanelOpen]);
 
   // Keep the slab non-empty: moving one end past the other drags the other with it.
   const setZStart = useCallback((v: number) => {
@@ -1061,6 +1066,11 @@ export function Volume3DViewer() {
   /** Point the camera at the given angles (degrees) and keep the inputs in step. */
   const applyAngles = useCallback((az: number, el: number) => {
     if (saveGuardRef.current.isLocked) return;
+    // The crop overlay maps pointer positions onto the source plane assuming
+    // the canonical straight-on pose the panel-open effect established. Any
+    // rotation while the panel is open would silently shift what a drawn
+    // rectangle selects, so the pose is frozen until the panel closes.
+    if (cropPanelOpen) return;
     const a = wrapAz(az);
     const e = clampEl(el);
     orbit.current.az = a;
@@ -1069,7 +1079,7 @@ export function Volume3DViewer() {
     // updateCamera records the angle, fit-relative zoom and resolved radius as
     // one coherent camera state for tab restore and Plate Save.
     updateCamera();
-  }, [updateCamera]);
+  }, [cropPanelOpen, updateCamera]);
 
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
     if (saveGuardRef.current.isLocked) return;
@@ -1163,23 +1173,28 @@ export function Volume3DViewer() {
       ctx.fillRect(0, 0, w, h);
       ctx.drawImage(src, 0, 0);
 
-      // Crop after the verified WebGL frame has been copied.  The crop tool
-      // stores source-image pixel corners; 3D uses the same normalized fraction
-      // of its rendered framebuffer for this trial implementation.  Draw the
-      // scale bar on the cropped canvas so it remains inside the saved image
-      // even when the selected area does not contain the on-screen bar.
-      // When the live viewer has already clipped the shader and fitted the
-      // camera to this exact owner/rectangle, read back the full canvas. A
-      // second normalized crop would double-crop the user's selection. If a
-      // crop exists but has not been completed/fitted, preserve the trial
-      // export's original post-crop behavior.
+      // Crop after the verified WebGL frame has been copied. The crop tool
+      // stores source-image pixel corners; the only faithful 3D export of a
+      // crop is the fitted shader/camera path, where the canvas already IS the
+      // selected area (a second normalized crop would double-crop it). A crop
+      // that has not been fitted — panel still open, or the fit rejected the
+      // owner — must refuse: mapping source pixels as a fraction of the
+      // letterboxed canvas saves a complete-looking image of the wrong region,
+      // while the save panel promises the exact source rectangle.
+      const displayFitted = displayCropMatchesSnapshot(displayCropFitRef.current, saveSnapshot);
+      if (saveSnapshot.cropRect && !displayFitted) {
+        throw new Error(
+          'クロップ範囲がまだ3D表示に適用されていません。'
+          + 'クロップパネルの 完了 を押してから保存してください。',
+        );
+      }
       const crop = cropRectForCapture(
         saveSnapshot.cropRect,
         saveSnapshot.cropOwner.width || w,
         saveSnapshot.cropOwner.height || h,
         w,
         h,
-        displayCropMatchesSnapshot(displayCropFitRef.current, saveSnapshot),
+        displayFitted,
       );
       const output = document.createElement('canvas');
       output.width = crop.width;
@@ -1195,7 +1210,6 @@ export function Volume3DViewer() {
       );
       if (saveIncludeScalebar && hasPhysicalScale && scalebar) {
         const exportScale = src.clientWidth > 0 ? w / src.clientWidth : 1;
-        const displayFitted = displayCropMatchesSnapshot(displayCropFitRef.current, saveSnapshot);
         // Re-plan against the cropped canvas. Automatic lengths can become a
         // shorter nice value; an explicit user length throws here if its bar or
         // label cannot fit, so the save never publishes a clipped annotation.
@@ -1464,13 +1478,16 @@ export function Volume3DViewer() {
       }
       if (target?.closest('[data-3d-controls]')) return;
       e.preventDefault();
+      // Zoom is part of the pose the crop overlay's mapping assumes — frozen
+      // while the panel is open, like applyAngles/applyZoomPercent.
+      if (cropPanelOpen) return;
       orbit.current.zoomPercent *= e.deltaY > 0 ? 1 / 1.1 : 1 / 0.9;
       setZoomDraft(null);
       updateCamera();
     };
     el.addEventListener('wheel', onWheel, { passive: false });
     return () => el.removeEventListener('wheel', onWheel);
-  }, [updateCamera]);
+  }, [cropPanelOpen, updateCamera]);
 
   const resetToSource = useCallback(async () => {
     if (saveGuardRef.current.isLocked) return;
@@ -1769,14 +1786,16 @@ export function Volume3DViewer() {
                 }
               }}
               aria-label="3D拡大率"
-              className="w-16 bg-black/60 border border-white/20 rounded px-1 py-0.5 text-xs text-right tabular-nums"
-              title={`100%で画面に合わせます（最大 ${maxZoomPercent}%）`}
+              disabled={cropPanelOpen}
+              className="w-16 bg-black/60 border border-white/20 rounded px-1 py-0.5 text-xs text-right tabular-nums disabled:opacity-40"
+              title={cropPanelOpen ? 'クロップ編集中は変更できません' : `100%で画面に合わせます（最大 ${maxZoomPercent}%）`}
             />
             <span className="text-white/40">%</span>
             <button
               onClick={() => applyZoomPercent(100)}
-              className="ml-auto rounded bg-white/10 px-1.5 py-0.5 text-[10px] hover:bg-white/20 transition"
-              title="画像全体を画面に合わせる"
+              disabled={cropPanelOpen}
+              className="ml-auto rounded bg-white/10 px-1.5 py-0.5 text-[10px] hover:bg-white/20 transition disabled:opacity-40"
+              title={cropPanelOpen ? 'クロップ編集中は変更できません' : '画像全体を画面に合わせる'}
             >
               全体
             </button>
@@ -1794,8 +1813,9 @@ export function Volume3DViewer() {
                 const v = Number(e.target.value);
                 if (!Number.isNaN(v)) applyAngles(v, angles.el);
               }}
-              className="w-16 bg-black/60 border border-white/20 rounded px-1 py-0.5 text-xs text-right tabular-nums"
-              title="水平方向の回転角（0–360°）"
+              disabled={cropPanelOpen}
+              className="w-16 bg-black/60 border border-white/20 rounded px-1 py-0.5 text-xs text-right tabular-nums disabled:opacity-40"
+              title={cropPanelOpen ? 'クロップ編集中は変更できません' : '水平方向の回転角（0–360°）'}
             />
             <span className="text-white/40">°</span>
             <input
@@ -1805,7 +1825,8 @@ export function Volume3DViewer() {
               step={1}
               value={angles.az}
               onChange={(e) => applyAngles(Number(e.target.value), angles.el)}
-              className="flex-1 min-w-0"
+              disabled={cropPanelOpen}
+              className="flex-1 min-w-0 disabled:opacity-40"
             />
           </div>
           <div className="flex items-center gap-2">
@@ -1818,8 +1839,9 @@ export function Volume3DViewer() {
                 const v = Number(e.target.value);
                 if (!Number.isNaN(v)) applyAngles(angles.az, v);
               }}
-              className="w-16 bg-black/60 border border-white/20 rounded px-1 py-0.5 text-xs text-right tabular-nums"
-              title="上下方向の角度（-89–89°、0=真横、90=真上）"
+              disabled={cropPanelOpen}
+              className="w-16 bg-black/60 border border-white/20 rounded px-1 py-0.5 text-xs text-right tabular-nums disabled:opacity-40"
+              title={cropPanelOpen ? 'クロップ編集中は変更できません' : '上下方向の角度（-89–89°、0=真横、90=真上）'}
             />
             <span className="text-white/40">°</span>
             <input
@@ -1829,7 +1851,8 @@ export function Volume3DViewer() {
               step={1}
               value={angles.el}
               onChange={(e) => applyAngles(angles.az, Number(e.target.value))}
-              className="flex-1 min-w-0"
+              disabled={cropPanelOpen}
+              className="flex-1 min-w-0 disabled:opacity-40"
             />
           </div>
           <div className="flex gap-1">
@@ -1843,8 +1866,9 @@ export function Volume3DViewer() {
               <button
                 key={p.label}
                 onClick={() => applyAngles(p.az, p.el)}
-                title={p.title}
-                className="flex-1 px-1 py-0.5 rounded bg-white/10 hover:bg-white/20 text-[10px] transition"
+                disabled={cropPanelOpen}
+                title={cropPanelOpen ? 'クロップ編集中は変更できません' : p.title}
+                className="flex-1 px-1 py-0.5 rounded bg-white/10 hover:bg-white/20 text-[10px] transition disabled:opacity-40"
               >
                 {p.label}
               </button>
@@ -1992,13 +2016,17 @@ export function Volume3DViewer() {
 
           <button
             onClick={() => handleSave(false)}
-            disabled={saving || !!conflict || !canSaveVolume}
-            title={canSaveVolume
-              ? '現在の3D表示を保存'
-              : '現在の画像・T・Qualityの3D読込が完了するまで保存できません'}
+            disabled={saving || !!conflict || !canSaveVolume || (cropPanelOpen && !!cropRect)}
+            title={cropPanelOpen && cropRect
+              ? 'クロップパネルの 完了 を押して表示に適用してから保存してください'
+              : canSaveVolume
+                ? '現在の3D表示を保存'
+                : '現在の画像・T・Qualityの3D読込が完了するまで保存できません'}
             className="w-full px-2 py-1 rounded bg-[var(--accent)] text-white text-xs hover:opacity-90 disabled:opacity-50 transition"
           >
-            {saving ? '保存中…' : canSaveVolume ? '名前を付けて保存' : '3D読込完了後に保存できます'}
+            {saving ? '保存中…'
+              : cropPanelOpen && cropRect ? 'クロップを 完了 してから保存できます'
+                : canSaveVolume ? '名前を付けて保存' : '3D読込完了後に保存できます'}
           </button>
           {saveProgress && (
             <div className="space-y-0.5" aria-live="polite">

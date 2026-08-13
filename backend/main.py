@@ -3501,6 +3501,7 @@ def plate_pdf(req: PlatePdfRequest):
             int(req.cell_px), list(req.table_headers),
             [list(row) for row in req.table_rows],
             bool(req.hide_empty_wells),
+            plate_name=str(req.plate_name), footer=str(req.footer),
         )
         _assert_plate_sources_unchanged(list(req.frames))
         frames = [

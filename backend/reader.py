@@ -890,28 +890,29 @@ def declared_z_length(reader_j) -> int:
     them worth comparing against the Z the reader can actually expose.
 
     Shared with the plate export path (plate.py), so both decide "this file is
-    only part of itself" by the same measure. Returns 0 rather than raising: a
-    file whose metadata does not name a Z axis is not evidence of a problem.
+    only part of itself" by the same measure. Returns 0 when the metadata does
+    not name a Z axis — absence is not evidence of a problem — but a failure to
+    READ the metadata raises: swallowing it here would silently disarm the
+    plate path's truncation guard, whose whole point is that a short stack
+    looks finished. The viewer's warning path has its own catch and stays a
+    best-effort banner.
     """
-    try:
-        table = reader_j.getSeriesMetadata()
-        if table is None:
-            return 0
-        found = 0
-        for i in range(1, 17):
-            axis = table.get(f"axis axis #{i}")
-            size = table.get(f"axis maxSize #{i}")
-            if axis is None or size is None:
-                continue
-            if str(axis).strip().upper() != "ZSTACK":
-                continue
-            try:
-                found = max(found, int(float(str(size))))
-            except ValueError:
-                continue
-        return found
-    except Exception:
+    table = reader_j.getSeriesMetadata()
+    if table is None:
         return 0
+    found = 0
+    for i in range(1, 17):
+        axis = table.get(f"axis axis #{i}")
+        size = table.get(f"axis maxSize #{i}")
+        if axis is None or size is None:
+            continue
+        if str(axis).strip().upper() != "ZSTACK":
+            continue
+        try:
+            found = max(found, int(float(str(size))))
+        except ValueError:
+            continue
+    return found
 
 
 def _detect_incomplete_oir(reader_j, path: str) -> str:

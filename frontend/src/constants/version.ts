@@ -2,6 +2,11 @@
 //
 // Format: vX.Y.Z
 // Update history (latest first):
+//   1.5.16 — 2026-08-14 — Plate PDF pages keep full colour resolution. A 3D
+//     crop that is not yet applied refuses to save instead of saving the wrong
+//     area, and camera controls stay fixed while editing a crop. Oversized
+//     conditions tables are refused before rendering, and source-resolution
+//     plate exports use less memory.
 //   1.5.15 — 2026-08-13 — Plate Save can export several named channel patterns
 //     (for example all channels and CH1+2 only) as separate PDFs in one run.
 //   1.5.14 — 2026-08-13 — Crop selections stay aligned between the display and
@@ -70,4 +75,4 @@
 //     and TIFF/PNG/JPEG plus OME-TIFF export.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.5.15';
+export const VERSION = '1.5.16';

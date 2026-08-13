@@ -24,5 +24,8 @@ src-tauri/target/
 # App data written at runtime
 .oir-viewer/
 
+# Manual-test output
+backend/上書きテスト/
+
 # macOS
 .DS_Store

@@ -24,6 +24,13 @@ export function plateZoomProblem(value: string): string {
  * per-well schedule exactly — existing callers and recorded expectations are
  * unchanged.
  */
+/** Appended to every conditions table after the user's columns, in this order. */
+export const GENERATED_TABLE_HEADERS =
+  ['PDF拡大率', 'スケールバー（中心深度換算）', '保存チャンネル'] as const;
+
+/** backend/plate.py's validate_pdf_layout refuses more headers than this. */
+export const PDF_TABLE_HEADER_LIMIT = 64;
+
 export function plateExportTotalUnits(totalWells: number, patternCount = 1): number {
   const wells = Math.max(0, Math.trunc(totalWells));
   const patterns = Math.max(1, Math.trunc(patternCount));

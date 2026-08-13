@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import re
 import threading
 import xml.etree.ElementTree as ET
@@ -185,9 +186,19 @@ def count_chunks(path: Path) -> int:
 
     Same count `scan` reports as `chunk_count`, kept in one place so the number
     quoted in an error is the number the plate list showed.
+
+    Counted with the same `_NNNNN` rule source_state freezes into the revision
+    token — not glob, whose `[`/`]` syntax breaks on legal filenames, and not
+    "any extensionless sibling", which would count a stray `<stem>_backup`.
     """
-    stem = _chunk_stem(path)
-    return len([p for p in path.parent.glob(f"{stem}_*") if p.suffix == ""])
+    pattern = re.compile(rf"{re.escape(_chunk_stem(path))}_\d{{5}}$")
+    try:
+        with os.scandir(path.parent) as entries:
+            return sum(1 for e in entries if pattern.fullmatch(e.name))
+    except OSError:
+        # This count only annotates messages and the plate list; a directory
+        # that vanished mid-read must not replace the error being built.
+        return 0
 
 
 def scan(where: str) -> Plate:
@@ -266,6 +277,21 @@ def scan(where: str) -> Plate:
         grid = f"{a.get('numOfXAreas', '?')}x{a.get('numOfYAreas', '?')}"
 
         tile_names = [_leaf_children(x).get("image", "") for x in areas]
+        # The stitch file is derived from tile names, so the tiles must actually
+        # belong to this well. A manifest whose group lists another well's tiles
+        # (hand-merged folders, a partial copy of two acquisitions) would
+        # otherwise map this well to that well's stitch file, and every
+        # downstream identity/revision check would then faithfully verify the
+        # wrong file — pixels published under a validated but wrong label, which
+        # nothing later can catch. Same rationale as the stage check below.
+        for t in tile_names:
+            m = re.fullmatch(r".+_(?P<well>[A-Za-z]\d{1,2})_G\d+_\d+\.oir", t)
+            if m and _well_id_to_rc(m["well"]) != (row, col):
+                raise ValueError(
+                    f"{wid} のタイル {t} は別のウェル {m['well']} を指しています。\n"
+                    "matl.omp2info と撮影ファイルの対応が崩れています。"
+                    "フォルダを手作業で統合した場合は、撮影ごとに分けてください。"
+                )
         stitch_name = next((s for s in (_derive_stitch(t) for t in tile_names) if s), None)
         stitch = folder / stitch_name if stitch_name else None
         exists = bool(stitch and stitch.is_file())
@@ -534,11 +560,26 @@ def read_low_volume(spec: VolumeSpec) -> tuple[dict, bytes]:
             # Z follows the same rule: untouched when max_xy asks for the source.
             out_z = n_z if cap == 0 else min(n_z, PLATE_MAX_Z)
 
-            planes: list[bytes] = []
+            header = np.array([len(want), out_z, out_h, out_w, n_c, n_z, h, w],
+                              dtype="<u4").tobytes()
+            # The renderer reads these as the window already applied, so report
+            # the window that WAS applied rather than anything measured.
+            meta = np.array([(int(lo), int(hi)) for lo, hi in spec.levels[:len(want)]],
+                            dtype="<i4").tobytes()
+            # One buffer for the whole reply, filled plane by plane. Collecting
+            # per-channel bytes and joining them held the payload three times
+            # over at the join — at source resolution (max_xy=0/Max) that is a
+            # multi-gigabyte transient on top of the reader, the same
+            # out-of-memory shape /api/volume-bin was already rewritten to
+            # avoid. Every offset is known before the first plane is read.
+            plane_n = out_h * out_w
+            payload = bytearray(len(header) + len(meta) + len(want) * out_z * plane_n)
+            payload[:len(header)] = header
+            payload[len(header):len(header) + len(meta)] = meta
+            off = len(header) + len(meta)
             for i, c in enumerate(want):
                 lo, hi = spec.levels[i]
                 rng = max(float(hi) - float(lo), 1.0)
-                buf = np.empty((out_z, out_h, out_w), dtype=np.uint8)
                 for zi in range(out_z):
                     # Nearest source plane when Z is decimated; no interpolation
                     # across Z, which would invent signal between real sections.
@@ -546,22 +587,21 @@ def read_low_volume(spec: VolumeSpec) -> tuple[dict, bytes]:
                     idx = reader_j.getIndex(int(src_z), int(c), int(spec.t))
                     raw = bytes(reader_j.openBytes(idx))
                     plane = np.frombuffer(raw, dtype=dtype).reshape(h, w)
+                    if plane.dtype.kind == "i":
+                        # The ordinary viewer clips signed negatives to 0 before
+                        # any display math (`reader._to_uint16`). Filtering raw
+                        # negatives here instead would darken their neighbours in
+                        # the AA resize and diverge from the screen at the same
+                        # Min/Max, so clip first to keep the stated contract.
+                        plane = np.clip(plane, 0, None)
                     small = _resize_plane(plane, out_h, out_w)
                     np.clip((small - float(lo)) * (255.0 / rng), 0, 255,
                             out=small)
-                    buf[zi] = small.astype(np.uint8)
-                planes.append(buf.tobytes())
-                del buf
-
-            header = np.array([len(want), out_z, out_h, out_w, n_c, n_z, h, w],
-                              dtype="<u4").tobytes()
-            # The renderer reads these as the window already applied, so report
-            # the window that WAS applied rather than anything measured.
-            meta = np.array([(int(lo), int(hi)) for lo, hi in spec.levels[:len(want)]],
-                            dtype="<i4").tobytes()
+                    payload[off:off + plane_n] = small.astype(np.uint8).tobytes()
+                    off += plane_n
             info = {
                 "channels": want, "out": [out_z, out_h, out_w], "max_xy": cap,
-                "source": [n_c, n_z, h, w], "bytes": len(header) + len(meta) + sum(map(len, planes)),
+                "source": [n_c, n_z, h, w], "bytes": len(payload),
                 "source_identity": before.identity,
                 "source_revision": before.revision,
                 "t": int(spec.t),
@@ -570,14 +610,15 @@ def read_low_volume(spec: VolumeSpec) -> tuple[dict, bytes]:
                 # guesses an isotropic shape when acquisition metadata is absent.
                 "voxel": voxel,
             }
-            payload = header + meta + b"".join(planes)
             after = snapshot_source(p)
             if after.identity != before.identity or after.revision != before.revision:
                 raise ValueError(
                     "ウェル画像または分割 OIR の続きが読み込み中に変更されました。"
                     "このウェルの画素は PDF に使用していません。"
                 )
-            return info, payload
+            # memoryview, not bytes(): Response.render passes it straight
+            # through, where bytes() would copy the finished payload once more.
+            return info, memoryview(payload)
         finally:
             # A Java reader left open holds the file and its memory-mapped chunks.
             try:
@@ -732,8 +773,17 @@ def validate_pdf_layout(
     table_headers: list[str] | None,
     table_rows: list[list[str]] | None,
     hide_empty_wells: bool = False,
+    plate_name: str = "",
+    footer: str = "",
 ) -> None:
     """Reject anything Pillow's grid would otherwise crop or silently replace."""
+    # The title is drawn on one line and the footer reserves real page height
+    # per wrapped line; neither is ellipsized, so unbounded input would grow
+    # the page allocation itself. The shipped frontend sends well under these.
+    if len(plate_name) > 300:
+        raise ValueError("プレート名が長すぎます")
+    if len(footer) > 20_000:
+        raise ValueError("フッターが長すぎます")
     if not (1 <= rows <= 26 and 1 <= cols <= 99):
         raise ValueError("プレートの行列数が不正です")
     if cell_px not in PDF_CELL_CHOICES.values():
@@ -785,7 +835,9 @@ def validate_pdf_layout(
     if bool(headers) != bool(body):
         raise ValueError("条件表の見出しと行が一致しません")
     if headers:
-        if len(headers) > 64 or len(body) != len(frames):
+        if len(headers) > 64:
+            raise ValueError("条件表の列数が多すぎます（最大 64 列）")
+        if len(body) != len(frames):
             raise ValueError("条件表の行数が描画ウェル数と一致しません")
         if any(len(row) != len(headers) for row in body):
             raise ValueError("条件表の列数が一致しません")
@@ -912,7 +964,7 @@ def compose_pdf(
     """
     validate_pdf_layout(
         rows, cols, frames, well_states, cell_px, table_headers, table_rows,
-        hide_empty_wells,
+        hide_empty_wells, plate_name=plate_name, footer=footer,
     )
     from PIL import Image, ImageDraw, ImageFont
 
@@ -1148,7 +1200,13 @@ def compose_pdf(
         )
         if tbl is not None:
             extra.append(tbl)
-    page.save(final, "PDF", resolution=300.0, save_all=bool(extra), append_images=extra)
+    # Pillow embeds RGB PDF pages as JPEG. With no arguments that means libjpeg
+    # defaults — roughly quality 75 with 4:2:0 chroma subsampling, which halves
+    # the colour resolution of exactly this data's shape: sparse coloured puncta
+    # on black. quality/subsampling flow to every page, because Pillow copies
+    # this encoderinfo onto each appended page (the conditions table included).
+    page.save(final, "PDF", resolution=300.0, quality=95, subsampling=0,
+              save_all=bool(extra), append_images=extra)
     return final
 
 
@@ -1216,10 +1274,106 @@ def selftest() -> int:
         return 13
     print(f"selftest: plate PDF OK ({size} bytes)", flush=True)
 
+    rc = _selftest_pdf_encoding()
+    if rc:
+        return rc
     rc = _selftest_split_guard()
     if rc:
         return rc
     return _selftest_source_state()
+
+
+def _jpeg_encoding_of(buf: bytes) -> tuple[int, list[int]] | None:
+    """(max quantizer value, per-component sampling bytes) of a JPEG stream."""
+    i = 2
+    max_q = 0
+    while i + 4 <= len(buf):
+        if buf[i] != 0xFF:
+            return None
+        marker = buf[i + 1]
+        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+            i += 2
+            continue
+        seglen = int.from_bytes(buf[i + 2:i + 4], "big")
+        seg = buf[i + 4:i + 2 + seglen]
+        if marker == 0xDB:  # DQT
+            k = 0
+            while k < len(seg):
+                pq = seg[k] >> 4
+                k += 1
+                n = 64 * (2 if pq else 1)
+                tbl = seg[k:k + n]
+                vals = ([int.from_bytes(tbl[m:m + 2], "big") for m in range(0, n, 2)]
+                        if pq else list(tbl))
+                max_q = max(max_q, max(vals))
+                k += n
+        elif marker in (0xC0, 0xC1, 0xC2):  # SOF: sampling factors live here
+            n_comp = seg[5]
+            return max_q, [seg[6 + 3 * ci + 1] for ci in range(n_comp)]
+        i += 2 + seglen
+    return None
+
+
+def _selftest_pdf_encoding() -> int:
+    """Prove PDF pages are embedded at full chroma and high quality.
+
+    Pillow embeds RGB pages as JPEG; with no arguments that means libjpeg
+    defaults — measured here as max quantizer 61 with 4:2:0 subsampling, which
+    halves the colour resolution of sparse coloured puncta on black. compose_pdf
+    passes quality=95, subsampling=0 (measured: max quantizer 12, 4:4:4); this
+    check fails the build if that regresses, on every page including the
+    conditions table. It also exercises the caption band and the table renderer
+    with a 保存チャンネル-style column, which the plain compose selftest above
+    does not.
+    """
+    import io
+    import tempfile
+
+    from PIL import Image
+
+    try:
+        buf = io.BytesIO()
+        Image.new("RGB", (64, 48), (200, 30, 90)).save(buf, "PNG")
+        png = buf.getvalue()
+        frames = [WellFrame(well_id="B02", row=1, col=1, png=png,
+                            caption=["B02", "条件A / サンプルB"])]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = compose_pdf(
+                Path(tmp) / "encoding.pdf", "エンコード検証", 2, 2, frames, {},
+                PDF_CELL_CHOICES["draft"], "selftest | channels CH1+CH2",
+                table_headers=["Well番号", "条件", "保存チャンネル"],
+                table_rows=[["B02", "条件A", "CH1+CH2"]],
+                hide_empty_wells=True,
+            )
+            pdf = out.read_bytes()
+        starts = []
+        j = pdf.find(b"\xff\xd8\xff")
+        while j != -1:
+            starts.append(j)
+            j = pdf.find(b"\xff\xd8\xff", j + 3)
+        if len(starts) != 2:
+            print(f"selftest FAILED: expected 2 PDF page images, found {len(starts)}", flush=True)
+            return 17
+        for page_no, s in enumerate(starts, 1):
+            enc = _jpeg_encoding_of(pdf[s:])
+            if enc is None:
+                print(f"selftest FAILED: page {page_no} JPEG stream unparseable", flush=True)
+                return 17
+            max_q, samplings = enc
+            if any(sf != 0x11 for sf in samplings):
+                print(f"selftest FAILED: page {page_no} is chroma-subsampled "
+                      f"(sampling {samplings}); figures need 4:4:4", flush=True)
+                return 17
+            if max_q > 20:
+                print(f"selftest FAILED: page {page_no} quantizer {max_q} > 20 "
+                      "(quality regressed toward the lossy default)", flush=True)
+                return 17
+    except Exception as e:
+        print(f"selftest FAILED: pdf encoding -> {type(e).__name__}: {e}", flush=True)
+        return 17
+
+    print("selftest: PDF pages are 4:4:4 high-quality JPEG (table page included)", flush=True)
+    return 0
 
 
 class _FakeReader:
@@ -1351,6 +1505,33 @@ def _selftest_split_guard() -> int:
             # "2" alone would pass on "B02" or "_00002"; the count must be stated.
             if "B02" not in msg or "続きのファイル 2 個" not in msg:
                 print(f"selftest FAILED: message omits well or chunk count: {msg!r}", flush=True)
+                return 14
+
+            # A metadata READ failure must fail the well, not disarm the guard:
+            # returning 0 on a JVM error would let a truncated well render as
+            # finished, the exact silence this guard exists to break.
+            class _BrokenReader:
+                def getSeriesMetadata(self):
+                    raise RuntimeError("metadata unavailable")
+            try:
+                require_complete_split(_BrokenReader(), lone, 13)
+            except Exception:
+                pass
+            else:
+                print("selftest FAILED: a metadata read failure disarmed the split guard", flush=True)
+                return 14
+
+            # Chunk counting must not treat filenames as glob syntax, and must
+            # not count extensionless siblings that are not `_NNNNN` chunks.
+            tricky = d / "sample[1].oir"
+            tricky.write_bytes(b"")
+            (d / "sample[1]_00001").write_bytes(b"")
+            (d / "Stitch_B02_G001_backup").write_bytes(b"")
+            if count_chunks(tricky) != 1:
+                print(f"selftest FAILED: glob-metachar stem counted {count_chunks(tricky)} != 1", flush=True)
+                return 14
+            if count_chunks(partial) != 2:
+                print("selftest FAILED: a non-chunk extensionless sibling was counted", flush=True)
                 return 14
 
             # The ordinary reader must warn even when the first continuation is

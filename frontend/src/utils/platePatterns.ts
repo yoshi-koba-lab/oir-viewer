@@ -54,9 +54,13 @@ export function patternProblem(
   const nameIssue = filenameProblem(trimmed);
   if (nameIssue) return nameIssue;
   if (trimmed.length > 24) return 'パターン名は24文字以内にしてください。';
+  // NFC before comparing: names become file stems, and the backend hashes
+  // targets NFC-normalized, so two NFC/NFD spellings of one name would pass
+  // here yet alias a single file on macOS and fail mid-run.
+  const nameKey = (s: string) => s.normalize('NFC').toLowerCase();
   const clash = existing.some(
-    (p) => p.name.toLowerCase() === trimmed.toLowerCase(),
-  ) || VISIBLE_PATTERN.name === trimmed;
+    (p) => nameKey(p.name) === nameKey(trimmed),
+  ) || nameKey(VISIBLE_PATTERN.name) === nameKey(trimmed);
   if (clash) return '同じ名前のパターンがあります。';
   if (channels.length === 0) return 'チャンネルを1つ以上選んでください。';
   if (channels.some((c) => !Number.isInteger(c) || c < 0 || c >= PATTERN_MAX_CHANNELS)) {
@@ -149,8 +153,8 @@ export function wellsMissingPatternChannels(
 /**
  * One fetch per well serves every selected pattern: the union of their channel
  * sets is requested, and each pattern is rendered from it with a visibility
- * mask. Refetching per pattern would multiply the slowest step (about two
- * minutes per well on real data at Maximum) by the number of patterns.
+ * mask. The volume fetch is by far the slowest step of an export; refetching
+ * per pattern would multiply it by the number of patterns.
  */
 export function unionChannelsFor(patterns: PlatePattern[], well: PatternWell): number[] {
   const union = new Set<number>();

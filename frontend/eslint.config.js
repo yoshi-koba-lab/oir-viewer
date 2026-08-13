@@ -20,4 +20,14 @@ export default defineConfig([
       globals: globals.browser,
     },
   },
+  {
+    // Without a matching block eslint applies zero rules to the .mjs tests, so
+    // "lint is clean" would be vacuously true for them.
+    files: ['tests/**/*.mjs'],
+    extends: [js.configs.recommended],
+    languageOptions: {
+      ecmaVersion: 2022,
+      globals: globals.node,
+    },
+  },
 ])
