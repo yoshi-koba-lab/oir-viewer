@@ -65,7 +65,11 @@ export function Viewport() {
       consumeCropFit(request.sequence);
       return;
     }
-    const viewport = containerRef.current?.getBoundingClientRect();
+    // The renderer's canvas is the source of truth for the visible CSS frame.
+    // During a dock/resize transition the flex wrapper can briefly have the old
+    // size; solving fit against it would make the completed crop use a
+    // different aspect from the rectangle the user actually drew.
+    const viewport = canvasRef.current?.getBoundingClientRect();
     if (!viewport || viewport.width <= 0 || viewport.height <= 0) return;
     const fit = fitCropViewport(
       cropRect,
@@ -235,6 +239,7 @@ export function Viewport() {
           panX={panX}
           panY={panY}
           containerRef={containerRef}
+          canvasRef={canvasRef}
         />
       )}
       {/* Scale bar. Capped at 70% of the image on screen so an auto length can

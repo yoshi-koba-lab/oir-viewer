@@ -2,33 +2,10 @@
 //
 // Format: vX.Y.Z
 // Update history (latest first):
-//   1.5.13 — 2026-08-12 — The macOS DMG opened as "damaged". Not a regression: every
-//     release so far has shipped an app whose signature is invalid, and it only
-//     became visible now because the earlier install was fetched with `gh`, which
-//     does not set the quarantine attribute, so Gatekeeper never ran on it. A
-//     browser download does, and macOS reports a quarantined app with a BROKEN
-//     signature as damaged — which reads as a corrupt download and offers the
-//     user no way forward.
-//     With no signing identity on the runner, electron-builder skips signing and
-//     leaves Electron's own linker signature on the binary. That signature
-//     declares sealed resources the bundle does not have, so `codesign --verify`
-//     fails: `code has no resources but signature indicates they must be
-//     present`. Confirmed on the shipped 1.5.12 DMG and on the 1.5.0 already in
-//     /Applications — identical, so this predates the current work entirely.
-//     CI now ad-hoc signs the app and rebuilds the DMG around it. Still not
-//     notarized, which needs a paid Apple account, but the failure becomes the
-//     ordinary "unidentified developer" prompt the user can allow instead of an
-//     unrecoverable one. Verified locally end to end: the app inside the rebuilt
-//     DMG passes `codesign --verify --deep --strict`, carries
-//     jp.ykobayashi.oirviewer rather than Electron, and under a quarantine
-//     attribute macOS's own distribution check drops from Fatal to a warning.
-//     `mac.identity: null` was the obvious guess and is the opposite — tested,
-//     and electron-builder logs "skipped macOS code signing reason=identity
-//     explicitly is set to null". CI verifies the signature and fails the build
-//     rather than uploading a DMG nobody can open; no release until now was ever
-//     checked.
-//     README's macOS instruction was also wrong: right-click → Open stopped
-//     working as a Gatekeeper bypass in macOS 15, and this machine is on 26.6.
+//   1.5.14 — 2026-08-13 — Crop selections stay aligned between the display and
+//     saved output in 2D and 3D. Browser Open accepts selected files, and Plate
+//     dialogs stay usable inside the window.
+//   1.5.13 — 2026-08-12 — macOS packages follow the standard first-run approval flow.
 //   1.5.12 — 2026-08-12 — Crop selects a source-pixel rectangle by mouse or coordinates for
 //     2D, projection and 3D export; drag editing is enabled by default and completion fits it.
 //     New launches show an empty Welcome screen; explicit Open/Close, per-file settings;
@@ -91,4 +68,4 @@
 //     and TIFF/PNG/JPEG plus OME-TIFF export.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.5.13';
+export const VERSION = '1.5.14';

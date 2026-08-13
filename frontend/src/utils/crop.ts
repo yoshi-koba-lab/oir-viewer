@@ -28,12 +28,177 @@ export interface CropViewportFit {
   panY: number;
 }
 
+/** CSS-pixel rectangle of the element that actually receives the rendered frame. */
+export interface CropViewportRect {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+/** CSS-pixel bounds of a source plane inside a renderer viewport. */
+export interface CropViewportFitRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+function viewportSize(rect: CropViewportRect): { width: number; height: number } {
+  return {
+    width: Math.max(1, finite(rect.width, 1)),
+    height: Math.max(1, finite(rect.height, 1)),
+  };
+}
+
+/**
+ * Convert a pointer in client/CSS pixels to a source-pixel corner.
+ *
+ * The renderer draws using the canvas's CSS width/height after applying the
+ * device-pixel-ratio transform to its backing store.  Crop interaction must
+ * therefore use the same CSS frame; multiplying by DPR here would turn a
+ * source-pixel crop into a different rectangle on HiDPI displays.
+ */
+export function sourcePointFromClient(
+  clientX: number,
+  clientY: number,
+  frame: CropViewportRect,
+  sourceWidth: number,
+  sourceHeight: number,
+  zoom: number,
+  panX: number,
+  panY: number,
+  fitToCanvas = false,
+  fitRect?: CropViewportFitRect,
+): { x: number; y: number } {
+  const width = Math.max(0, Math.trunc(finite(sourceWidth, 0)));
+  const height = Math.max(0, Math.trunc(finite(sourceHeight, 0)));
+  const { width: frameWidth, height: frameHeight } = viewportSize(frame);
+  const left = finite(frame.left, 0);
+  const top = finite(frame.top, 0);
+  if (fitToCanvas) {
+    const fittedLeft = left + finite(fitRect?.x ?? 0, 0);
+    const fittedTop = top + finite(fitRect?.y ?? 0, 0);
+    const fittedWidth = Math.max(1, finite(fitRect?.width ?? frameWidth, frameWidth));
+    const fittedHeight = Math.max(1, finite(fitRect?.height ?? frameHeight, frameHeight));
+    return {
+      x: Math.max(0, Math.min(width, Math.round(((clientX - fittedLeft) / fittedWidth) * width))),
+      y: Math.max(0, Math.min(height, Math.round(((clientY - fittedTop) / fittedHeight) * height))),
+    };
+  }
+  const scale = Math.max(Number.isFinite(zoom) ? zoom : 0, Number.EPSILON);
+  const dx = frameWidth / 2 - (width * scale) / 2 + (Number.isFinite(panX) ? panX : 0);
+  const dy = frameHeight / 2 - (height * scale) / 2 + (Number.isFinite(panY) ? panY : 0);
+  return {
+    x: Math.max(0, Math.min(width, Math.round((clientX - left - dx) / scale))),
+    y: Math.max(0, Math.min(height, Math.round((clientY - top - dy) / scale))),
+  };
+}
+
+/** Convert a source-pixel corner to a client/CSS-pixel point in the rendered frame. */
+export function clientPointFromSource(
+  x: number,
+  y: number,
+  frame: CropViewportRect,
+  sourceWidth: number,
+  sourceHeight: number,
+  zoom: number,
+  panX: number,
+  panY: number,
+  fitToCanvas = false,
+  fitRect?: CropViewportFitRect,
+): { x: number; y: number } {
+  const width = Math.max(0, Math.trunc(finite(sourceWidth, 0)));
+  const height = Math.max(0, Math.trunc(finite(sourceHeight, 0)));
+  const { width: frameWidth, height: frameHeight } = viewportSize(frame);
+  const left = finite(frame.left, 0);
+  const top = finite(frame.top, 0);
+  if (fitToCanvas) {
+    const fittedLeft = left + finite(fitRect?.x ?? 0, 0);
+    const fittedTop = top + finite(fitRect?.y ?? 0, 0);
+    const fittedWidth = Math.max(1, finite(fitRect?.width ?? frameWidth, frameWidth));
+    const fittedHeight = Math.max(1, finite(fitRect?.height ?? frameHeight, frameHeight));
+    return {
+      x: fittedLeft + (x / Math.max(1, width)) * fittedWidth,
+      y: fittedTop + (y / Math.max(1, height)) * fittedHeight,
+    };
+  }
+  const scale = Math.max(Number.isFinite(zoom) ? zoom : 0, Number.EPSILON);
+  const dx = frameWidth / 2 - (width * scale) / 2 + (Number.isFinite(panX) ? panX : 0);
+  const dy = frameHeight / 2 - (height * scale) / 2 + (Number.isFinite(panY) ? panY : 0);
+  return {
+    x: left + dx + x * scale,
+    y: top + dy + y * scale,
+  };
+}
+
+export type CropHandle = 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w' | 'nw';
+
 function finite(value: number, fallback: number): number {
   return Number.isFinite(value) ? value : fallback;
 }
 
 function bound(value: number, max: number): number {
   return Math.max(0, Math.min(max, value));
+}
+
+export interface CropPoint {
+  x: number;
+  y: number;
+}
+
+/** Source rectangle from a drag in source-pixel coordinates. */
+export function cropRectFromDragPoints(
+  start: CropPoint,
+  end: CropPoint,
+  width: number,
+  height: number,
+): CropRect {
+  const w = Math.max(0, finite(width, 0));
+  const h = Math.max(0, finite(height, 0));
+  const minSize = 1;
+  const x = bound(Math.min(start.x, end.x), Math.max(0, w - minSize));
+  const y = bound(Math.min(start.y, end.y), Math.max(0, h - minSize));
+  const right = Math.max(x + minSize, Math.min(w, Math.max(start.x, end.x)));
+  const bottom = Math.max(y + minSize, Math.min(h, Math.max(start.y, end.y)));
+  return { x, y, width: right - x, height: bottom - y };
+}
+
+/** Move a source rectangle while keeping it inside the image bounds. */
+export function moveCropRect(
+  rect: CropRect,
+  dx: number,
+  dy: number,
+  width: number,
+  height: number,
+): CropRect {
+  return {
+    ...rect,
+    x: bound(rect.x + dx, Math.max(0, finite(width, 0) - rect.width)),
+    y: bound(rect.y + dy, Math.max(0, finite(height, 0) - rect.height)),
+  };
+}
+
+/** Resize a source rectangle from one of its eight handles. */
+export function resizeCropRect(
+  rect: CropRect,
+  handle: CropHandle,
+  point: CropPoint,
+  width: number,
+  height: number,
+): CropRect {
+  let left = rect.x;
+  let right = rect.x + rect.width;
+  let top = rect.y;
+  let bottom = rect.y + rect.height;
+  const minSize = 1;
+  if (handle.includes('w')) left = bound(point.x, right - minSize);
+  if (handle.includes('e')) right = bound(point.x, Math.max(0, finite(width, 0)));
+  if (handle.includes('e')) right = Math.max(right, left + minSize);
+  if (handle.includes('n')) top = bound(point.y, bottom - minSize);
+  if (handle.includes('s')) bottom = bound(point.y, Math.max(0, finite(height, 0)));
+  if (handle.includes('s')) bottom = Math.max(bottom, top + minSize);
+  return { x: left, y: top, width: right - left, height: bottom - top };
 }
 
 function dimensions(bounds: CropBounds): CropBounds {

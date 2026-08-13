@@ -180,10 +180,10 @@ jobs:
           if-no-files-found: error
 
   release:
-    # `!cancelled()` rather than `success()`: one platform failing to build must
-    # not withhold the installers that did build. The Release then simply carries
-    # fewer files, which is visible, instead of not existing at all.
-    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    # A public release is complete only when every supported platform has passed
+    # its packaged-backend self-test, fresh-session HTTP smoke test, installer
+    # build, and artifact upload. Never publish a partial set of installers.
+    if: ${{ success() && startsWith(github.ref, 'refs/tags/v') }}
     needs: build
     runs-on: ubuntu-latest
     permissions:

@@ -400,6 +400,19 @@ export interface ChooseFolderResponse {
 export interface ChooseFilesResponse {
   paths: string[];
   cancelled: boolean;
+  /** Browser fallback files; native Electron pickers return filesystem paths. */
+  files?: File[];
+}
+
+export type PickedFileInput =
+  | { kind: 'files'; files: File[] }
+  | { kind: 'paths'; paths: string[] };
+
+/** Normalize native and browser picker results before an open operation. */
+export function pickedFileInput(response: ChooseFilesResponse): PickedFileInput | null {
+  if (response.files?.length) return { kind: 'files', files: response.files };
+  if (response.paths.length) return { kind: 'paths', paths: response.paths };
+  return null;
 }
 
 /**
@@ -417,13 +430,66 @@ interface ElectronAPI {
 }
 
 function shell(): ElectronAPI | null {
+  if (typeof window === 'undefined') return null;
   return (window as unknown as { electronAPI?: ElectronAPI }).electronAPI ?? null;
+}
+
+const BROWSER_IMAGE_ACCEPT = [
+  '.oir', '.oib', '.oif', '.tif', '.tiff', '.nd2', '.lif', '.czi',
+].join(',');
+
+/**
+ * Browser-safe replacement for the native picker.
+ *
+ * A plain browser has no filesystem path that can be sent to `/api/open`.
+ * Selecting a File object and uploading it through the existing `/api/upload`
+ * route keeps the browser path safe (the backend receives a copy, never an
+ * arbitrary path) and makes the Welcome/Open buttons useful in the trial
+ * build.  The Electron branch above remains the native path picker.
+ */
+function chooseBrowserFiles(): Promise<ChooseFilesResponse> {
+  if (typeof document === 'undefined') {
+    return Promise.resolve({ paths: [], cancelled: true });
+  }
+  return new Promise((resolve) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = true;
+    input.accept = BROWSER_IMAGE_ACCEPT;
+    input.style.display = 'none';
+    document.body.appendChild(input);
+
+    let settled = false;
+    const finish = (files: File[]) => {
+      if (settled) return;
+      settled = true;
+      window.removeEventListener('focus', onFocus);
+      input.remove();
+      resolve({ paths: [], files, cancelled: files.length === 0 });
+    };
+    const onFocus = () => {
+      // Chromium does not consistently emit `cancel` for a dismissed file
+      // chooser.  Once focus returns, an empty FileList is an unambiguous
+      // cancellation; the timeout lets a real selection finish its change
+      // event first.
+      window.setTimeout(() => {
+        if (!settled && (!input.files || input.files.length === 0)) finish([]);
+      }, 0);
+    };
+    input.addEventListener('change', () => {
+      finish(Array.from(input.files ?? []));
+    }, { once: true });
+    input.addEventListener('cancel', () => finish([]), { once: true });
+    window.addEventListener('focus', onFocus, { once: true });
+    input.click();
+  });
 }
 
 /** Open the OS file picker and return the chosen image paths. */
 export async function chooseFiles(): Promise<ChooseFilesResponse> {
   const api = shell();
   if (api) return api.chooseFiles();
+  if (typeof document !== 'undefined') return chooseBrowserFiles();
   return getJson<ChooseFilesResponse>('/api/choose-files', 'ファイル選択ダイアログを開けません');
 }
 

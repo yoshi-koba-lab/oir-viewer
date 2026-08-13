@@ -51,6 +51,14 @@ export interface VolumeCameraCropFit {
   target: Vec3;
 }
 
+export interface VolumeViewportRect {
+  /** CSS-pixel bounds of the projected physical volume in its canvas. */
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 type Vec3 = [number, number, number];
 
 const dot = (a: Vec3, b: Vec3) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -179,6 +187,66 @@ function boxCorners(input: VolumeCameraFitInput): Vec3[] {
     }
   }
   return corners;
+}
+
+function sourcePlaneCorners(input: VolumeCameraFitInput): Vec3[] {
+  const hx = finitePositive(input.scaleX, 1) / 2;
+  const hy = finitePositive(input.scaleY, 1) / 2;
+  return [[-hx, -hy, 0], [-hx, hy, 0], [hx, -hy, 0], [hx, hy, 0]];
+}
+
+/**
+ * Project the physical source X/Y plane into a canvas.
+ *
+ * The 3D crop overlay edits source X/Y coordinates, but the rendered volume is
+ * not necessarily canvas-sized: an anisotropic sample is letterboxed whenever
+ * the limiting camera dimension is the other axis.  Mapping the overlay to the
+ * full canvas makes drags in black margins select arbitrary source pixels.  Use
+ * the same perspective basis as camera fitting and project the four corners of
+ * the source plane to obtain its projected bounds for the current
+ * view. The center plane is intentional: under perspective, the front/back
+ * volume corners have different magnification and cannot be mapped back to one
+ * source-pixel coordinate system. The crop editor is about source X/Y, not the
+ * Z silhouette.
+ */
+export function volumeViewportRect(
+  input: Pick<VolumeCameraFitInput, 'scaleX' | 'scaleY' | 'scaleZ' | 'azDeg' | 'elDeg' | 'fovDeg' | 'aspect'> & {
+    radius: number;
+    viewportWidth: number;
+    viewportHeight: number;
+  },
+): VolumeViewportRect {
+  const viewportWidth = finitePositive(input.viewportWidth, 0);
+  const viewportHeight = finitePositive(input.viewportHeight, 0);
+  const radius = finitePositive(input.radius, 0);
+  if (!(viewportWidth > 0) || !(viewportHeight > 0) || !(radius > 0)) {
+    throw new Error('3D表示領域のサイズが不正です。');
+  }
+  const fov = Math.max(1, Math.min(179, finitePositive(input.fovDeg, 45))) * Math.PI / 180;
+  const aspect = finitePositive(input.aspect, viewportWidth / viewportHeight);
+  const tanV = Math.tan(fov / 2);
+  const tanH = tanV * aspect;
+  const { outward, right, up } = cameraBasis(input.azDeg, input.elDeg);
+  const points = sourcePlaneCorners(input).map((offset) => {
+    // Camera is target + outward*radius and looks back at target.  Positive
+    // viewDepth is therefore radius minus the corner's outward projection.
+    const viewDepth = radius - dot(offset, outward);
+    if (!(viewDepth > 1e-9)) {
+      throw new Error('3D表示カメラがボリューム内部にあります。');
+    }
+    const ndcX = dot(offset, right) / (viewDepth * tanH);
+    const ndcY = dot(offset, up) / (viewDepth * tanV);
+    return {
+      x: viewportWidth * (0.5 + ndcX * 0.5),
+      y: viewportHeight * (0.5 - ndcY * 0.5),
+    };
+  });
+  const x0 = Math.min(...points.map((point) => point.x));
+  const x1 = Math.max(...points.map((point) => point.x));
+  const y0 = Math.min(...points.map((point) => point.y));
+  const y1 = Math.max(...points.map((point) => point.y));
+  if (!(x1 > x0) || !(y1 > y0)) throw new Error('3D表示領域を計算できません。');
+  return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
 }
 
 /**

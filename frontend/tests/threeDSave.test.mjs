@@ -101,6 +101,13 @@ test('completed 3D crop fits the display and avoids a second capture crop', () =
   assert.match(viewer, /orbit\.current\.el = 0/);
   assert.match(viewer, /previousCropPanelOpenRef/);
   assert.match(viewer, /cropPanelOpen && \(\s*<CropOverlay/);
+  assert.match(viewer, /volumeViewportRect\(/);
+  assert.match(viewer, /fitRect=\{cropViewportRect \?\? undefined\}/);
+  assert.match(viewer, /renderedRect=\{cropViewportRect/);
+  assert.match(readFileSync(new URL('../src/components/ScalebarOverlay.tsx', import.meta.url), 'utf8'), /renderedRect/);
+  assert.match(viewer, /displayFitted && cropViewportRect/);
+  assert.match(viewer, /if \(cropPanelOpen\) \{\s*orbit\.current\.az = 0;\s*orbit\.current\.el = 0;/);
+  assert.match(viewer, /\}, \[activeImageId, cropPanelOpen\]\);/);
   assert.match(viewer, /setVolume3D\(\{\s*az,\s*el/);
   assert.match(readFileSync(new URL('../src/components/CropSettingsPanel.tsx', import.meta.url), 'utf8'), /viewMode === '2d' \|\| viewMode === '3d'/);
   assert.match(viewer, /cropRectForCapture\(/);

@@ -92,16 +92,19 @@ export function PlateDialog({ onClose }: { onClose: () => void }) {
 
   return (
     <div
-      className="absolute inset-0 z-50 flex items-center justify-center bg-black/70 p-6"
+      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/70 p-6"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="plate-dialog-title"
       onClick={requestClose}
     >
       <div
         className="bg-[var(--bg-panel)] border border-[var(--border)] rounded-xl shadow-2xl
-                   p-5 max-w-3xl w-full max-h-[85vh] overflow-y-auto"
+                   p-5 max-w-3xl w-full max-h-[calc(100vh-3rem)] overflow-y-auto"
         onClick={(event) => event.stopPropagation()}
       >
         <div className="flex items-center justify-between mb-3">
-          <h2 className="text-sm font-semibold">プレート（MATL 撮影）を読み込む</h2>
+          <h2 id="plate-dialog-title" className="text-sm font-semibold">プレート（MATL 撮影）を読み込む</h2>
           <button
             onClick={requestClose}
             disabled={busy || !!loading}

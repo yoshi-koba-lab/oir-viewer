@@ -23,6 +23,7 @@ import {
 export function ScalebarOverlay({
   metrics,
   geometry,
+  renderedRect,
   pad = 12,
 }: {
   /** Physical length and its on-screen width; null hides the bar. */
@@ -32,6 +33,8 @@ export function ScalebarOverlay({
    * container and there is no separate image rect (the 3D volume).
    */
   geometry?: { imgW: number; imgH: number; zoom: number; panX: number; panY: number };
+  /** Explicit rendered-image bounds for a letterboxed 3D source plane. */
+  renderedRect?: { x: number; y: number; w: number; h: number };
   pad?: number;
 }) {
   const showScalebar = useViewStore((s) => s.showScalebar);
@@ -59,9 +62,10 @@ export function ScalebarOverlay({
   }, []);
 
   const rectOf = useCallback(() => {
+    if (renderedRect) return renderedRect;
     if (!geometry) return { x: 0, y: 0, w: box.w, h: box.h };
     return imageRect(box.w, box.h, geometry.imgW, geometry.imgH, geometry.zoom, geometry.panX, geometry.panY);
-  }, [geometry, box.w, box.h]);
+  }, [geometry, renderedRect, box.w, box.h]);
 
   const onPointerDown = (e: React.PointerEvent) => {
     // The panel underneath pans on drag; this one is ours.

@@ -6,6 +6,7 @@ import {
   minimumVolumeCameraRadius,
   resolveVolumeCameraZoom,
   volumeCameraCropFit,
+  volumeViewportRect,
   volumePhysicalGeometry,
   volumeRadiusForZoomPercent,
   volumeZoomPercentForRadius,
@@ -116,4 +117,57 @@ test('invalid 3D crop geometry fails closed', () => {
     ),
     /範囲外/,
   );
+});
+
+test('3D crop overlay follows the projected physical volume instead of the full letterboxed canvas', () => {
+  const input = {
+    scaleX: 1,
+    scaleY: 0.5,
+    scaleZ: 0.2,
+    azDeg: 0,
+    elDeg: 0,
+    fovDeg: 50,
+    aspect: 16 / 9,
+  };
+  const camera = resolveVolumeCameraZoom(input, 100);
+  const rect = volumeViewportRect({
+    ...input,
+    radius: camera.radius,
+    viewportWidth: 1600,
+    viewportHeight: 900,
+  });
+  // The wide physical X axis is the limiting dimension here; the Y source
+  // plane is letterboxed and must not be mapped to all 900 CSS pixels.
+  assert.ok(rect.width > 0 && rect.height > 0);
+  assert.ok(rect.x > 0 && rect.x + rect.width < 1600);
+  assert.ok(rect.y > 0 && rect.y + rect.height < 900);
+  assert.ok(rect.height < 900 * 0.8);
+  assert.ok(Math.abs(rect.x + rect.width / 2 - 800) < 1e-9);
+  assert.ok(Math.abs(rect.y + rect.height / 2 - 450) < 1e-9);
+});
+
+test('3D overlay projection stays inside the frame for an off-axis orbit', () => {
+  const input = {
+    scaleX: 0.8,
+    scaleY: 0.6,
+    scaleZ: 0.4,
+    azDeg: 37,
+    elDeg: -22,
+    fovDeg: 50,
+    aspect: 1,
+  };
+  const camera = resolveVolumeCameraZoom(input, 100);
+  const rect = volumeViewportRect({
+    ...input,
+    radius: camera.radius,
+    viewportWidth: 700,
+    viewportHeight: 700,
+  });
+  assert.ok(rect.width > 0 && rect.height > 0);
+  // Perspective magnification varies across a tilted source plane, so the
+  // projected bounds need not be centred on the orbit pivot.  They must still
+  // remain inside the canvas: pointer drags outside this rectangle are margins,
+  // not source pixels.
+  assert.ok(rect.x > 0 && rect.x + rect.width < 700);
+  assert.ok(rect.y > 0 && rect.y + rect.height < 700);
 });

@@ -4,9 +4,9 @@ import { useImageStore } from '../stores/imageStore';
 import { threeDSaveIsBusy, useOperationStore } from '../stores/operationStore';
 import { usePlateStore } from '../stores/plateStore';
 import {
-  openAndReload, openPathBatch, showDefaultViewForActiveImage,
+  openAndReload, openPathBatch, uploadFileBatch, showDefaultViewForActiveImage,
 } from '../hooks/useImageLoader';
-import { chooseFiles } from '../utils/api';
+import { chooseFiles, pickedFileInput } from '../utils/api';
 import { SaveDialog } from './SaveDialog';
 import { ProjectionDialog } from './ProjectionDialog';
 import { PlateDialog } from './PlateDialog';
@@ -100,15 +100,20 @@ export function Toolbar({ fileManagerOpen = false, onToggleFileManager }: Toolba
       const picked = await chooseFiles();
       if (threeDSaveIsBusy()) return;
       if (picked.cancelled) return;
-      if (picked.paths.length === 0) {
+      const selected = pickedFileInput(picked);
+      if (!selected) {
         // Not a cancel, but nothing came back either. Silence here is how a
         // broken picker looks identical to a working one.
         report('ファイルが選択されませんでした（ファイル選択ダイアログから何も返りませんでした）');
         return;
       }
+      // A native Electron picker returns paths; the browser-safe picker returns
+      // File objects, which must go through the upload endpoint instead.
       // Present only the last successful image. Mounting Maximum-quality 3D
       // for every intermediate file would overlap several GB-scale loads.
-      const { lastOpenedId, failures } = await openPathBatch(picked.paths);
+      const { lastOpenedId, failures } = selected.kind === 'files'
+        ? await uploadFileBatch(selected.files)
+        : await openPathBatch(selected.paths);
       if (lastOpenedId) showDefaultViewForActiveImage(lastOpenedId);
       if (failures.length) {
         report(failures.map(({ label, message }) => `${label}: ${message}`).join('\n'));

@@ -133,6 +133,7 @@ test('3D viewport stays pinned and crop settings dock beside the image', () => {
   const overlay = readFileSync(new URL('../src/components/CropOverlay.tsx', import.meta.url), 'utf8');
   const save = readFileSync(new URL('../src/components/SaveDialog.tsx', import.meta.url), 'utf8');
   const projection = readFileSync(new URL('../src/components/ProjectionDialog.tsx', import.meta.url), 'utf8');
+  const viewport = readFileSync(new URL('../src/components/Viewport.tsx', import.meta.url), 'utf8');
 
   // `absolute` and `relative` on the same viewport wrapper made the final
   // utility order browser-dependent and collapsed the WebGL canvas height.
@@ -159,10 +160,26 @@ test('3D viewport stays pinned and crop settings dock beside the image', () => {
   assert.doesNotMatch(controls, /disabled=\{!sourceUsable/);
   assert.match(overlay, /setCropRect\(next, currentOwner\)/);
   assert.match(overlay, /pointerEvents: canEdit \? 'all' : 'none'/);
+  assert.match(viewport, /<CropOverlay[\s\S]*containerRef=\{containerRef\}[\s\S]*canvasRef=\{canvasRef\}/);
   assert.match(save, /imageOperationIsBusy\(\)/);
   assert.match(save, /cropOwnerMatchesMetadata\(currentView\.cropOwner/);
   assert.match(projection, /imageOperationIsBusy\(\)/);
   assert.match(projection, /cropOwnerMatchesMetadata\(currentView\.cropOwner/);
   assert.match(readFileSync(new URL('../src/components/Viewport.tsx', import.meta.url), 'utf8'), /cropFitRequest/);
   assert.match(panel, /w-64 shrink-0 overflow-y-auto/);
+});
+
+test('Plate dialogs use the viewport, not the compact toolbar, as their modal frame', () => {
+  const plate = readFileSync(new URL('../src/components/PlateDialog.tsx', import.meta.url), 'utf8');
+  const save = readFileSync(new URL('../src/components/PlateSaveDialog.tsx', import.meta.url), 'utf8');
+  for (const dialog of [plate, save]) {
+    // Both dialogs are rendered from Toolbar, whose relative box is only one
+    // toolbar row tall. A fixed, top-aligned, scrollable backdrop prevents the
+    // old absolute/inset-0 modal from centering above the browser viewport.
+    assert.match(dialog, /className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black\/70 p-6"/);
+    assert.doesNotMatch(dialog, /className="absolute inset-0 z-50 flex items-center justify-center bg-black\/70 p-6"/);
+    assert.match(dialog, /max-h-\[calc\(100vh-3rem\)\] overflow-y-auto/);
+    assert.match(dialog, /role="dialog"/);
+    assert.match(dialog, /aria-modal="true"/);
+  }
 });

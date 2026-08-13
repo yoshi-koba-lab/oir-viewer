@@ -20,7 +20,7 @@ import { SplitView } from './components/SplitView';
 import { Volume3DViewer } from './components/Volume3DViewer';
 import { CompareView } from './components/CompareView';
 import { CropSettingsPanel } from './components/CropSettingsPanel';
-import { chooseFiles } from './utils/api';
+import { chooseFiles, pickedFileInput } from './utils/api';
 import { VERSION } from './constants/version';
 import './index.css';
 
@@ -256,8 +256,13 @@ function WelcomeScreen() {
     try {
       const picked = await chooseFiles();
       if (threeDSaveIsBusy()) return;
-      if (picked.cancelled || picked.paths.length === 0) return;
-      const { lastOpenedId, failures } = await openPathBatch(picked.paths);
+      const selected = pickedFileInput(picked);
+      if (!selected) return;
+      // Electron returns filesystem paths; a browser trial returns File
+      // objects and uploads them through the safe `/api/upload` route.
+      const { lastOpenedId, failures } = selected.kind === 'files'
+        ? await uploadFileBatch(selected.files)
+        : await openPathBatch(selected.paths);
       if (lastOpenedId) showDefaultViewForActiveImage(lastOpenedId);
       if (failures.length) {
         setError(failures.map(({ label, message }) => `${label}: ${message}`).join('\n'));
