@@ -20,10 +20,14 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -66,6 +70,53 @@ def find_cached_jars() -> list[Path]:
     return sorted(Path(p) for p in glob.glob(str(m2 / "**" / "*.jar"), recursive=True))
 
 
+def fetch_jars_archive(url: str) -> list[Path] | None:
+    """Stage the jar set from a pinned archive instead of resolving via Maven.
+
+    Exists because maven.scijava.org has real outages (2026-08: metadata
+    requests hung for 6+ hours and every CI build died in jgo's resolver).
+    The archive is the byte-identical, daily-verified jar set from the
+    development machine's runtime, and OIR_JARS_SHA256 must match exactly —
+    a wrong digest stops the build rather than falling back to anything.
+    """
+    expected = os.environ.get("OIR_JARS_SHA256", "").strip().lower()
+    if not expected:
+        print("ERROR: OIR_JARS_ARCHIVE_URL is set but OIR_JARS_SHA256 is not; "
+              "refusing an unverified jar archive", file=sys.stderr)
+        return None
+    print(f"downloading jar archive {url}", flush=True)
+    workdir = Path(tempfile.mkdtemp(prefix="oir-jars-"))
+    archive = workdir / "jars.tar.gz"
+    try:
+        with urllib.request.urlopen(url, timeout=120) as r, open(archive, "wb") as f:
+            shutil.copyfileobj(r, f)
+    except Exception as e:
+        print(f"ERROR: could not download jar archive: {e}", file=sys.stderr)
+        return None
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    if digest != expected:
+        print(f"ERROR: jar archive SHA-256 mismatch\n  expected {expected}\n  got      {digest}",
+              file=sys.stderr)
+        return None
+    out = workdir / "jars"
+    out.mkdir()
+    with tarfile.open(archive) as tar:
+        for member in tar.getmembers():
+            # Flat jar files only; anything else in the archive is refused.
+            name = Path(member.name).name
+            if not member.isfile() or not name.endswith(".jar"):
+                if member.isdir() or member.name in (".", "./"):
+                    continue
+                print(f"ERROR: unexpected entry in jar archive: {member.name}",
+                      file=sys.stderr)
+                return None
+            with tar.extractfile(member) as src, open(out / name, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+    jars = sorted(out.glob("*.jar"))
+    print(f"verified jar archive: {len(jars)} jars, sha256 {digest[:12]}…", flush=True)
+    return jars
+
+
 def resolve_jars() -> None:
     """Populate the Maven repository with Bio-Formats and its dependencies.
 
@@ -99,14 +150,20 @@ def main() -> int:
     if not jre:
         return 1
 
-    jars = find_cached_jars()
-    if not jars:
-        resolve_jars()
+    archive_url = os.environ.get("OIR_JARS_ARCHIVE_URL", "").strip()
+    if archive_url:
+        jars = fetch_jars_archive(archive_url)
+        if not jars:
+            return 1
+    else:
         jars = find_cached_jars()
-    if not jars:
-        print("ERROR: no jars found in the Maven repository after resolving",
-              file=sys.stderr)
-        return 1
+        if not jars:
+            resolve_jars()
+            jars = find_cached_jars()
+        if not jars:
+            print("ERROR: no jars found in the Maven repository after resolving",
+                  file=sys.stderr)
+            return 1
     # Sanity-check that we got the reader itself, not just transitive noise.
     if not any(j.name.startswith("formats-gpl") for j in jars):
         print(f"ERROR: formats-gpl jar missing from the {len(jars)} jars found",

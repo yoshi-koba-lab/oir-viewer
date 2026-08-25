@@ -76,7 +76,14 @@ jobs:
 
       # Downloads the JRE (cjdk) and the Bio-Formats jars (Maven) once, then
       # copies them into backend/runtime so the app never needs them at run time.
+      # The pinned archive (see the deps-bioformats-8.0.1 release) sidesteps
+      # maven.scijava.org, whose 2026-08 outage killed every build leg in the
+      # resolver. stage_runtime.py verifies the digest and fails closed; the
+      # packaged-backend selftest below still proves the jars actually work.
       - name: Stage the Java runtime
+        env:
+          OIR_JARS_ARCHIVE_URL: https://github.com/yoshi-koba-lab/oir-viewer/releases/download/deps-bioformats-8.0.1/bioformats-8.0.1-jars.tar.gz
+          OIR_JARS_SHA256: c2034ef72e755e3bd754dcd6b7bb0a3d538cd27d517f15bbb61dd75a60049785
         run: python scripts/stage_runtime.py
 
       - name: Package the backend
