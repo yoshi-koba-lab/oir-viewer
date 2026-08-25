@@ -2,6 +2,17 @@
 //
 // Format: vX.Y.Z
 // Update history (latest first):
+//   1.5.17 — 2026-08-26 — The 3D view renders only when the camera, contrast,
+//     channels or volume actually change. It used to raymarch the full volume at
+//     display refresh rate even while idle (measured: 1 draw per frame with no
+//     interaction; now 0 over 800+ idle frames), which kept the GPU and — on
+//     Apple silicon — shared memory bandwidth busy the whole time a stack was
+//     open and slowed the entire machine. The CPU-side copy of the packed
+//     volume (hundreds of MB at Maximum) is also freed once textures are
+//     verified on the GPU. Pseudo Plate: arrange the open files in a 6/12/24/48
+//     well layout and export one PDF. Cells keep each image's rectangular shape,
+//     positions are assigned per well from dropdowns, and empty positions are
+//     labelled Empty rather than Not acquired.
 //   1.5.16 — 2026-08-14 — Plate PDF pages keep full colour resolution. A 3D
 //     crop that is not yet applied refuses to save instead of saving the wrong
 //     area, and camera controls stay fixed while editing a crop. Oversized
@@ -75,4 +86,4 @@
 //     and TIFF/PNG/JPEG plus OME-TIFF export.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.5.16';
+export const VERSION = '1.5.17';

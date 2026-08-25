@@ -11,6 +11,7 @@ import { SaveDialog } from './SaveDialog';
 import { ProjectionDialog } from './ProjectionDialog';
 import { PlateDialog } from './PlateDialog';
 import { PlateSaveDialog } from './PlateSaveDialog';
+import { PseudoPlateDialog } from './PseudoPlateDialog';
 import { VERSION } from '../constants/version';
 import { CropControls } from './CropControls';
 
@@ -42,7 +43,7 @@ export function Toolbar({ fileManagerOpen = false, onToggleFileManager }: Toolba
   const plate = usePlateStore((s) => s.scan);
   const threeDSaveBusy = useOperationStore((s) => !!s.threeDSave);
   const [showOpenDialog, setShowOpenDialog] = useState(false);
-  const [plateModal, setPlateModal] = useState<'plate' | 'save' | 'saved' | null>(null);
+  const [plateModal, setPlateModal] = useState<'plate' | 'save' | 'pseudo' | 'saved' | null>(null);
   const [plateSaveCompleted, setPlateSaveCompleted] = useState('');
   const [showSaveDialog, setShowSaveDialog] = useState(false);
   const [showProjection, setShowProjection] = useState(false);
@@ -213,10 +214,28 @@ export function Toolbar({ fileManagerOpen = false, onToggleFileManager }: Toolba
         >
           Plate Save
         </button>
+        <button
+          onClick={() => { if (!threeDSaveIsBusy()) setPlateModal('pseudo'); }}
+          disabled={plateModal !== null || threeDSaveBusy}
+          className="px-2 py-1 rounded text-xs bg-[var(--border)] text-[var(--text-secondary)]
+                     hover:text-white disabled:opacity-40 transition"
+          title="開いているファイルをプレート配置（6/12/24/48 well）で1つのPDFに書き出す"
+        >
+          Pseudo Plate
+        </button>
       </div>
       {plateModal === 'plate' && <PlateDialog onClose={() => setPlateModal(null)} />}
       {plateModal === 'save' && (
         <PlateSaveDialog
+          onClose={() => setPlateModal(null)}
+          onSaved={(details) => {
+            setPlateSaveCompleted(details);
+            setPlateModal('saved');
+          }}
+        />
+      )}
+      {plateModal === 'pseudo' && (
+        <PseudoPlateDialog
           onClose={() => setPlateModal(null)}
           onSaved={(details) => {
             setPlateSaveCompleted(details);

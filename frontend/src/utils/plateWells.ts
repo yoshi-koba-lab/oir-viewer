@@ -1,6 +1,6 @@
 import { useImageStore, DEFAULT_VOLUME_3D, type ChannelState, type Volume3DState } from '../stores/imageStore';
 import type { WellSnapshot } from '../stores/plateStore';
-import type { PlateScan } from './api';
+import type { ImageListItem, PlateScan } from './api';
 
 /**
  * What the open tabs currently look like, per well.
@@ -97,54 +97,106 @@ export function collectOpenWells(scan: PlateScan | null): OpenWell[] {
       : rcFromWellId(wellId);
     if (!rc) continue;
 
-    // The active tab's live state has not been written to imageViewStates yet.
-    const isActive = item.id === st.activeImageId;
-    const channels: ChannelState[] = isActive
-      ? st.channels
-      : st.imageViewStates[item.id]?.channels ?? [];
-    const view: Volume3DState = (isActive
-      ? st.volume3D
-      : st.imageViewStates[item.id]?.volume3D) ?? DEFAULT_VOLUME_3D;
-    const t = isActive
-      ? st.currentT
-      : st.imageViewStates[item.id]?.currentT ?? 0;
-
-    const channelIdx = channels.map((_, i) => i).filter((i) => channels[i].visible).slice(0, 4);
-    const numChannels = Math.min(channels.length, 4);
-    const channelWindows = channels.slice(0, numChannels)
-      .map((ch) => [ch.min, ch.max] as [number, number]);
-    const channelColors = channels.slice(0, numChannels).map((ch) => ch.color);
-    const total = Math.max(1, view.zTotal);
-    const zFrac: [number, number] = [
-      Math.max(0, Math.min(1, (view.zStart - 1) / total)),
-      Math.max(0, Math.min(1, view.zEnd / total)),
-    ];
-    if (zFrac[1] <= zFrac[0]) { zFrac[0] = 0; zFrac[1] = 1; }
-
     out.push({
-      imageId: item.id,
       wellId,
       row: rc.row,
       col: rc.col,
-      filename: item.filename,
       path: scanned?.stitch_path ?? null,
+      ...tabRenderState(item),
       sourceIdentity: scanned?.stitch_identity ?? item.source_identity,
       sourceRevision: scanned?.stitch_revision ?? item.source_revision,
-      t: Math.max(0, Math.min(t, item.num_t - 1)),
-      numT: item.num_t,
-      channelIdx,
-      levels: channelIdx.map((c) => [channels[c].min, channels[c].max] as [number, number]),
-      colors: channelIdx.map((c) => channels[c].color),
-      numChannels,
-      channelWindows,
-      channelColors,
-      view,
-      zFrac,
     });
   }
 
   out.sort((a, b) => a.row - b.row || a.col - b.col);
   return out;
+}
+
+/** An open tab with the settings its export would bake in, position-free. */
+export interface OpenImage {
+  imageId: string;
+  filename: string;
+  /** Absolute path of the tab's own source file. */
+  path: string;
+  sourceIdentity: string;
+  sourceRevision: string;
+  t: number;
+  numT: number;
+  numZ: number;
+  channelIdx: number[];
+  levels: [number, number][];
+  colors: [number, number, number][];
+  numChannels: number;
+  channelWindows: [number, number][];
+  channelColors: [number, number, number][];
+  view: Volume3DState;
+  zFrac: [number, number];
+}
+
+/**
+ * One tab's current display settings, exactly as collectOpenWells reads them.
+ *
+ * The caller must flush the active tab with `saveViewState()` before an
+ * export for the same reason collectOpenWells documents: the active tab's
+ * live state has not been written to imageViewStates yet.
+ */
+function tabRenderState(item: ImageListItem) {
+  const st = useImageStore.getState();
+  const isActive = item.id === st.activeImageId;
+  const channels: ChannelState[] = isActive
+    ? st.channels
+    : st.imageViewStates[item.id]?.channels ?? [];
+  const view: Volume3DState = (isActive
+    ? st.volume3D
+    : st.imageViewStates[item.id]?.volume3D) ?? DEFAULT_VOLUME_3D;
+  const t = isActive
+    ? st.currentT
+    : st.imageViewStates[item.id]?.currentT ?? 0;
+
+  const channelIdx = channels.map((_, i) => i).filter((i) => channels[i].visible).slice(0, 4);
+  const numChannels = Math.min(channels.length, 4);
+  const channelWindows = channels.slice(0, numChannels)
+    .map((ch) => [ch.min, ch.max] as [number, number]);
+  const channelColors = channels.slice(0, numChannels).map((ch) => ch.color);
+  const total = Math.max(1, view.zTotal);
+  const zFrac: [number, number] = [
+    Math.max(0, Math.min(1, (view.zStart - 1) / total)),
+    Math.max(0, Math.min(1, view.zEnd / total)),
+  ];
+  if (zFrac[1] <= zFrac[0]) { zFrac[0] = 0; zFrac[1] = 1; }
+
+  return {
+    imageId: item.id,
+    filename: item.filename,
+    sourceIdentity: item.source_identity,
+    sourceRevision: item.source_revision,
+    t: Math.max(0, Math.min(t, item.num_t - 1)),
+    numT: item.num_t,
+    numZ: item.num_z,
+    channelIdx,
+    levels: channelIdx.map((c) => [channels[c].min, channels[c].max] as [number, number]),
+    colors: channelIdx.map((c) => channels[c].color),
+    numChannels,
+    channelWindows,
+    channelColors,
+    view,
+    zFrac,
+  };
+}
+
+/**
+ * Every open tab, in tab order, with its current display settings.
+ *
+ * The Pseudo Plate export arranges arbitrary open files, so unlike
+ * collectOpenWells nothing is filtered by filename and no scan is consulted —
+ * the position comes from the user's assignment, not the file's name.
+ */
+export function collectOpenImages(): OpenImage[] {
+  const st = useImageStore.getState();
+  return st.imageList.map((item) => ({
+    ...tabRenderState(item),
+    path: item.source_path,
+  }));
 }
 
 /** Open well tabs whose frozen source is not part of the selected acquisition. */

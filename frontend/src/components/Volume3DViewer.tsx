@@ -239,6 +239,17 @@ export function Volume3DViewer() {
   const meshRef = useRef<THREE.Mesh | null>(null);
   const materialRef = useRef<THREE.ShaderMaterial | null>(null);
   const texturesRef = useRef<THREE.Data3DTexture[]>([]);
+  /**
+   * Frames are rendered only when something changed. The loop used to call
+   * renderer.render unconditionally at display refresh rate, which kept a
+   * 200-step raymarch over the full volume running forever — an idle viewer
+   * pinned the GPU (and, on Apple silicon, the shared memory bandwidth), and
+   * the whole machine crawled while a tab merely sat open. Every mutation of
+   * the camera, uniforms or textures calls invalidate(); the heartbeat rAF
+   * then presents exactly one frame and goes back to sleep.
+   */
+  const needsRenderRef = useRef(true);
+  const invalidate = useCallback(() => { needsRenderRef.current = true; }, []);
   const animIdRef = useRef<number>(0);
 
   const metadata = useImageStore((s) => s.metadata);
@@ -490,7 +501,8 @@ export function Volume3DViewer() {
     });
     viewRevisionRef.current += 1;
     recomputeScalebar(); // depends on the camera distance
-  }, [recomputeScalebar]);
+    invalidate();
+  }, [recomputeScalebar, invalidate]);
 
   /** Apply one verified source crop to the live 3D camera and shader. */
   const fitCropSelection = useCallback((rect: ThreeDSaveCropRect, owner: ReturnType<typeof cropOwnerForMetadata>) => {
@@ -626,13 +638,22 @@ export function Volume3DViewer() {
     loadedVolumeRef.current = null;
     texturesRef.current.forEach((texture) => texture.dispose());
     texturesRef.current = [];
-    if (materialRef.current) materialRef.current.uniforms.uNumChannels.value = 0;
+    if (materialRef.current) {
+      materialRef.current.uniforms.uNumChannels.value = 0;
+      // Detach the disposed textures. Rendering while a uniform still names a
+      // disposed texture makes Three re-upload it from image.data — which the
+      // load path frees after a verified upload, so it must never be re-read.
+      for (const name of ['uVolume0', 'uVolume1', 'uVolume2', 'uVolume3']) {
+        materialRef.current.uniforms[name].value = null;
+      }
+    }
     setVolInfo('');
     setVolZ(0);
     setLoading(false);
     setLoadError(message);
     setVolumeEpoch((value) => value + 1);
-  }, []);
+    invalidate();
+  }, [invalidate]);
 
   // A typed-in bar length must take effect without waiting for a camera move.
   useEffect(() => { recomputeScalebar(); }, [scalebarUm, recomputeScalebar]);
@@ -727,9 +748,13 @@ export function Volume3DViewer() {
     // Initial camera position
     updateCamera();
 
-    // Animation loop
+    // Heartbeat loop: presents a frame only when invalidate() was called.
+    // Skipped frames cost one boolean check — the GPU stays idle between
+    // interactions instead of raymarching an unchanged image at 60-120 Hz.
     const animate = () => {
       animIdRef.current = requestAnimationFrame(animate);
+      if (!needsRenderRef.current) return;
+      needsRenderRef.current = false;
       renderer.render(scene, camera);
     };
     animate();
@@ -765,7 +790,13 @@ export function Volume3DViewer() {
     texturesRef.current = [];
     loadedVolumeRef.current = null;
     bakedLevelsRef.current = [];
-    if (materialRef.current) materialRef.current.uniforms.uNumChannels.value = 0;
+    if (materialRef.current) {
+      materialRef.current.uniforms.uNumChannels.value = 0;
+      for (const name of ['uVolume0', 'uVolume1', 'uVolume2', 'uVolume3']) {
+        materialRef.current.uniforms[name].value = null;
+      }
+    }
+    invalidate();
     setVolInfo('');
     setVolZ(0);
     setZRange({ start: 1, end: 1 });
@@ -920,6 +951,15 @@ export function Volume3DViewer() {
               : `GPUへの3Dテクスチャ転送に失敗しました (WebGL ${glErrors.map((e) => `0x${e.toString(16)}`).join(', ')})`,
           );
         }
+        // The verified render above uploaded every texture, so the CPU-side
+        // voxel arrays are no longer needed: Three keeps image.data referenced
+        // for potential re-uploads, which retained the whole packed volume
+        // (hundreds of MB at Maximum) in renderer memory alongside the GPU
+        // copy for the life of the tab. A context loss re-fetches from the
+        // backend rather than re-uploading, so the copy serves nothing.
+        for (const texture of texturesRef.current) {
+          (texture.image as { data: Uint8Array | null }).data = null;
+        }
         loadedVolumeRef.current = {
           runId,
           imageId: activeImageId,
@@ -957,7 +997,7 @@ export function Volume3DViewer() {
       cancelled = true;
       controller.abort();
     };
-  }, [metadata, activeImageId, currentT, resolution, retryNonce, updateCamera]);
+  }, [metadata, activeImageId, currentT, resolution, retryNonce, updateCamera, invalidate]);
 
   // Update channel colors/visibility uniforms. This can also be forced at the
   // save boundary so a just-edited React state cannot lag one frame behind.
@@ -1002,7 +1042,8 @@ export function Volume3DViewer() {
     mat.uniforms.uMaxs.value = maxs;
     mat.uniforms.uVisible.value = visible;
     viewRevisionRef.current += 1;
-  }, [channels]);
+    invalidate();
+  }, [channels, invalidate]);
 
   // Note: volume data is pre-contrasted to uint8 on backend, so min=0 max=1.
   useEffect(() => {
@@ -1024,7 +1065,8 @@ export function Volume3DViewer() {
     mat.uniforms.uZMin.value = Math.max(0, (zRange.start - 1) / volZ);
     mat.uniforms.uZMax.value = Math.min(1, zRange.end / volZ);
     viewRevisionRef.current += 1;
-  }, [zRange, volZ]);
+    invalidate();
+  }, [zRange, volZ, invalidate]);
 
   useEffect(() => {
     if (saving || saveGuardRef.current.isLocked) return;
@@ -1261,10 +1303,12 @@ export function Volume3DViewer() {
     } finally {
       mat.uniforms.uVisible.value = prev;
       renderer.render(scene, cam);
+      invalidate();
     }
   }, [
     hasPhysicalScale, loadedVolumeIsCurrent, saveIncludeScalebar,
     cropViewportRect, scalebar, scalebarColor, scalebarPos, scalebarUm,
+    invalidate,
   ]);
 
   /** Channels the save will use: an explicit pick, else whatever is visible now. */

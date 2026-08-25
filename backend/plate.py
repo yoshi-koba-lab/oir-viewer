@@ -652,6 +652,11 @@ EMPTY_CELL_LABELS = {
     "disabled": "Disabled",       # in the manifest, switched off for the run
     "excluded": "Not selected",   # imaged, but the user did not include it here
     "missing": "File missing",    # imaged, but its stitched file is not on disk
+    # A pseudo-plate position the user left unassigned. Distinct from the
+    # acquisition states above: "Not acquired" would be a claim about an
+    # experiment, and a pseudo plate arranges arbitrary open files, not wells
+    # of a real acquisition.
+    "empty": "Empty",
 }
 
 #: Fonts to try, CJK-capable first. The plate name comes from the acquisition
@@ -1262,7 +1267,8 @@ def selftest() -> int:
         with tempfile.TemporaryDirectory() as tmp:
             out = compose_pdf(
                 Path(tmp) / "selftest.pdf", "セルフテスト", 2, 2, frames,
-                {"A02": "disabled"}, PDF_CELL_CHOICES["draft"], "selftest",
+                {"A02": "disabled", "B01": "empty"},
+                PDF_CELL_CHOICES["draft"], "selftest",
             )
             head, size = out.read_bytes()[:5], out.stat().st_size
     except Exception as e:
