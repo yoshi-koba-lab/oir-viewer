@@ -140,6 +140,15 @@ interface ImageStore {
   toggleChannel: (c: number) => void;
   setChannelColor: (c: number, color: [number, number, number]) => void;
   setChannelRange: (c: number, min: number, max: number) => void;
+  /**
+   * Set several channels' windows on one image — the active one or a
+   * background tab that has been shown at least once. Returns false when the
+   * tab has no established state to edit (never displayed).
+   */
+  applyChannelRanges: (
+    id: string,
+    updates: { channel: number; min: number; max: number }[],
+  ) => boolean;
   autoContrastChannel: (c: number) => void;
   autoContrastAll: () => void;
   setCurrentZ: (z: number) => void;
@@ -149,6 +158,29 @@ interface ImageStore {
   setVolume3D: (v: Partial<Volume3DState>) => void;
   setLoading: (l: boolean) => void;
   setLoadError: (e: string | null) => void;
+}
+
+/** One channel with a new window, ordered, established, and track-widened. */
+function channelWithRange(
+  ch: ChannelState,
+  min: number,
+  max: number,
+  bitDepth: number,
+): ChannelState {
+  // The Min and Max sliders are independent, so Min can be dragged past Max.
+  // An inverted window makes the renderer's range negative and blacks the
+  // channel out with no feedback — keep them ordered instead.
+  const lo = Math.min(min, max);
+  const hi = Math.max(min, max);
+  return {
+    ...ch,
+    min: lo,
+    max: hi,
+    hasLevels: true,
+    // Widen only. A drag must never make the track it is being dragged on
+    // smaller; Auto is what re-fits it downward.
+    controlMax: Math.max(ch.controlMax, displayScaleFor(hi, bitDepth)),
+  };
 }
 
 /** Track that fits both the data and the window, used when Auto re-fits it. */
@@ -570,23 +602,47 @@ export const useImageStore = create<ImageStore>((set, get) => ({
   setChannelRange: (c, min, max) => {
     const channels = [...get().channels];
     if (channels[c]) {
-      // The Min and Max sliders are independent, so Min can be dragged past Max.
-      // An inverted window makes the renderer's range negative and blacks the
-      // channel out with no feedback — keep them ordered instead.
-      const lo = Math.min(min, max);
-      const hi = Math.max(min, max);
       const bitDepth = get().metadata?.bit_depth ?? 16;
-      channels[c] = {
-        ...channels[c],
-        min: lo,
-        max: hi,
-        hasLevels: true,
-        // Widen only. A drag must never make the track it is being dragged on
-        // smaller; Auto is what re-fits it downward.
-        controlMax: Math.max(channels[c].controlMax, displayScaleFor(hi, bitDepth)),
-      };
+      channels[c] = channelWithRange(channels[c], min, max, bitDepth);
       set({ channels });
     }
+  },
+
+  applyChannelRanges: (id, updates) => {
+    const state = get();
+    if (id === state.activeImageId) {
+      const channels = [...state.channels];
+      const bitDepth = state.metadata?.bit_depth ?? 16;
+      for (const u of updates) {
+        if (channels[u.channel]) {
+          channels[u.channel] = channelWithRange(channels[u.channel], u.min, u.max, bitDepth);
+        }
+      }
+      set({ channels });
+      return true;
+    }
+    const saved = state.imageViewStates[id];
+    if (!saved) return false;
+    const channels = [...saved.channels];
+    for (const u of updates) {
+      if (channels[u.channel]) {
+        // No metadata for a background tab, so the slider-track fields are left
+        // alone; channelWithPixels re-fits them when the tab is next shown.
+        channels[u.channel] = {
+          ...channels[u.channel],
+          min: Math.min(u.min, u.max),
+          max: Math.max(u.min, u.max),
+          hasLevels: true,
+        };
+      }
+    }
+    set({
+      imageViewStates: {
+        ...state.imageViewStates,
+        [id]: { ...saved, channels },
+      },
+    });
+    return true;
   },
 
   autoContrastChannel: (c) => {

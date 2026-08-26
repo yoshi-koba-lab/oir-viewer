@@ -2,6 +2,8 @@
 //
 // Format: vX.Y.Z
 // Update history (latest first):
+//   1.5.18 — 2026-08-26 — A CH一括 dialog applies one set of channel Min/Max
+//     windows to every checked open file at once, with per-file saving.
 //   1.5.17 — 2026-08-26 — The 3D view renders only when the camera, contrast,
 //     channels or volume actually change. It used to raymarch the full volume at
 //     display refresh rate even while idle (measured: 1 draw per frame with no
@@ -86,4 +88,4 @@
 //     and TIFF/PNG/JPEG plus OME-TIFF export.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.5.17';
+export const VERSION = '1.5.18';

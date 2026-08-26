@@ -12,6 +12,7 @@ import { ProjectionDialog } from './ProjectionDialog';
 import { PlateDialog } from './PlateDialog';
 import { PlateSaveDialog } from './PlateSaveDialog';
 import { PseudoPlateDialog } from './PseudoPlateDialog';
+import { BulkChannelDialog } from './BulkChannelDialog';
 import { VERSION } from '../constants/version';
 import { CropControls } from './CropControls';
 
@@ -46,6 +47,7 @@ export function Toolbar({ fileManagerOpen = false, onToggleFileManager }: Toolba
   const [plateModal, setPlateModal] = useState<'plate' | 'save' | 'pseudo' | 'saved' | null>(null);
   const [plateSaveCompleted, setPlateSaveCompleted] = useState('');
   const [showSaveDialog, setShowSaveDialog] = useState(false);
+  const [showBulkChannels, setShowBulkChannels] = useState(false);
   const [showProjection, setShowProjection] = useState(false);
   const [filePath, setFilePath] = useState('');
   const [openError, setOpenError] = useState('');
@@ -172,6 +174,18 @@ export function Toolbar({ fileManagerOpen = false, onToggleFileManager }: Toolba
       >
         File Manager
       </button>
+      <button
+        onClick={() => { if (!threeDSaveIsBusy()) setShowBulkChannels(true); }}
+        disabled={showBulkChannels || threeDSaveBusy}
+        className="px-2 py-1 rounded text-xs bg-[var(--border)] text-[var(--text-secondary)]
+                   hover:text-white disabled:opacity-40 transition"
+        title="開いているファイルのCH Min/Maxをまとめて変更"
+      >
+        CH一括
+      </button>
+      {showBulkChannels && (
+        <BulkChannelDialog onClose={() => setShowBulkChannels(false)} />
+      )}
       <button
         onClick={() => { if (!threeDSaveIsBusy()) setShowSaveDialog(true); }}
         disabled={threeDSaveBusy}
