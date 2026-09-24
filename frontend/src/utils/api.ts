@@ -80,6 +80,10 @@ async function postJson<T>(path: string, body: unknown, what: string): Promise<T
   return readJson<T>(res, what);
 }
 
+// Type-only on purpose: this module has no runtime imports, and its tests load
+// it without a TypeScript resolver.
+import type { Orientation } from './orientation';
+
 export interface ImageMetadata {
   id?: string;
   /** True when Open activated an already-loaded exact source instead of decoding a new tab. */
@@ -105,6 +109,8 @@ export interface ImageMetadata {
   bit_depth: number;
   // Non-fatal problem detected while opening (e.g. a split .oir missing chunks).
   warning?: string;
+  /** Display orientation the backend currently applies; width/height already reflect it. */
+  orientation?: Orientation;
 }
 
 export interface ImageListItem {
@@ -119,6 +125,7 @@ export interface ImageListItem {
   width: number;
   height: number;
   active: boolean;
+  orientation?: Orientation;
 }
 
 export interface ChannelData {
@@ -213,6 +220,8 @@ export interface SavedImageView {
   currentZ: number;
   currentT: number;
   showMIP: boolean;
+  /** Absent in records written before v1.5.19, which means the identity. */
+  orientation?: Orientation;
 }
 
 export type ViewSettingsResponse =
@@ -259,8 +268,29 @@ export async function putViewSettings(
   return readJson(res, '表示設定を保存できません');
 }
 
-/** Remove every saved revision for the image's authoritative source path. */
-export async function deleteViewSettings(id: string): Promise<{ deleted: boolean }> {
+/** Turn an image: every plane the backend serves from now on is oriented. */
+export async function putOrientation(id: string, orientation: Orientation): Promise<ImageMetadata> {
+  let res: Response;
+  try {
+    res = await fetch(`/api/images/${encodeURIComponent(id)}/orientation`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(orientation),
+    });
+  } catch (e) {
+    throw new Error(`向きを変更できません: サーバーに到達できません（${e instanceof Error ? e.message : e}）`);
+  }
+  return readJson<ImageMetadata>(res, '向きを変更できません');
+}
+
+/**
+ * Remove every saved revision for the image's authoritative source path.
+ * The backend also puts the planes back in their stored orientation and
+ * returns the metadata that now describes them.
+ */
+export async function deleteViewSettings(
+  id: string,
+): Promise<{ deleted: boolean; metadata?: ImageMetadata }> {
   let res: Response;
   try {
     res = await fetch(`/api/images/${encodeURIComponent(id)}/view-settings`, {
@@ -1014,6 +1044,8 @@ export interface PlateVolumeRequest {
   t?: number;
   /** Max XY; 0 for the source resolution. */
   max_xy?: number;
+  /** The orientation the tab shows this well with; absent means stored order. */
+  orientation?: Orientation;
 }
 
 /** One well's volume as the binary layout plateRender.parseVolume expects. */
@@ -1033,6 +1065,8 @@ export interface PlateVolumeInfo {
   source_revision: string;
   /** 0-based time point actually read. */
   t: number;
+  /** The orientation the backend applied (identity when it echoes none). */
+  orientation?: Orientation;
   levels: [number, number][];
 }
 
@@ -1118,6 +1152,9 @@ export async function fetchPlateVolume(
     && info.source_identity === req.source_identity
     && info.source_revision === req.source_revision
     && info.t === (req.t ?? 0)
+    && (info.orientation?.rotation ?? 0) === (req.orientation?.rotation ?? 0)
+    && (info.orientation?.flipH ?? false) === (req.orientation?.flipH ?? false)
+    && (info.orientation?.flipV ?? false) === (req.orientation?.flipV ?? false)
     && sameLevels(info.levels, requestedLevels)
     && sameLevels(binaryLevels, requestedLevels.map(
       ([lo, hi]) => [Math.trunc(lo), Math.trunc(hi)],

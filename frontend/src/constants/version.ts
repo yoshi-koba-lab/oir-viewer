@@ -2,6 +2,10 @@
 //
 // Format: vX.Y.Z
 // Update history (latest first):
+//   1.5.19 — 2026-09-24 — A 向き control rotates (90/180/270°) or flips an image;
+//     the orientation applies to 2D, 3D, saves and plate PDFs alike and is
+//     remembered per file. 3D views, 3D saves and plate figures now share the
+//     2D orientation; they were drawn vertically mirrored before.
 //   1.5.18 — 2026-08-26 — A CH一括 dialog applies one set of channel Min/Max
 //     windows to every checked open file at once, with per-file saving.
 //   1.5.17 — 2026-08-26 — The 3D view renders only when the camera, contrast,
@@ -88,4 +92,4 @@
 //     and TIFF/PNG/JPEG plus OME-TIFF export.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.5.18';
+export const VERSION = '1.5.19';

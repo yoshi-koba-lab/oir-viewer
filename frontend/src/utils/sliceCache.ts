@@ -19,9 +19,19 @@ interface Entry {
 const cache = new Map<string, Entry>();
 let totalBytes = 0;
 
+// Bumped by clearImageCache so a fetch that was already in flight when the
+// image's planes changed (orientation, reset) cannot land its stale response
+// under a key the new planes will be asked for.
+const generations = new Map<string, number>();
+
+function generationOf(id: string | undefined): number {
+  return generations.get(id ?? '') ?? 0;
+}
+
 function keyOf(o: FetchChannelsOpts): string {
   return [
     o.id ?? '',
+    `g${generationOf(o.id)}`,
     `z${o.z}`,
     `t${o.t}`,
     o.mip ? 'mip' : '',
@@ -68,8 +78,12 @@ export async function fetchAllChannelsCached(opts: FetchChannelsOpts): Promise<A
   const pending = inFlight.get(key);
   if (pending) return pending;
 
+  const generation = generationOf(opts.id);
   const request = fetchAllChannelsBin(opts)
     .then((resp) => {
+      // The planes changed while this was in flight: hand the response to
+      // its caller, which re-checks currency itself, but never cache it.
+      if (generation !== generationOf(opts.id)) return resp;
       const bytes = respBytes(resp);
       // Replacing an existing key must return its bytes to the budget first.
       const prev = cache.get(key);
@@ -94,8 +108,9 @@ export function prefetchSlice(opts: FetchChannelsOpts): void {
   fetchAllChannelsCached(opts).catch(() => { /* best-effort */ });
 }
 
-/** Drop all cached slices for an image (e.g. when it is closed). */
+/** Drop all cached slices for an image (closed, re-oriented, or reset). */
 export function clearImageCache(id: string): void {
+  generations.set(id, generationOf(id) + 1);
   for (const [key, entry] of cache) {
     if (key.startsWith(`${id}|`)) {
       totalBytes -= entry.bytes;

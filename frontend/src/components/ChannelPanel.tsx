@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
+import { adoptIfReoriented } from '../hooks/useImageLoader';
 import { useImageStore } from '../stores/imageStore';
 import { useViewStore } from '../stores/viewStore';
 import { reloadActiveChannelData } from '../hooks/useImageLoader';
@@ -37,10 +38,12 @@ export function ChannelPanel() {
       if (!resetActiveImageToSource()) throw new Error('元ファイルの初期設定を取得できません');
       // resetSettings synchronously drops an unsent old snapshot before its
       // promise is awaited; its queue then puts DELETE after any PUT in flight.
-      await Promise.all([
+      const [restoredMetadata] = await Promise.all([
         resetSettings(activeImageId),
         reloadActiveChannelData(activeImageId),
       ]);
+      // A reset also returns the planes to their stored orientation.
+      await adoptIfReoriented(activeImageId, restoredMetadata);
     } catch (e) {
       const current = useImageStore.getState();
       if (current.activeImageId === resetId

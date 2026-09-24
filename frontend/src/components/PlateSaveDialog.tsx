@@ -688,6 +688,7 @@ export function PlateSaveDialog({
           levels: unionChannels.map((c) => w.channelWindows[c]),
           t: w.t,
           max_xy: maxXy,
+          orientation: w.orientation,
         }, abortRef.current.signal);
         if (runCancelled()) { setResult('中止しました。PDF は作成していません。'); return; }
         completedUnits += 1;

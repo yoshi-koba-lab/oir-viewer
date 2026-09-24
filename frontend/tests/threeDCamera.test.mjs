@@ -91,8 +91,22 @@ test('3D crop fit narrows X/Y and centers an off-centre source rectangle in worl
     scaleY: 0.125,
     scaleZ: 0.2,
     // The mesh is translated to keep its physical box centered in world space.
-    target: [0.4, 0.375, 0.5],
+    // Rows count down from the image top while model y points up: the crop's
+    // vertical centre is at source fraction 0.25, i.e. model fraction 0.75.
+    target: [0.4, 0.625, 0.5],
   });
+});
+
+test('a crop at the top of the image targets the upper part of the volume', () => {
+  const fit = volumeCameraCropFit(
+    { scaleX: 1, scaleY: 1, scaleZ: 1 },
+    { x: 0, y: 0, width: 100, height: 20 },
+    100,
+    100,
+  );
+  // Source row 0 is the image top, which the shader draws at model y = 1.
+  assert.ok(fit.target[1] > 0.5, `target y ${fit.target[1]} should sit above the centre`);
+  assert.equal(fit.target[1], 0.9);
 });
 
 test('full-frame crop is an exact no-op for 3D framing', () => {

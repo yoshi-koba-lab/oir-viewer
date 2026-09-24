@@ -1,4 +1,5 @@
 import { useImageStore, DEFAULT_VOLUME_3D, type ChannelState, type Volume3DState } from '../stores/imageStore';
+import { normalizeOrientation, type Orientation } from './orientation';
 import type { WellSnapshot } from '../stores/plateStore';
 import type { ImageListItem, PlateScan } from './api';
 
@@ -57,6 +58,8 @@ export interface OpenWell {
    */
   channelWindows: [number, number][];
   channelColors: [number, number, number][];
+  /** The orientation the tab shows this image with; the export applies the same. */
+  orientation: Orientation;
   view: Volume3DState;
   /**
    * The Z slab as a 0..1 fraction of the stack. The export re-reads the volume
@@ -129,6 +132,8 @@ export interface OpenImage {
   numChannels: number;
   channelWindows: [number, number][];
   channelColors: [number, number, number][];
+  /** The orientation the tab shows this image with; the export applies the same. */
+  orientation: Orientation;
   view: Volume3DState;
   zFrac: [number, number];
 }
@@ -179,6 +184,7 @@ function tabRenderState(item: ImageListItem) {
     numChannels,
     channelWindows,
     channelColors,
+    orientation: normalizeOrientation(item.orientation),
     view,
     zFrac,
   };

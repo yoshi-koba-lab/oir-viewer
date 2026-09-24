@@ -118,7 +118,10 @@ export function volumeCameraCropFit(
     scaleZ: fullZ,
     target: [
       (1 - fullX) * 0.5 + fullX * (x0 + sx * 0.5),
-      (1 - fullY) * 0.5 + fullY * (y0 + sy * 0.5),
+      // Source rows count down from the image top while model y points up,
+      // and the shader samples y mirrored to match; the crop's centre sits at
+      // the mirrored fraction.
+      (1 - fullY) * 0.5 + fullY * (1 - (y0 + sy * 0.5)),
       (1 - fullZ) * 0.5 + fullZ * 0.5,
     ],
   };

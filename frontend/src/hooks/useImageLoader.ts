@@ -1,4 +1,8 @@
 import { useEffect, useRef } from 'react';
+import { putOrientation } from '../utils/api';
+import {
+  normalizeOrientation, sameOrientation, type Orientation,
+} from '../utils/orientation';
 import {
   useImageStore,
   type ImageViewState,
@@ -532,6 +536,60 @@ export function applyChannelResponseIfCurrent(
 }
 
 /** Load channel data for the currently active image. */
+/**
+ * Bring the renderer in line with planes the backend now serves differently:
+ * a new orientation, or a reset back to the stored one. Every cached slice of
+ * the image is forgotten, selections drawn in the old frame are dropped, the
+ * metadata that describes the new planes is adopted, and the visible planes
+ * are reloaded. The 3D viewer rebuilds itself from the metadata change.
+ */
+export async function adoptReorientedImage(
+  id: string,
+  metadata: ImageMetadata,
+): Promise<void> {
+  const store = useImageStore.getState();
+  clearImageCache(id);
+  if (store.activeImageId !== id) {
+    await refreshImageList();
+    return;
+  }
+  const view = useViewStore.getState();
+  view.setCropRect(null);
+  view.clearRois();
+  store.replaceMetadata({
+    ...metadata,
+    orientation: normalizeOrientation(metadata.orientation),
+  });
+  await refreshImageList();
+  await reloadActiveChannelData(id);
+}
+
+/** After a reset: adopt the returned metadata only if the orientation moved. */
+export async function adoptIfReoriented(
+  id: string,
+  metadata: ImageMetadata | null,
+): Promise<void> {
+  if (!metadata) return;
+  const current = useImageStore.getState();
+  if (current.activeImageId !== id || !current.metadata) return;
+  if (sameOrientation(
+    normalizeOrientation(current.metadata.orientation),
+    normalizeOrientation(metadata.orientation),
+  )) return;
+  await adoptReorientedImage(id, metadata);
+}
+
+/** Turn the active image; the backend serves every plane oriented from now on. */
+export async function applyOrientation(id: string, orientation: Orientation): Promise<void> {
+  const store = useImageStore.getState();
+  if (store.activeImageId !== id || !store.metadata) {
+    throw new Error('表示中の画像だけ向きを変更できます');
+  }
+  if (sameOrientation(normalizeOrientation(store.metadata.orientation), orientation)) return;
+  const metadata = await putOrientation(id, orientation);
+  await adoptReorientedImage(id, metadata);
+}
+
 export async function reloadActiveChannelData(id?: string): Promise<boolean> {
   const request = captureChannelRequest(id);
   if (!request) return false;
@@ -1088,6 +1146,7 @@ export function useImageLoader() {
       currentZ,
       currentT,
       showMIP,
+      orientation: normalizeOrientation(metadata.orientation),
     };
     const sourceIdentity = metadata.source_identity;
     const sourceRevision = metadata.source_revision;

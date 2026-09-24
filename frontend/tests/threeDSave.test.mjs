@@ -114,7 +114,7 @@ test('completed 3D crop fits the display and avoids a second capture crop', () =
   assert.match(viewer, /displayCropMatchesSnapshot\(displayCropFitRef\.current, saveSnapshot\)/);
   assert.match(shader, /uniform vec2 uCropMin/);
   assert.match(shader, /uniform vec2 uCropMax/);
-  assert.match(shader, /samplePos\.x < uCropMin\.x/);
+  assert.match(shader, /tex\.x < uCropMin\.x/);
   assert.match(plate, /uCropMin: \{ value: new THREE\.Vector2\(0, 0\) \}/);
   assert.match(plate, /uCropMax: \{ value: new THREE\.Vector2\(1, 1\) \}/);
 });

@@ -1,4 +1,5 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
+import { adoptIfReoriented } from '../hooks/useImageLoader';
 import * as THREE from 'three';
 import { useImageStore } from '../stores/imageStore';
 import { useOperationStore } from '../stores/operationStore';
@@ -1563,10 +1564,12 @@ export function Volume3DViewer() {
       });
       updateCamera();
       setResolution(MAX_QUALITY);
-      await Promise.all([
+      const [restoredMetadata] = await Promise.all([
         resetSettings(activeImageId),
         reloadActiveChannelData(activeImageId),
       ]);
+      // A reset also returns the planes to their stored orientation.
+      await adoptIfReoriented(activeImageId, restoredMetadata);
     } catch (error) {
       const current = useImageStore.getState();
       if (current.activeImageId === resetId

@@ -441,6 +441,10 @@ class VolumeSpec:
     t: int = 0
     #: Max XY of the returned volume; 0 for the source resolution unchanged.
     max_xy: int = PLATE_MAX_XY
+    #: Display orientation {rotation, flipH, flipV} the tab shows this well
+    #: with. Empty means the stored orientation. Applied before any resize so
+    #: the PDF shows exactly what the tab shows.
+    orientation: dict = field(default_factory=dict)
 
 
 def _plate_source_dtype(pixel_type: int, format_tools, little: bool,
@@ -502,7 +506,11 @@ def read_low_volume(spec: VolumeSpec) -> tuple[dict, bytes]:
                 )
             reader_j.setId(str(p))
             n_c, n_z, n_t = reader_j.getSizeC(), reader_j.getSizeZ(), reader_j.getSizeT()
-            h, w = reader_j.getSizeY(), reader_j.getSizeX()
+            src_h, src_w = int(reader_j.getSizeY()), int(reader_j.getSizeX())
+            from reader import orient_planes, orientation_swaps_axes, validate_orientation
+            orientation = validate_orientation(spec.orientation or None)
+            # Every size below describes the oriented plane the caller sees.
+            h, w = (src_w, src_h) if orientation_swaps_axes(orientation) else (src_h, src_w)
             # Before a single plane is read: a well missing its continuation
             # chunks reads perfectly and renders a short stack, so the only way
             # to keep it out of the PDF is to refuse it here.
@@ -531,6 +539,8 @@ def read_low_volume(spec: VolumeSpec) -> tuple[dict, bytes]:
                     f"{p.name}: voxel size (X/Y/Z) を取得できないため、"
                     "形状を推測した 3D 図は作成しません。"
                 )
+            if orientation_swaps_axes(orientation):
+                voxel[0], voxel[1] = voxel[1], voxel[0]
 
             want = list(spec.channels)
             if not want:
@@ -586,7 +596,9 @@ def read_low_volume(spec: VolumeSpec) -> tuple[dict, bytes]:
                     src_z = zi if out_z == n_z else min(n_z - 1, round(zi * (n_z - 1) / max(out_z - 1, 1)))
                     idx = reader_j.getIndex(int(src_z), int(c), int(spec.t))
                     raw = bytes(reader_j.openBytes(idx))
-                    plane = np.frombuffer(raw, dtype=dtype).reshape(h, w)
+                    plane = orient_planes(
+                        np.frombuffer(raw, dtype=dtype).reshape(src_h, src_w), orientation,
+                    )
                     if plane.dtype.kind == "i":
                         # The ordinary viewer clips signed negatives to 0 before
                         # any display math (`reader._to_uint16`). Filtering raw
@@ -605,6 +617,7 @@ def read_low_volume(spec: VolumeSpec) -> tuple[dict, bytes]:
                 "source_identity": before.identity,
                 "source_revision": before.revision,
                 "t": int(spec.t),
+                "orientation": orientation,
                 "levels": [[float(lo), float(hi)] for lo, hi in spec.levels],
                 # µm per voxel. All three are required above; Plate PDF never
                 # guesses an isotropic shape when acquisition metadata is absent.

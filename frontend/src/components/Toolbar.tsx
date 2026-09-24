@@ -13,6 +13,7 @@ import { PlateDialog } from './PlateDialog';
 import { PlateSaveDialog } from './PlateSaveDialog';
 import { PseudoPlateDialog } from './PseudoPlateDialog';
 import { BulkChannelDialog } from './BulkChannelDialog';
+import { OrientationMenu } from './OrientationMenu';
 import { VERSION } from '../constants/version';
 import { CropControls } from './CropControls';
 
@@ -396,6 +397,7 @@ export function Toolbar({ fileManagerOpen = false, onToggleFileManager }: Toolba
           </button>
         ))}
       </div>
+      <OrientationMenu />
 
       {/* Separator */}
       <div className="w-px h-5 bg-[var(--border)]" />

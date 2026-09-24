@@ -64,6 +64,7 @@ from processor import (
 from roi import line_profile, measure_roi
 import plate
 import view_settings
+from reader import IDENTITY_ORIENTATION, selftest_orientation, validate_orientation
 
 # Multi-image state: id -> ImageReader
 images: dict[str, ImageReader] = {}
@@ -339,6 +340,7 @@ def _selftest_session() -> int:
             or _selftest_plate_volume_reservation()
             or _selftest_volume_memory_plan()
             or view_settings.selftest()
+            or selftest_orientation()
             or _selftest_view_settings_api())
 
 
@@ -917,10 +919,32 @@ def get_reader(image_id: str | None = None) -> ImageReader:
     return images[rid]
 
 
+def _apply_persisted_orientation(reader: ImageReader) -> None:
+    """Orient a freshly opened image the way its saved view says, before any
+    plane is served — the frontend only mirrors what the backend applied."""
+    meta = reader.metadata
+    if not (meta.source_path and meta.source_identity and meta.source_revision):
+        return
+    try:
+        saved, _reason = _view_settings_store.get(
+            meta.source_path, meta.source_identity, meta.source_revision,
+        )
+    except Exception:
+        # A corrupt store is reported by the view-settings GET; it must not
+        # stop the image from opening in its stored orientation.
+        return
+    if isinstance(saved, dict):
+        try:
+            reader.set_orientation(validate_orientation(saved.get("orientation")))
+        except ValueError:
+            pass
+
+
 def add_image(reader: ImageReader) -> str:
     """Register a reader and return its ID."""
     global active_id
     img_id = uuid.uuid4().hex[:8]
+    _apply_persisted_orientation(reader)
     with _state_lock:
         images[img_id] = reader
         active_id = img_id
@@ -976,6 +1000,7 @@ async def list_images():
             "num_t": meta.num_t,
             "width": meta.width,
             "height": meta.height,
+            "orientation": dict(meta.orientation),
             "active": img_id == snapshot_active,
         })
     return result
@@ -1034,6 +1059,9 @@ class SavedImageView(BaseModel):
     currentZ: int
     currentT: int
     showMIP: bool
+    #: {rotation, flipH, flipV}; absent in records written before v1.5.19,
+    #: which means the identity.
+    orientation: dict | None = None
     client_session: str = ""
     client_sequence: int = 0
 
@@ -1089,6 +1117,7 @@ def _validated_view_settings(meta: ImageMetadata, raw: object) -> dict:
         "currentZ": current_z,
         "currentT": current_t,
         "showMIP": show_mip,
+        "orientation": validate_orientation(raw.get("orientation")),
     }
 
 
@@ -1188,7 +1217,42 @@ def delete_view_settings(image_id: str):
             "error": "This image has no source path to reset"
         })
     try:
-        return {"deleted": _view_settings_store.delete(source_path)}
+        deleted = _view_settings_store.delete(source_path)
+        # The orientation is part of the saved view: forgetting the view puts
+        # the planes back in their stored order, and the caller gets the
+        # metadata that now describes them.
+        reader.set_orientation(IDENTITY_ORIENTATION)
+        return {
+            "deleted": deleted,
+            "metadata": {**reader.metadata.to_dict(), "id": image_id},
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": _describe(e)})
+
+
+class OrientationRequest(BaseModel):
+    rotation: int = 0
+    flipH: bool = False
+    flipV: bool = False
+
+
+@app.put("/api/images/{image_id}/orientation")
+def put_orientation(image_id: str, req: OrientationRequest):
+    """Apply a display orientation to every plane this image serves from now.
+
+    Persistence rides on the view-settings snapshot the renderer sends after
+    this, so a corrupt settings store cannot block turning an image.
+    """
+    with _state_lock:
+        reader = images.get(image_id)
+    if reader is None:
+        return JSONResponse(status_code=404, content={"error": "Image not found"})
+    try:
+        raw = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+        reader.set_orientation(validate_orientation(raw))
+        return {**reader.metadata.to_dict(), "id": image_id}
+    except ValueError as e:
+        return JSONResponse(status_code=422, content={"error": _describe(e)})
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": _describe(e)})
 
@@ -1222,9 +1286,15 @@ def _selftest_view_settings_api() -> int:
                     self.metadata = metadata
                     self._pixels_lock = threading.RLock()
                     self._metadata_authoritative = True
+                    self.orientation = dict(IDENTITY_ORIENTATION)
 
                 def ensure_metadata(self) -> bool:
                     return False
+
+                def set_orientation(self, orientation: object) -> dict:
+                    self.orientation = validate_orientation(orientation)
+                    self.metadata.orientation = dict(self.orientation)
+                    return self.orientation
 
             images, active_id, _lru = {"view": _MetadataReader(meta)}, "view", []
             _view_settings_store = view_settings.ViewSettingsStore(
@@ -1249,8 +1319,29 @@ def _selftest_view_settings_api() -> int:
                     or loaded.get("found") is not True
                     or loaded.get("source_identity") != source.identity
                     or loaded.get("source_revision") != source.revision
-                    or loaded.get("settings") != payload):
+                    or loaded.get("settings") != {**payload, "orientation": IDENTITY_ORIENTATION}):
                 raise AssertionError("validated settings did not round-trip through the API")
+
+            # Orientation travels with the view: a canonical value round-trips,
+            # an invalid one is refused, and the live endpoint applies it.
+            turned = put_view_settings("view", SavedImageView(
+                **payload, orientation={"rotation": 90, "flipV": True},
+            ))
+            turned_loaded = get_view_settings("view")
+            if (turned.get("saved") is not True
+                    or turned_loaded.get("settings", {}).get("orientation")
+                    != {"rotation": 90, "flipH": False, "flipV": True}):
+                raise AssertionError("orientation did not round-trip through view settings")
+            bad_turn = put_view_settings("view", SavedImageView(
+                **payload, orientation={"rotation": 45},
+            ))
+            if not isinstance(bad_turn, JSONResponse) or bad_turn.status_code != 422:
+                raise AssertionError("an invalid orientation was accepted")
+            applied = put_orientation("view", OrientationRequest(rotation=270, flipH=True))
+            if (applied.get("orientation") != {"rotation": 270, "flipH": True, "flipV": False}
+                    or images["view"].orientation.get("rotation") != 270):
+                raise AssertionError("the orientation endpoint did not apply to the reader")
+            put_view_settings("view", request)
 
             invalid = SavedImageView(
                 channels=[SavedChannelView(
@@ -1290,8 +1381,10 @@ def _selftest_view_settings_api() -> int:
             # Reset is intentionally path-scoped and remains available while the
             # source is changed or temporarily unavailable.
             reset = delete_view_settings("view")
-            if reset != {"deleted": True}:
-                raise AssertionError("reset did not delete the source's settings")
+            if (reset.get("deleted") is not True
+                    or reset.get("metadata", {}).get("orientation") != IDENTITY_ORIENTATION
+                    or images["view"].orientation != IDENTITY_ORIENTATION):
+                raise AssertionError("reset did not delete the settings and restore the stored orientation")
             if _view_settings_store.get(
                     source_path, source.identity, source.revision) != (None, "none"):
                 raise AssertionError("deleted settings came back through the store")
@@ -3243,6 +3336,9 @@ class PlateVolumeRequest(BaseModel):
     #: Low, and the PDF footer recorded the resolution the user picked rather than
     #: the one used. The response header now reports the cap that was applied.
     max_xy: int = plate.PLATE_MAX_XY
+    #: {rotation, flipH, flipV} the tab displays this well with; absent means
+    #: the stored orientation. Applied before any resize.
+    orientation: dict | None = None
 
 
 @app.post("/api/plate/volume-bin")
@@ -3269,6 +3365,7 @@ def plate_volume_bin(req: PlateVolumeRequest):
             levels=[(float(a), float(b)) for a, b in req.levels],
             t=int(req.t),
             max_xy=int(req.max_xy),
+            orientation=validate_orientation(req.orientation),
         )
         info, payload = plate.read_low_volume(spec)
         response = _VolumeResponse(

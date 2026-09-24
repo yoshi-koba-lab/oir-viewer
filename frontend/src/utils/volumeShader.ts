@@ -90,17 +90,24 @@ export const fragmentShader = `
 
       vec3 samplePos = vOrigin + rayDir * t;
       if (any(lessThan(samplePos, vec3(0.0))) || any(greaterThan(samplePos, vec3(1.0)))) continue;
-      if (samplePos.x < uCropMin.x || samplePos.x > uCropMax.x
-          || samplePos.y < uCropMin.y || samplePos.y > uCropMax.y) continue;
+      // Model +y is screen-up, but texture row 0 is the TOP of the source
+      // image (the same row the 2D view draws at the top). Sampling model y
+      // directly drew every volume upside down relative to 2D; mirroring y
+      // here gives 3D, 3D saves and plate figures the 2D orientation. The
+      // crop box and Z slab are given in source fractions, so they are tested
+      // in this same mirrored space.
+      vec3 tex = vec3(samplePos.x, 1.0 - samplePos.y, samplePos.z);
+      if (tex.x < uCropMin.x || tex.x > uCropMax.x
+          || tex.y < uCropMin.y || tex.y > uCropMax.y) continue;
       // Restrict to the selected slab of the stack.
-      if (samplePos.z < uZMin || samplePos.z > uZMax) continue;
+      if (tex.z < uZMin || tex.z > uZMax) continue;
 
       vec3 color = vec3(0.0);
       for (int ch = 0; ch < 4; ch++) {
         if (ch >= uNumChannels) break;
         if (!uVisible[ch]) continue;
 
-        float raw = sampleChannel(ch, samplePos);
+        float raw = sampleChannel(ch, tex);
         float rangeInv = 1.0 / max(uMaxs[ch] - uMins[ch], 0.001);
         float norm = clamp((raw - uMins[ch]) * rangeInv, 0.0, 1.0);
         color += uColors[ch] * norm;

@@ -416,6 +416,7 @@ export function PseudoPlateDialog({
             levels: image.channelIdx.map((c) => image.channelWindows[c]),
             t: image.t,
             max_xy: maxXy,
+            orientation: image.orientation,
           }, abortRef.current.signal);
         } catch (e) {
           // Name the position and file; the shared fetch error does not.

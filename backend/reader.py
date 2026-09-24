@@ -13,6 +13,120 @@ from dataclasses import dataclass, field
 
 from source_state import snapshot_source
 
+# Display orientation, applied to every plane this reader hands out.
+#
+# `rotation` is clockwise in degrees; the flips are applied in the stored frame
+# before the rotation. The identity leaves the stored pixel order untouched,
+# which for .oir files is the order the MATL plate map uses (row A up, column
+# 1 left) — verified by locating stage-indexed tiles inside a stitched well.
+# Olympus's own viewer presents the same data through a display transform,
+# so this exists to let a figure match that presentation on request.
+ORIENTATION_ROTATIONS = (0, 90, 180, 270)
+IDENTITY_ORIENTATION: dict = {"rotation": 0, "flipH": False, "flipV": False}
+
+
+def validate_orientation(raw: object) -> dict:
+    """Canonical {rotation, flipH, flipV}; None means the identity."""
+    if raw is None:
+        return dict(IDENTITY_ORIENTATION)
+    if not isinstance(raw, dict):
+        raise ValueError("Orientation is not an object")
+    rotation = raw.get("rotation", 0)
+    flip_h = raw.get("flipH", False)
+    flip_v = raw.get("flipV", False)
+    if isinstance(rotation, bool) or rotation not in ORIENTATION_ROTATIONS:
+        raise ValueError("Orientation rotation must be 0, 90, 180 or 270")
+    if type(flip_h) is not bool or type(flip_v) is not bool:
+        raise ValueError("Orientation flips must be true or false")
+    return {"rotation": int(rotation), "flipH": flip_h, "flipV": flip_v}
+
+
+def orientation_swaps_axes(orientation: dict) -> bool:
+    """Whether width and height trade places (90° or 270°)."""
+    return int(orientation.get("rotation", 0)) in (90, 270)
+
+
+def orient_planes(arr: np.ndarray, orientation: dict) -> np.ndarray:
+    """Apply the orientation to the last two axes (rows, columns) as a view.
+
+    Views, not copies: a full-resolution well is gigabytes, and every consumer
+    already copies the plane it needs (`tobytes`, resize, clip).
+    """
+    if orientation.get("flipH"):
+        arr = np.flip(arr, axis=-1)
+    if orientation.get("flipV"):
+        arr = np.flip(arr, axis=-2)
+    k = int(orientation.get("rotation", 0)) // 90
+    if k:
+        # np.rot90 turns counter-clockwise; negative k is the clockwise turn
+        # the UI labels promise.
+        arr = np.rot90(arr, k=-k, axes=(-2, -1))
+    return arr
+
+
+def selftest_orientation() -> int:
+    """Pin every orientation on a plane with no symmetry, so a wrong turn
+    direction or a flip/rotation order swap fails the build."""
+    a = np.array([[1, 2, 3], [4, 5, 6]])
+    o = lambda r=0, h=False, v=False: {"rotation": r, "flipH": h, "flipV": v}
+    cases = [
+        (o(), [[1, 2, 3], [4, 5, 6]]),
+        (o(90), [[4, 1], [5, 2], [6, 3]]),
+        (o(180), [[6, 5, 4], [3, 2, 1]]),
+        (o(270), [[3, 6], [2, 5], [1, 4]]),
+        (o(v=True), [[4, 5, 6], [1, 2, 3]]),
+        (o(h=True), [[3, 2, 1], [6, 5, 4]]),
+        (o(90, v=True), [[1, 4], [2, 5], [3, 6]]),
+        (o(180, h=True, v=True), [[1, 2, 3], [4, 5, 6]]),
+    ]
+    try:
+        for orientation, expected in cases:
+            got = orient_planes(a, orientation)
+            if got.tolist() != expected:
+                raise AssertionError(f"{orientation}: {got.tolist()} != {expected}")
+        # Higher-rank arrays orient their last two axes only.
+        vol = np.arange(2 * 3 * 2 * 3).reshape(2, 3, 2, 3)
+        turned = orient_planes(vol, o(90))
+        if turned.shape != (2, 3, 3, 2) or turned[1, 2].tolist() != orient_planes(vol[1, 2], o(90)).tolist():
+            raise AssertionError("volume orientation does not act plane by plane")
+        for bad in ({"rotation": 45}, {"rotation": True}, {"rotation": "90"},
+                    {"flipH": 1}, "90"):
+            try:
+                validate_orientation(bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"invalid orientation accepted: {bad!r}")
+        if validate_orientation(None) != IDENTITY_ORIENTATION:
+            raise AssertionError("None is not the identity")
+        # Through a reader: planes come out turned, the metadata describes the
+        # turned plane, and a metadata reload keeps the orientation.
+        r = ImageReader()
+        r.data = np.arange(6, dtype=np.uint16).reshape(1, 1, 1, 2, 3) + 1
+        r.metadata = ImageMetadata(width=3, height=2, pixel_size_x=1.0, pixel_size_y=2.0)
+        r._metadata_authoritative = True
+        r.set_orientation({"rotation": 90})
+        if (r.get_slice(0, 0, 0).tolist() != [[4, 1], [5, 2], [6, 3]]
+                or (r.metadata.width, r.metadata.height) != (2, 3)
+                or (r.metadata.pixel_size_x, r.metadata.pixel_size_y) != (2.0, 1.0)
+                or r.metadata.to_dict()["orientation"] != {"rotation": 90, "flipH": False, "flipV": False}):
+            raise AssertionError("a 90° reader did not present turned planes and metadata")
+        r.metadata = ImageMetadata(width=3, height=2, pixel_size_x=1.0, pixel_size_y=2.0)
+        r._resync_metadata_orientation()
+        if (r.metadata.width, r.metadata.height) != (2, 3):
+            raise AssertionError("reassigned metadata lost the orientation")
+        r.set_orientation({"rotation": 180})
+        if (r.metadata.width, r.metadata.height) != (3, 2) or r.get_mip(0, 0).tolist() != [[6, 5, 4], [3, 2, 1]]:
+            raise AssertionError("180° did not restore the stored width/height")
+        r.set_orientation(None)
+        if r.get_volume(0).shape != (1, 1, 2, 3) or r.metadata.orientation != IDENTITY_ORIENTATION:
+            raise AssertionError("the identity did not restore the stored planes")
+    except Exception as e:
+        print(f"selftest FAILED: orientation -> {type(e).__name__}: {e}", flush=True)
+        return 18
+    print("selftest: orientation OK (8 states pinned, invalid values refused)", flush=True)
+    return 0
+
 
 @dataclass
 class ImageMetadata:
@@ -41,6 +155,9 @@ class ImageMetadata:
     # Non-fatal problem found while opening (e.g. a split .oir missing its
     # companion chunks). Empty when the file loaded cleanly.
     warning: str = ""
+    # The display orientation currently applied to this image's planes. The
+    # width/height/pixel sizes above already reflect it.
+    orientation: dict = field(default_factory=lambda: dict(IDENTITY_ORIENTATION))
 
     def to_dict(self) -> dict:
         return {
@@ -62,6 +179,7 @@ class ImageMetadata:
             "channel_ranges": self.channel_ranges,
             "bit_depth": self.bit_depth,
             "warning": self.warning,
+            "orientation": dict(self.orientation),
         }
 
 
@@ -312,6 +430,9 @@ class ImageReader:
     def __init__(self):
         self.data: np.ndarray | None = None  # shape: (T, C, Z, Y, X)
         self.metadata = ImageMetadata()
+        # Applied to every plane handed out; the stored array stays as read.
+        self.orientation: dict = dict(IDENTITY_ORIENTATION)
+        self._metadata_swapped = False
         # Serialises loading and unloading. FastAPI runs sync endpoints on a
         # thread pool, and the Compare view requests several images by id
         # without activating them first — so two requests racing into the same
@@ -342,6 +463,31 @@ class ImageReader:
         self.deferred_path = path
         self.metadata = metadata
         self._metadata_authoritative = False
+        self._resync_metadata_orientation()
+
+    def _swap_metadata_axes(self) -> None:
+        m = self.metadata
+        m.width, m.height = m.height, m.width
+        m.pixel_size_x, m.pixel_size_y = m.pixel_size_y, m.pixel_size_x
+        self._metadata_swapped = not self._metadata_swapped
+
+    def _resync_metadata_orientation(self) -> None:
+        """After metadata was (re)assigned in stored orientation, present it
+        the way the current orientation does."""
+        self._metadata_swapped = False
+        self.metadata.orientation = dict(self.orientation)
+        if orientation_swaps_axes(self.orientation):
+            self._swap_metadata_axes()
+
+    def set_orientation(self, orientation: object) -> dict:
+        """Change the display orientation; metadata width/height follow."""
+        clean = validate_orientation(orientation)
+        with self._pixels_lock:
+            self.orientation = clean
+            self.metadata.orientation = dict(clean)
+            if orientation_swaps_axes(clean) != self._metadata_swapped:
+                self._swap_metadata_axes()
+        return clean
 
     def unload(self) -> int:
         """Drop the pixels, keeping the file re-openable. Returns bytes freed.
@@ -457,6 +603,7 @@ class ImageReader:
         metadata.source_identity = after.identity
         metadata.source_revision = after.revision
         self._metadata_authoritative = True
+        self._resync_metadata_orientation()
         return metadata
 
     # Keep old name as alias
@@ -783,6 +930,7 @@ class ImageReader:
             bit_depth=16,
         )
         self._metadata_authoritative = True
+        self._resync_metadata_orientation()
         return self.metadata
 
     def get_slice(self, c: int, z: int, t: int) -> np.ndarray:
@@ -793,14 +941,14 @@ class ImageReader:
         t = max(0, min(t, data.shape[0] - 1))
         c = max(0, min(c, data.shape[1] - 1))
         z = max(0, min(z, data.shape[2] - 1))
-        return data[t, c, z]
+        return orient_planes(data[t, c, z], self.orientation)
 
     def get_mip(self, c: int, t: int) -> np.ndarray:
         """Maximum Intensity Projection along Z for a given channel and time."""
         data = self._pixels()
         t = max(0, min(t, data.shape[0] - 1))
         c = max(0, min(c, data.shape[1] - 1))
-        return np.max(data[t, c], axis=0)
+        return orient_planes(np.max(data[t, c], axis=0), self.orientation)
 
     def get_projection(self, c: int, t: int, z_from: int, z_to: int, method: str = "max") -> np.ndarray:
         """Z-projection over a specified range.
@@ -819,18 +967,19 @@ class ImageReader:
         z_to = max(z_from, min(z_to, data.shape[2] - 1))
         stack = data[t, c, z_from:z_to + 1]  # (Z_range, Y, X)
         if method == "min":
-            return np.min(stack, axis=0)
+            result = np.min(stack, axis=0)
         elif method == "avg":
             # Round, not truncate — truncation biases every avg projection low.
-            return np.rint(np.mean(stack, axis=0)).astype(data.dtype)
+            result = np.rint(np.mean(stack, axis=0)).astype(data.dtype)
         else:  # "max"
-            return np.max(stack, axis=0)
+            result = np.max(stack, axis=0)
+        return orient_planes(result, self.orientation)
 
     def get_volume(self, t: int) -> np.ndarray:
         """Get full volume data (C, Z, Y, X) for a given time point."""
         data = self._pixels()
         t = max(0, min(t, data.shape[0] - 1))
-        return data[t]
+        return orient_planes(data[t], self.orientation)
 
 
 # Transmitted-light / DIC channel name patterns

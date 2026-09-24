@@ -11,6 +11,7 @@ import {
   deleteViewSettings,
   fetchViewSettings,
   putViewSettings,
+  type ImageMetadata,
   type SavedImageView,
 } from './api';
 
@@ -123,7 +124,7 @@ export async function flushSettings(imageId: string): Promise<void> {
  * Drop an unsent old snapshot, then delete after every already-started PUT.
  * A fresh-baseline save scheduled by the reset render is queued after DELETE.
  */
-export async function resetSettings(imageId: string): Promise<void> {
+export async function resetSettings(imageId: string): Promise<ImageMetadata | null> {
   // This must happen before the first await. A slow GET returning after DELETE
   // must not reapply the deleted Min/Max and schedule it as a fresh PUT.
   invalidateSettingsLoad(imageId);
@@ -133,8 +134,11 @@ export async function resetSettings(imageId: string): Promise<void> {
     pending.delete(imageId);
   }
   latest.delete(imageId);
-  await enqueue(imageId, async () => {
-    await deleteViewSettings(imageId);
+  return enqueue(imageId, async () => {
+    const result = await deleteViewSettings(imageId);
+    // The backend also put the planes back in their stored orientation; the
+    // caller adopts this metadata so the renderer follows.
+    return result.metadata ?? null;
   });
 }
 

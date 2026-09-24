@@ -135,6 +135,8 @@ interface ImageStore {
   // Current image actions
   // Accepts null: closing the last image clears it.
   setMetadata: (m: ImageMetadata | null) => void;
+  /** Adopt metadata that describes the same image's planes anew (orientation); the view state stays. */
+  replaceMetadata: (m: ImageMetadata) => void;
   initChannels: (n: number) => void;
   setChannelData: (c: number, data: Uint16Array, autoMin: number, autoMax: number) => void;
   toggleChannel: (c: number) => void;
@@ -564,6 +566,8 @@ export const useImageStore = create<ImageStore>((set, get) => ({
   // but never let the previous or process-default slab become this image's
   // saved state merely because the user switched tabs before opening 3D.
   // A saved image state, when present, is restored immediately after this.
+  replaceMetadata: (m) => set({ metadata: m }),
+
   setMetadata: (m) => set((s) => ({
     metadata: m,
     ...(m ? { volume3D: volume3DForFreshImage(s.volume3D, m.num_z) } : {}),
