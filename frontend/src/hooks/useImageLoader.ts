@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react';
-import { putOrientation } from '../utils/api';
+import { putOrientation, reorderImages } from '../utils/api';
 import {
   normalizeOrientation, sameOrientation, type Orientation,
 } from '../utils/orientation';
@@ -256,6 +256,24 @@ async function loadSettingsOnce(
 }
 
 /** Refresh the image list from the server. */
+/**
+ * Reorder the open tabs. The new order is shown at once; the backend's reply
+ * is then adopted as the truth, so a tab that closed or opened meanwhile ends
+ * up where the backend put it rather than where the drag assumed.
+ */
+export async function reorderOpenImages(ids: string[]): Promise<void> {
+  const store = useImageStore.getState();
+  const byId = new Map(store.imageList.map((item) => [item.id, item]));
+  const optimistic = ids.map((id) => byId.get(id)).filter((item): item is ImageListItem => !!item);
+  if (optimistic.length === store.imageList.length) store.setImageList(optimistic);
+  try {
+    useImageStore.getState().setImageList(await reorderImages(ids));
+  } catch (e) {
+    await refreshImageList();
+    throw e;
+  }
+}
+
 export async function refreshImageList() {
   const list = await listImages();
   useImageStore.getState().setImageList(list);

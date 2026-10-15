@@ -167,6 +167,24 @@ export async function listImages(): Promise<ImageListItem[]> {
   return getJson<ImageListItem[]>('/api/images', '画像一覧の取得に失敗');
 }
 
+/**
+ * Put the open images in this order. The backend refuses anything that is not
+ * exactly the current id set, and replies with the list as it now stands.
+ */
+export async function reorderImages(ids: string[]): Promise<ImageListItem[]> {
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}/api/images/order`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids }),
+    });
+  } catch (e) {
+    throw new Error(`タブの並べ替えに失敗: サーバーに到達できません（${e instanceof Error ? e.message : e}）`);
+  }
+  return readJson<ImageListItem[]>(res, 'タブの並べ替えに失敗');
+}
+
 export async function activateImage(id: string): Promise<ImageMetadata> {
   let res: Response;
   try {

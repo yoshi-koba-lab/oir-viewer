@@ -341,6 +341,7 @@ def _selftest_session() -> int:
             or _selftest_volume_memory_plan()
             or view_settings.selftest()
             or selftest_orientation()
+            or _selftest_image_order()
             or _selftest_view_settings_api())
 
 
@@ -983,27 +984,8 @@ def _open_image_with_source(
 
 @app.get("/api/images")
 async def list_images():
-    """List all loaded images."""
-    with _state_lock:
-        snapshot = [(img_id, reader.metadata) for img_id, reader in images.items()]
-        snapshot_active = active_id
-    result = []
-    for img_id, meta in snapshot:
-        result.append({
-            "id": img_id,
-            "filename": meta.filename,
-            "source_path": meta.source_path,
-            "source_identity": meta.source_identity,
-            "source_revision": meta.source_revision,
-            "num_channels": meta.num_channels,
-            "num_z": meta.num_z,
-            "num_t": meta.num_t,
-            "width": meta.width,
-            "height": meta.height,
-            "orientation": dict(meta.orientation),
-            "active": img_id == snapshot_active,
-        })
-    return result
+    """List all loaded images, in tab order."""
+    return _image_list_payload()
 
 
 @app.post("/api/images/{image_id}/activate")
@@ -1045,6 +1027,94 @@ async def close_image(image_id: str):
             active_id = next(iter(images), None)
     _save_session()
     return {"closed": image_id, "active_id": active_id}
+
+
+class ImageOrderRequest(BaseModel):
+    ids: list[str]
+
+
+def _reordered_images(current: dict, ids: list[str]) -> dict:
+    """The images dict re-keyed in `ids` order, or ValueError.
+
+    Fail-closed on purpose: a request that names a tab that has since closed,
+    omits one that opened, or repeats an id would silently drop or duplicate
+    tabs if the list were merely filtered. The renderer resends from the list
+    the backend returns instead.
+    """
+    if len(ids) != len(set(ids)):
+        raise ValueError("タブの並び順に同じ画像が二度あります")
+    if set(ids) != set(current):
+        raise ValueError("タブの並び順が開いている画像と一致しません。一覧を更新してください")
+    return {image_id: current[image_id] for image_id in ids}
+
+
+@app.put("/api/images/order")
+def put_image_order(req: ImageOrderRequest):
+    """Set the tab order; every list the API serves follows it from now on."""
+    try:
+        with _state_lock:
+            reordered = _reordered_images(images, list(req.ids))
+            images.clear()
+            images.update(reordered)
+    except ValueError as e:
+        return JSONResponse(status_code=409, content={"error": _describe(e)})
+    _save_session()
+    return _image_list_payload()
+
+
+def _image_list_payload() -> list[dict]:
+    with _state_lock:
+        snapshot = [(img_id, reader.metadata) for img_id, reader in images.items()]
+        snapshot_active = active_id
+    return [
+        {
+            "id": img_id,
+            "filename": meta.filename,
+            "source_path": meta.source_path,
+            "source_identity": meta.source_identity,
+            "source_revision": meta.source_revision,
+            "num_channels": meta.num_channels,
+            "num_z": meta.num_z,
+            "num_t": meta.num_t,
+            "width": meta.width,
+            "height": meta.height,
+            "orientation": dict(meta.orientation),
+            "active": img_id == snapshot_active,
+        }
+        for img_id, meta in snapshot
+    ]
+
+
+def _selftest_image_order() -> int:
+    """Prove reordering keeps every tab exactly once and refuses anything else."""
+    global images, active_id, _lru
+    saved_images, saved_active, saved_lru = images, active_id, _lru
+    try:
+        readers = {name: ImageReader() for name in ("a", "b", "c")}
+        for name, reader in readers.items():
+            reader.metadata.filename = f"{name}.oir"
+        images, active_id, _lru = dict(readers), "b", ["a", "b", "c"]
+        result = put_image_order(ImageOrderRequest(ids=["c", "a", "b"]))
+        if (isinstance(result, JSONResponse) or [row["id"] for row in result] != ["c", "a", "b"]
+                or list(images) != ["c", "a", "b"] or active_id != "b"
+                or [row["active"] for row in result] != [False, False, True]
+                or any(images[name] is not readers[name] for name in readers)):
+            raise AssertionError(f"reorder did not re-key the images: {list(images)}")
+        for bad in (["a", "b"], ["a", "b", "c", "zzz"], ["a", "a", "b"], []):
+            response = put_image_order(ImageOrderRequest(ids=bad))
+            if not isinstance(response, JSONResponse) or response.status_code != 409:
+                raise AssertionError(f"an invalid order was accepted: {bad}")
+            if list(images) != ["c", "a", "b"]:
+                raise AssertionError(f"a refused order changed the images: {list(images)}")
+        if _save_session is None:
+            raise AssertionError("unreachable")
+    except Exception as e:
+        print(f"selftest FAILED: image order -> {type(e).__name__}: {e}", flush=True)
+        return 19
+    finally:
+        images, active_id, _lru = saved_images, saved_active, saved_lru
+    print("selftest: image order OK (re-keyed in place, mismatched sets refused)", flush=True)
+    return 0
 
 
 class SavedChannelView(BaseModel):

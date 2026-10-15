@@ -2,6 +2,9 @@
 //
 // Format: vX.Y.Z
 // Update history (latest first):
+//   1.5.20 — 2026-10-15 — File tabs can be reordered by drag and drop; every
+//     list that follows the tab order (Compare, Pseudo Plate, CH一括) follows
+//     the new order.
 //   1.5.19 — 2026-09-24 — A 向き control rotates (90/180/270°) or flips an image;
 //     the orientation applies to 2D, 3D, saves and plate PDFs alike and is
 //     remembered per file. 3D views, 3D saves and plate figures now share the
@@ -92,4 +95,4 @@
 //     and TIFF/PNG/JPEG plus OME-TIFF export.
 //   0.x — pre-release development (unversioned)
 
-export const VERSION = '1.5.19';
+export const VERSION = '1.5.20';
